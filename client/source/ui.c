@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "sync.h"
 
 static PrintConsole top_screen;
 static PrintConsole bottom_screen;
@@ -93,8 +94,8 @@ void ui_draw_status(const char *status_line) {
     printf("\x1b[4;1H B  - Download save from server%-*s", BOT_COLS - 31, "");
     printf("\x1b[5;1H X  - Sync all (SD only)%-*s", BOT_COLS - 24, "");
     printf("\x1b[6;1H Y  - Rescan titles%-*s", BOT_COLS - 19, "");
-    printf("\x1b[7;1H SELECT - Check for updates%-*s", BOT_COLS - 27, "");
-    printf("\x1b[8;1H START - Exit%-*s", BOT_COLS - 13, "");
+    printf("\x1b[7;1H R  - Save details%-*s", BOT_COLS - 18, "");
+    printf("\x1b[8;1H SELECT - Updates | START - Exit%-*s", BOT_COLS - 32, "");
     printf("\x1b[9;1H%-*s", BOT_COLS, "");
     printf("\x1b[10;1H\x1b[36mCyan\x1b[0m = cartridge (A/B only)%-*s", BOT_COLS - 27, "");
     printf("\x1b[11;1H%-*s", BOT_COLS, "");
@@ -121,4 +122,115 @@ void ui_clear(void) {
     consoleClear();
     consoleSelect(&bottom_screen);
     consoleClear();
+}
+
+// Format size in human-readable form
+static void format_size(u32 bytes, char *out, int out_size) {
+    if (bytes >= 1024 * 1024) {
+        snprintf(out, out_size, "%.1f MB", bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024) {
+        snprintf(out, out_size, "%.1f KB", bytes / 1024.0);
+    } else {
+        snprintf(out, out_size, "%lu B", (unsigned long)bytes);
+    }
+}
+
+// Format date from ISO 8601 (YYYY-MM-DDTHH:MM:SS) to readable form
+static void format_date(const char *iso, char *out, int out_size) {
+    // Extract date and time parts
+    if (strlen(iso) >= 16 && iso[10] == 'T') {
+        snprintf(out, out_size, "%.10s %.5s", iso, iso + 11);
+    } else if (strlen(iso) > 0) {
+        snprintf(out, out_size, "%.19s", iso);
+    } else {
+        snprintf(out, out_size, "N/A");
+    }
+}
+
+void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
+    consoleSelect(&top_screen);
+    consoleClear();
+
+    int row = 1;
+
+    // Title name header (truncate if too long)
+    printf("\x1b[%d;1H\x1b[36m--- %.44s ---\x1b[0m", row++, title->name);
+    row++;
+
+    // Title ID
+    printf("\x1b[%d;1H Title ID: %s", row++, title->title_id_hex);
+
+    // Media type
+    const char *media = (title->media_type == MEDIATYPE_SD) ? "SD Card" :
+                        (title->media_type == MEDIATYPE_GAME_CARD) ? "Game Card" : "Unknown";
+    printf("\x1b[%d;1H Media:    %s", row++, media);
+    row++;
+
+    // Local save info
+    printf("\x1b[%d;1H\x1b[33m-- Local Save --\x1b[0m", row++);
+    if (details->local_exists) {
+        char size_str[32];
+        format_size(details->local_size, size_str, sizeof(size_str));
+        printf("\x1b[%d;1H Files: %d | Size: %s", row++, details->local_file_count, size_str);
+        printf("\x1b[%d;1H Hash:  %.32s...", row++, details->local_hash);
+    } else {
+        printf("\x1b[%d;1H No local save data", row++);
+    }
+    row++;
+
+    // Server save info
+    printf("\x1b[%d;1H\x1b[33m-- Server Save --\x1b[0m", row++);
+    if (details->server_exists) {
+        char size_str[32];
+        format_size(details->server_size, size_str, sizeof(size_str));
+        printf("\x1b[%d;1H Files: %d | Size: %s", row++, details->server_file_count, size_str);
+        printf("\x1b[%d;1H Hash:  %.32s...", row++, details->server_hash);
+
+        char date_str[32];
+        format_date(details->server_last_sync, date_str, sizeof(date_str));
+        printf("\x1b[%d;1H Last sync: %s", row++, date_str);
+
+        if (details->server_console_id[0]) {
+            printf("\x1b[%d;1H From console: %.16s", row++, details->server_console_id);
+        }
+    } else {
+        printf("\x1b[%d;1H Not yet uploaded to server", row++);
+    }
+    row++;
+
+    // Sync status
+    printf("\x1b[%d;1H\x1b[33m-- Sync Status --\x1b[0m", row++);
+    if (details->is_synced) {
+        printf("\x1b[%d;1H\x1b[32m Synced (hashes match)\x1b[0m", row++);
+    } else if (details->local_exists && details->server_exists) {
+        printf("\x1b[%d;1H\x1b[31m Out of sync (different hashes)\x1b[0m", row++);
+    } else if (details->local_exists && !details->server_exists) {
+        printf("\x1b[%d;1H\x1b[33m Local only (not uploaded)\x1b[0m", row++);
+    } else if (!details->local_exists && details->server_exists) {
+        printf("\x1b[%d;1H\x1b[33m Server only (not downloaded)\x1b[0m", row++);
+    } else {
+        printf("\x1b[%d;1H\x1b[90m No save data\x1b[0m", row++);
+    }
+
+    if (details->has_last_synced) {
+        printf("\x1b[%d;1H Last synced: %.32s...", row++, details->last_synced_hash);
+    }
+
+    // Footer
+    printf("\x1b[%d;1H\x1b[90m Press B to close\x1b[0m", TOP_ROWS);
+
+    // Draw to both buffers to prevent flicker
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
+
+    // Wait for B button
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kDown = hidKeysDown();
+        if (kDown & KEY_B) break;
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
 }

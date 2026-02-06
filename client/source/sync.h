@@ -49,4 +49,31 @@ bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
 SyncResult sync_download_title(const AppConfig *config, const TitleInfo *title,
                                SyncProgressCb progress);
 
+// Save details info (for details dialog)
+typedef struct {
+    // Local info
+    int local_file_count;
+    u32 local_size;
+    char local_hash[65];
+    bool local_exists;
+
+    // Server info (fetched from server)
+    bool server_exists;
+    int server_file_count;
+    u32 server_size;
+    char server_hash[65];
+    char server_last_sync[32];      // ISO 8601 date
+    char server_console_id[17];     // Which console uploaded
+
+    // Sync status
+    bool is_synced;           // local_hash == server_hash
+    bool has_last_synced;     // Whether we have a sync state file
+    char last_synced_hash[65];
+} SaveDetails;
+
+// Get detailed info about a save (local + server).
+// Fills details struct with information. Returns true on success.
+bool sync_get_save_details(const AppConfig *config, const TitleInfo *title,
+                           SaveDetails *details);
+
 #endif // SYNC_H

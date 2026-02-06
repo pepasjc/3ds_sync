@@ -352,6 +352,19 @@ int main(int argc, char *argv[]) {
             redraw = true;
         }
 
+        // R button - show save details
+        if (kDown & KEY_R && title_count > 0) {
+            ui_draw_message("Loading save details...");
+
+            SaveDetails details;
+            if (sync_get_save_details(&config, &titles[selected], &details)) {
+                ui_show_save_details(&titles[selected], &details);
+            } else {
+                snprintf(status, sizeof(status), "Failed to load save details");
+            }
+            redraw = true;
+        }
+
         if (redraw) {
             // Draw to both buffers to prevent flicker with double buffering
             for (int buf = 0; buf < 2; buf++) {

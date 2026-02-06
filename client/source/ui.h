@@ -2,6 +2,7 @@
 #define UI_H
 
 #include "common.h"
+#include "sync.h"
 
 // Initialize both screens for console output
 void ui_init(void);
@@ -21,5 +22,9 @@ void ui_update_progress(const char *msg);
 
 // Clear both screens
 void ui_clear(void);
+
+// Show save details dialog on top screen
+// Returns when user presses B to close
+void ui_show_save_details(const TitleInfo *title, const SaveDetails *details);
 
 #endif // UI_H

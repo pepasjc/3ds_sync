@@ -460,3 +460,103 @@ bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
     if (summary) *summary = local_summary;
     return true;
 }
+
+// Parse a JSON string value (no escapes, simple case)
+static bool json_parse_string(const char *json, const char *key, char *out, int out_size) {
+    const char *pos = json_find_key(json, key);
+    if (!pos || *pos != '"') return false;
+    pos++; // skip opening quote
+
+    const char *end = strchr(pos, '"');
+    if (!end) return false;
+
+    int len = (int)(end - pos);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, pos, len);
+    out[len] = '\0';
+    return true;
+}
+
+// Parse a JSON integer value
+static bool json_parse_int(const char *json, const char *key, int *out) {
+    const char *pos = json_find_key(json, key);
+    if (!pos) return false;
+    *out = atoi(pos);
+    return true;
+}
+
+bool sync_get_save_details(const AppConfig *config, const TitleInfo *title,
+                           SaveDetails *details) {
+    memset(details, 0, sizeof(SaveDetails));
+
+    // --- Get local info ---
+    ArchiveFile *files = (ArchiveFile *)malloc(MAX_SAVE_FILES * sizeof(ArchiveFile));
+    if (!files) return false;
+
+    int file_count = archive_read(title->title_id, title->media_type,
+                                  files, MAX_SAVE_FILES);
+    if (file_count > 0) {
+        details->local_exists = true;
+        details->local_file_count = file_count;
+
+        // Compute hash and total size
+        bundle_compute_save_hash(files, file_count, details->local_hash);
+        for (int i = 0; i < file_count; i++) {
+            details->local_size += files[i].size;
+        }
+        archive_free_files(files, file_count);
+    } else {
+        details->local_exists = (file_count == 0);  // 0 files = empty save, -1 = error/no save
+        details->local_file_count = 0;
+        details->local_size = 0;
+        strcpy(details->local_hash, "N/A");
+    }
+    free(files);
+
+    // --- Load last synced hash ---
+    details->has_last_synced = load_last_synced_hash(title->title_id_hex, details->last_synced_hash);
+
+    // --- Fetch server info ---
+    char path[64];
+    snprintf(path, sizeof(path), "/saves/%s/meta", title->title_id_hex);
+
+    u32 resp_size, status;
+    u8 *resp = network_get(config, path, &resp_size, &status);
+
+    if (resp && status == 200) {
+        // Null-terminate for string parsing
+        u8 *resp_str = (u8 *)realloc(resp, resp_size + 1);
+        if (resp_str) {
+            resp_str[resp_size] = '\0';
+            char *json = (char *)resp_str;
+
+            details->server_exists = true;
+
+            json_parse_string(json, "save_hash", details->server_hash, sizeof(details->server_hash));
+            json_parse_string(json, "last_sync", details->server_last_sync, sizeof(details->server_last_sync));
+            json_parse_string(json, "console_id", details->server_console_id, sizeof(details->server_console_id));
+
+            int size = 0, fc = 0;
+            if (json_parse_int(json, "save_size", &size)) details->server_size = (u32)size;
+            if (json_parse_int(json, "file_count", &fc)) details->server_file_count = fc;
+
+            free(resp_str);
+        } else {
+            free(resp);
+        }
+    } else if (resp) {
+        free(resp);
+        details->server_exists = false;
+    } else {
+        details->server_exists = false;
+    }
+
+    // --- Determine sync status ---
+    if (details->local_exists && details->server_exists) {
+        details->is_synced = (strcmp(details->local_hash, details->server_hash) == 0);
+    } else {
+        details->is_synced = false;
+    }
+
+    return true;
+}
