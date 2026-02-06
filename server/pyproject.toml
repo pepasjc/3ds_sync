@@ -1,0 +1,17 @@
+[project]
+name = "3dssync-server"
+version = "1.0.0"
+description = "PC server for 3DS save file sync"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "pydantic-settings>=2.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "httpx>=0.25.0",
+]

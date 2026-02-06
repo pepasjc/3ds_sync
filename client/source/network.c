@@ -1,0 +1,183 @@
+#include "network.h"
+#include <3ds/svc.h>
+
+#define HTTP_BUF_SIZE 0x1000 // 4KB read chunks
+#define MAX_RESPONSE  (2 * 1024 * 1024) // 2MB max response
+#define MAX_POST_SIZE 0x70000 // 448KB max POST body (leave headroom in 512KB buffer)
+
+// Brief delay between requests to let httpc clean up
+static void request_delay(void) {
+    svcSleepThread(50000000LL); // 50ms
+}
+
+bool network_init(void) {
+    // Shared memory size for POST data (512KB)
+    return R_SUCCEEDED(httpcInit(0x80000));
+}
+
+void network_exit(void) {
+    httpcExit();
+}
+
+// Build full URL from config base + path
+static void build_url(const AppConfig *config, const char *path, char *url, int url_size) {
+    snprintf(url, url_size, "%s/api/v1%s", config->server_url, path);
+}
+
+// Read full response body with dynamic buffer
+static u8 *read_response(httpcContext *context, u32 *out_size) {
+    u32 size = 0;
+    u32 buf_cap = HTTP_BUF_SIZE;
+    u8 *buf = (u8 *)malloc(buf_cap);
+    if (!buf) return NULL;
+
+    Result res;
+    do {
+        // Grow buffer if needed
+        if (size + HTTP_BUF_SIZE > buf_cap) {
+            buf_cap *= 2;
+            if (buf_cap > MAX_RESPONSE) {
+                free(buf);
+                return NULL;
+            }
+            u8 *new_buf = (u8 *)realloc(buf, buf_cap);
+            if (!new_buf) {
+                free(buf);
+                return NULL;
+            }
+            buf = new_buf;
+        }
+
+        u32 read = 0;
+        res = httpcDownloadData(context, buf + size, HTTP_BUF_SIZE, &read);
+        size += read;
+    } while (res == (s32)HTTPC_RESULTCODE_DOWNLOADPENDING);
+
+    if (R_FAILED(res) && res != HTTPC_RESULTCODE_DOWNLOADPENDING) {
+        free(buf);
+        return NULL;
+    }
+
+    *out_size = size;
+    return buf;
+}
+
+u8 *network_get(const AppConfig *config, const char *path,
+                u32 *out_size, u32 *out_status) {
+    request_delay(); // Let previous request fully clean up
+
+    char url[MAX_URL_LEN + 128];
+    build_url(config, path, url, sizeof(url));
+
+    httpcContext context;
+    Result res = httpcOpenContext(&context, HTTPC_METHOD_GET, url, 0);
+    if (R_FAILED(res)) return NULL;
+
+    httpcSetSSLOpt(&context, SSLCOPT_DisableVerify);
+    httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
+    httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
+    httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "Connection", "close");
+
+    res = httpcBeginRequest(&context);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
+
+    httpcGetResponseStatusCode(&context, out_status);
+
+    u8 *body = read_response(&context, out_size);
+    httpcCancelConnection(&context);
+    httpcCloseContext(&context);
+    return body;
+}
+
+u8 *network_post(const AppConfig *config, const char *path,
+                 const u8 *body, u32 body_size,
+                 u32 *out_size, u32 *out_status) {
+    request_delay(); // Let previous request fully clean up
+
+    // Reject oversized POST bodies that would overflow httpc buffer
+    if (body_size > MAX_POST_SIZE) return NULL;
+
+    char url[MAX_URL_LEN + 128];
+    build_url(config, path, url, sizeof(url));
+
+    httpcContext context;
+    Result res = httpcOpenContext(&context, HTTPC_METHOD_POST, url, 0);
+    if (R_FAILED(res)) return NULL;
+
+    httpcSetSSLOpt(&context, SSLCOPT_DisableVerify);
+    httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
+    httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
+    httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "Connection", "close");
+    httpcAddRequestHeaderField(&context, "Content-Type", "application/octet-stream");
+
+    res = httpcAddPostDataRaw(&context, (u32 *)body, body_size);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
+
+    res = httpcBeginRequest(&context);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
+
+    httpcGetResponseStatusCode(&context, out_status);
+
+    u8 *resp = read_response(&context, out_size);
+    httpcCancelConnection(&context);
+    httpcCloseContext(&context);
+    return resp;
+}
+
+u8 *network_post_json(const AppConfig *config, const char *path,
+                      const char *json_body,
+                      u32 *out_size, u32 *out_status) {
+    request_delay(); // Let previous request fully clean up
+
+    u32 json_len = strlen(json_body);
+    if (json_len > MAX_POST_SIZE) return NULL;
+
+    char url[MAX_URL_LEN + 128];
+    build_url(config, path, url, sizeof(url));
+
+    httpcContext context;
+    Result res = httpcOpenContext(&context, HTTPC_METHOD_POST, url, 0);
+    if (R_FAILED(res)) return NULL;
+
+    httpcSetSSLOpt(&context, SSLCOPT_DisableVerify);
+    httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
+    httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
+    httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "Connection", "close");
+    httpcAddRequestHeaderField(&context, "Content-Type", "application/json");
+
+    res = httpcAddPostDataRaw(&context, (u32 *)json_body, json_len);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
+
+    res = httpcBeginRequest(&context);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
+
+    httpcGetResponseStatusCode(&context, out_status);
+
+    u8 *resp = read_response(&context, out_size);
+    httpcCancelConnection(&context);
+    httpcCloseContext(&context);
+    return resp;
+}

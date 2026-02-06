@@ -1,0 +1,15 @@
+from pathlib import Path
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    save_dir: Path = Path(__file__).parent.parent / "saves"
+    api_key: str = "anything"
+    host: str = "0.0.0.0"
+    port: int = 8000
+    max_history_versions: int = 10
+
+    model_config = {"env_prefix": "SYNC_"}
+
+
+settings = Settings()

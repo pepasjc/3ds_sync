@@ -1,0 +1,146 @@
+"""Filesystem storage for save data.
+
+Saves are stored as:
+  saves/<title_id>/
+    metadata.json
+    current/          -- extracted save files
+    history/
+      <timestamp>/    -- previous versions
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.config import settings
+from app.models.save import SaveBundle, SaveMetadata
+
+
+def _title_dir(title_id: str) -> Path:
+    return settings.save_dir / title_id
+
+
+def _current_dir(title_id: str) -> Path:
+    return _title_dir(title_id) / "current"
+
+
+def _history_dir(title_id: str) -> Path:
+    return _title_dir(title_id) / "history"
+
+
+def _metadata_path(title_id: str) -> Path:
+    return _title_dir(title_id) / "metadata.json"
+
+
+def title_exists(title_id: str) -> bool:
+    return _metadata_path(title_id).exists()
+
+
+def list_titles() -> list[dict]:
+    """Return metadata for all stored titles."""
+    results = []
+    save_dir = settings.save_dir
+    if not save_dir.exists():
+        return results
+
+    for entry in sorted(save_dir.iterdir()):
+        meta_path = entry / "metadata.json"
+        if entry.is_dir() and meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            results.append(meta)
+
+    return results
+
+
+def get_metadata(title_id: str) -> SaveMetadata | None:
+    """Load metadata for a title, or None if it doesn't exist."""
+    path = _metadata_path(title_id)
+    if not path.exists():
+        return None
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return SaveMetadata(**data)
+
+
+def store_save(bundle: SaveBundle, source: str = "3ds") -> SaveMetadata:
+    """Store a save bundle to disk, archiving any existing save to history."""
+    title_id = bundle.title_id_hex
+    current = _current_dir(title_id)
+    history = _history_dir(title_id)
+
+    # Archive existing save to history
+    if current.exists():
+        old_meta = get_metadata(title_id)
+        if old_meta:
+            ts = old_meta.last_sync.replace(":", "_").replace("+", "_")
+            archive_dir = history / ts
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for item in current.iterdir():
+                if item.is_file():
+                    shutil.copy2(item, archive_dir / item.name)
+
+            # Prune old history
+            _prune_history(title_id)
+
+        # Clear current directory
+        shutil.rmtree(current)
+
+    # Write new save files
+    current.mkdir(parents=True, exist_ok=True)
+    for f in bundle.files:
+        file_path = current / f.path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(f.data)
+
+    # Compute bundle hash
+    all_data = b"".join(f.data for f in bundle.files)
+    bundle_hash = hashlib.sha256(all_data).hexdigest()
+
+    # Write metadata
+    now = datetime.now(timezone.utc).isoformat()
+    meta = SaveMetadata(
+        title_id=title_id,
+        name=title_id,  # no game name available from bundle alone
+        last_sync=now,
+        last_sync_source=source,
+        save_hash=bundle_hash,
+        save_size=bundle.total_size,
+        file_count=len(bundle.files),
+        client_timestamp=bundle.timestamp,
+        server_timestamp=now,
+    )
+
+    meta_path = _metadata_path(title_id)
+    meta_path.write_text(json.dumps(meta.to_dict(), indent=2), encoding="utf-8")
+
+    return meta
+
+
+def load_save_files(title_id: str) -> list[tuple[str, bytes]] | None:
+    """Load all save files for a title. Returns list of (path, data) or None."""
+    current = _current_dir(title_id)
+    if not current.exists():
+        return None
+
+    files = []
+    for file_path in sorted(current.rglob("*")):
+        if file_path.is_file():
+            rel_path = file_path.relative_to(current).as_posix()
+            files.append((rel_path, file_path.read_bytes()))
+    return files
+
+
+def _prune_history(title_id: str) -> None:
+    """Keep only the most recent N history versions."""
+    history = _history_dir(title_id)
+    if not history.exists():
+        return
+
+    versions = sorted(history.iterdir(), key=lambda p: p.name)
+    while len(versions) > settings.max_history_versions:
+        oldest = versions.pop(0)
+        shutil.rmtree(oldest)
