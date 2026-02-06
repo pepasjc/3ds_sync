@@ -22,25 +22,33 @@ static const char *media_type_str(FS_MediaType mt) {
 
 void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset) {
     consoleSelect(&top_screen);
-    consoleClear();
 
-    // Header
-    printf("\x1b[1;1H\x1b[36m--- 3DS Save Sync v%s ---\x1b[0m\n", APP_VERSION);
-    printf("\x1b[2;1H");
+    // Header (line 1) - pad to full width to overwrite without clearing
+    printf("\x1b[1;1H\x1b[36m--- 3DS Save Sync v%s ---\x1b[0m%-*s",
+        APP_VERSION, TOP_COLS - 24, "");
 
     if (count == 0) {
-        printf("\n  No titles with save data found.\n");
-        printf("  Make sure you have games installed.\n");
+        printf("\x1b[3;1H  No titles with save data found.%-*s", TOP_COLS - 34, "");
+        printf("\x1b[4;1H  Make sure you have games installed.%-*s", TOP_COLS - 38, "");
+        // Blank remaining lines with spaces
+        for (int i = 5; i <= TOP_ROWS; i++) {
+            printf("\x1b[%d;1H%-*s", i, TOP_COLS, "");
+        }
         return;
     }
 
-    // Title list (scrollable)
-    int visible = LIST_ROWS;
-    if (visible > count) visible = count;
-
-    for (int i = 0; i < visible; i++) {
+    // Title list (scrollable) - starts at line 3
+    for (int i = 0; i < LIST_ROWS; i++) {
+        int row = 3 + i;  // Start at line 3
         int idx = scroll_offset + i;
-        if (idx >= count) break;
+
+        printf("\x1b[%d;1H", row);  // Position cursor
+
+        if (idx >= count) {
+            // Blank line - overwrite with spaces
+            printf("%-*s", TOP_COLS, "");
+            continue;
+        }
 
         const TitleInfo *t = &titles[idx];
         const char *cursor = (idx == selected) ? ">" : " ";
@@ -54,37 +62,46 @@ void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int sc
         } else if (idx == selected) {
             color = "\x1b[33m";  // Yellow for selected
         } else {
-            color = "";
+            color = "\x1b[0m";
         }
 
-        // Truncate name to fit (50 cols - cursor(2) - media(5) - space(1) = 42 chars)
-        char display_name[43];
-        snprintf(display_name, sizeof(display_name), "%.42s", t->name);
-
-        printf(" %s %s%-4s %s\x1b[0m\n",
+        // Format line and pad to full width
+        char line[TOP_COLS + 1];
+        snprintf(line, sizeof(line), " %s %-4s %.42s",
             cursor,
-            color,
             media_type_str(t->media_type),
-            display_name);
+            t->name);
+
+        printf("%s%-*s\x1b[0m", color, TOP_COLS, line);
     }
 
-    // Footer with count
-    printf("\x1b[%d;1H\x1b[90m %d title(s) | D-Pad: navigate\x1b[0m", TOP_ROWS, count);
+    // Footer with count (last row) - pad to full width
+    char footer[TOP_COLS + 1];
+    snprintf(footer, sizeof(footer), " %d title(s) | D-Pad: navigate", count);
+    printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", TOP_ROWS, TOP_COLS, footer);
 }
+
+#define BOT_COLS 40  // Bottom screen width
 
 void ui_draw_status(const char *status_line) {
     consoleSelect(&bottom_screen);
-    consoleClear();
 
-    printf("\x1b[1;1H\x1b[36mActions:\x1b[0m\n\n");
-    printf(" A  - Upload save to server\n");
-    printf(" B  - Download save from server\n");
-    printf(" X  - Sync all (SD only)\n");
-    printf(" Y  - Rescan titles\n");
-    printf(" SELECT - Check for updates\n");
-    printf(" START - Exit\n");
-    printf("\n\x1b[36mCyan\x1b[0m = cartridge (A/B only)\n");
-    printf("\n\x1b[90m%s\x1b[0m", status_line ? status_line : "Ready.");
+    // Overwrite each line - pad to full width instead of clearing
+    printf("\x1b[1;1H\x1b[36mActions:\x1b[0m%-*s", BOT_COLS - 8, "");
+    printf("\x1b[2;1H%-*s", BOT_COLS, "");
+    printf("\x1b[3;1H A  - Upload save to server%-*s", BOT_COLS - 27, "");
+    printf("\x1b[4;1H B  - Download save from server%-*s", BOT_COLS - 31, "");
+    printf("\x1b[5;1H X  - Sync all (SD only)%-*s", BOT_COLS - 24, "");
+    printf("\x1b[6;1H Y  - Rescan titles%-*s", BOT_COLS - 19, "");
+    printf("\x1b[7;1H SELECT - Check for updates%-*s", BOT_COLS - 27, "");
+    printf("\x1b[8;1H START - Exit%-*s", BOT_COLS - 13, "");
+    printf("\x1b[9;1H%-*s", BOT_COLS, "");
+    printf("\x1b[10;1H\x1b[36mCyan\x1b[0m = cartridge (A/B only)%-*s", BOT_COLS - 27, "");
+    printf("\x1b[11;1H%-*s", BOT_COLS, "");
+
+    char status_padded[BOT_COLS + 1];
+    snprintf(status_padded, sizeof(status_padded), "%s", status_line ? status_line : "Ready.");
+    printf("\x1b[12;1H\x1b[90m%-*s\x1b[0m", BOT_COLS, status_padded);
 }
 
 void ui_draw_message(const char *msg) {
@@ -94,9 +111,9 @@ void ui_draw_message(const char *msg) {
 }
 
 void ui_update_progress(const char *msg) {
-    // Lightweight update: just overwrite line 1 without clearing whole screen
+    // Lightweight update: just overwrite line 1, pad to full width
     consoleSelect(&bottom_screen);
-    printf("\x1b[1;1H\x1b[2K%s", msg);  // Move to line 1, clear line, print
+    printf("\x1b[1;1H%-*s", BOT_COLS, msg);
 }
 
 void ui_clear(void) {

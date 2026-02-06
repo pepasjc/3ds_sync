@@ -125,8 +125,14 @@ int main(int argc, char *argv[]) {
     scan_titles();
 
     snprintf(status, sizeof(status), "Server: %.200s", config.server_url);
-    ui_draw_title_list(titles, title_count, selected, scroll_offset);
-    ui_draw_status(status);
+    // Draw to both buffers to prevent flicker
+    for (int buf = 0; buf < 2; buf++) {
+        ui_draw_title_list(titles, title_count, selected, scroll_offset);
+        ui_draw_status(status);
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
 
     // Main loop
     while (aptMainLoop()) {
@@ -347,13 +353,18 @@ int main(int argc, char *argv[]) {
         }
 
         if (redraw) {
-            ui_draw_title_list(titles, title_count, selected, scroll_offset);
-            ui_draw_status(status);
+            // Draw to both buffers to prevent flicker with double buffering
+            for (int buf = 0; buf < 2; buf++) {
+                ui_draw_title_list(titles, title_count, selected, scroll_offset);
+                ui_draw_status(status);
+                gfxFlushBuffers();
+                gfxSwapBuffers();
+                gspWaitForVBlank();
+            }
+        } else {
+            // No redraw needed, just wait for next frame
+            gspWaitForVBlank();
         }
-
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
     }
 
 cleanup:

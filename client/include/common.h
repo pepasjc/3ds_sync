@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define APP_VERSION "0.3.1"
+#define APP_VERSION "0.3.2"
 
 // Max values
 #define MAX_TITLES        256
