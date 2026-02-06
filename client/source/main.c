@@ -36,11 +36,12 @@ static void update_scroll(void) {
         scroll_offset = selected - LIST_VISIBLE + 1;
 }
 
-// Progress callback - lightweight update without screen clear or buffer swap
+// Progress callback for sync operations
 static void sync_progress(const char *message) {
     ui_update_progress(message);
-    // Don't call gfxSwapBuffers here - let the main loop handle it
-    // This avoids GPU overload during rapid sync operations
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
 }
 
 // Update progress callback
@@ -50,6 +51,9 @@ static void update_progress_cb(int pct) {
         char msg[64];
         snprintf(msg, sizeof(msg), "Progress: %d%%", pct);
         ui_update_progress(msg);
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
         last_pct = pct;
     }
     // Reset for next use when complete
@@ -83,9 +87,11 @@ int main(int argc, char *argv[]) {
         ui_draw_message(msg);
 
         while (aptMainLoop()) {
-            gspWaitForVBlank();
             hidScanInput();
             if (hidKeysDown() & KEY_START) break;
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
         }
 
         fsExit();
@@ -102,9 +108,11 @@ int main(int argc, char *argv[]) {
             "Press START to exit.");
 
         while (aptMainLoop()) {
-            gspWaitForVBlank();
             hidScanInput();
             if (hidKeysDown() & KEY_START) break;
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
         }
 
         fsExit();
@@ -122,7 +130,6 @@ int main(int argc, char *argv[]) {
 
     // Main loop
     while (aptMainLoop()) {
-        gspWaitForVBlank();
         hidScanInput();
         u32 kDown = hidKeysDown();
 
@@ -235,9 +242,11 @@ int main(int argc, char *argv[]) {
                     ui_draw_message(conflict_msg);
                     // Wait for any button press
                     while (aptMainLoop()) {
-                        gspWaitForVBlank();
                         hidScanInput();
                         if (hidKeysDown()) break;
+                        gfxFlushBuffers();
+                        gfxSwapBuffers();
+                        gspWaitForVBlank();
                     }
 
                     snprintf(status, sizeof(status),
@@ -283,11 +292,13 @@ int main(int argc, char *argv[]) {
                 // Wait for A or B
                 bool do_update = false;
                 while (aptMainLoop()) {
-                    gspWaitForVBlank();
                     hidScanInput();
                     u32 k = hidKeysDown();
                     if (k & KEY_A) { do_update = true; break; }
                     if (k & KEY_B) { break; }
+                    gfxFlushBuffers();
+                    gfxSwapBuffers();
+                    gspWaitForVBlank();
                 }
 
                 if (do_update) {
@@ -318,9 +329,11 @@ int main(int argc, char *argv[]) {
                                 "Press START to exit.");
 
                             while (aptMainLoop()) {
-                                gspWaitForVBlank();
                                 hidScanInput();
                                 if (hidKeysDown() & KEY_START) break;
+                                gfxFlushBuffers();
+                                gfxSwapBuffers();
+                                gspWaitForVBlank();
                             }
 
                             goto cleanup;
@@ -337,6 +350,10 @@ int main(int argc, char *argv[]) {
             ui_draw_title_list(titles, title_count, selected, scroll_offset);
             ui_draw_status(status);
         }
+
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
     }
 
 cleanup:
