@@ -89,15 +89,15 @@ void ui_draw_status(const char *status_line) {
 
     // Overwrite each line - pad to full width instead of clearing
     printf("\x1b[1;1H\x1b[36mActions:\x1b[0m%-*s", BOT_COLS - 8, "");
-    printf("\x1b[2;1H%-*s", BOT_COLS, "");
-    printf("\x1b[3;1H A  - Upload save to server%-*s", BOT_COLS - 27, "");
-    printf("\x1b[4;1H B  - Download save from server%-*s", BOT_COLS - 31, "");
-    printf("\x1b[5;1H X  - Sync all (SD only)%-*s", BOT_COLS - 24, "");
-    printf("\x1b[6;1H Y  - Rescan titles%-*s", BOT_COLS - 19, "");
-    printf("\x1b[7;1H R  - Save details%-*s", BOT_COLS - 18, "");
-    printf("\x1b[8;1H SELECT - Updates | START - Exit%-*s", BOT_COLS - 32, "");
-    printf("\x1b[9;1H%-*s", BOT_COLS, "");
-    printf("\x1b[10;1H\x1b[36mCyan\x1b[0m = cartridge (A/B only)%-*s", BOT_COLS - 27, "");
+    printf("\x1b[2;1H A - Upload | B - Download%-*s", BOT_COLS - 26, "");
+    printf("\x1b[3;1H X - Sync all (SD only)%-*s", BOT_COLS - 23, "");
+    printf("\x1b[4;1H Y - Rescan titles%-*s", BOT_COLS - 18, "");
+    printf("\x1b[5;1H L - Config | R - Save details%-*s", BOT_COLS - 30, "");
+    printf("\x1b[6;1H SELECT - Updates%-*s", BOT_COLS - 17, "");
+    printf("\x1b[7;1H START - Exit%-*s", BOT_COLS - 13, "");
+    printf("\x1b[8;1H%-*s", BOT_COLS, "");
+    printf("\x1b[9;1H\x1b[36mCyan\x1b[0m = cartridge (A/B only)%-*s", BOT_COLS - 27, "");
+    printf("\x1b[10;1H%-*s", BOT_COLS, "");
     printf("\x1b[11;1H%-*s", BOT_COLS, "");
 
     char status_padded[BOT_COLS + 1];
@@ -233,4 +233,127 @@ void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
         gfxSwapBuffers();
         gspWaitForVBlank();
     }
+}
+
+#include "config.h"
+
+// Draw config editor menu
+static void draw_config_menu(const AppConfig *config, int selected) {
+    consoleSelect(&top_screen);
+    consoleClear();
+
+    int row = 1;
+
+    printf("\x1b[%d;1H\x1b[36m--- Configuration ---\x1b[0m", row++);
+    row++;
+
+    // Menu items
+    const char *items[] = {
+        "Server URL",
+        "API Key",
+        "Save & Exit",
+        "Cancel"
+    };
+    const int item_count = 4;
+
+    for (int i = 0; i < item_count; i++) {
+        const char *cursor = (i == selected) ? ">" : " ";
+        const char *color = (i == selected) ? "\x1b[33m" : "\x1b[0m";
+
+        printf("\x1b[%d;1H%s%s %s\x1b[0m", row++, color, cursor, items[i]);
+
+        // Show current value for editable items
+        if (i == 0) {
+            printf("\x1b[%d;1H   \x1b[90m%.44s\x1b[0m", row++, config->server_url);
+        } else if (i == 1) {
+            // Mask API key for privacy
+            int len = strlen(config->api_key);
+            if (len > 4) {
+                printf("\x1b[%d;1H   \x1b[90m%.4s****\x1b[0m", row++, config->api_key);
+            } else {
+                printf("\x1b[%d;1H   \x1b[90m(not set)\x1b[0m", row++);
+            }
+        }
+        row++;
+    }
+
+    row++;
+    printf("\x1b[%d;1H\x1b[90mConsole ID: %s\x1b[0m", row++, config->console_id);
+
+    // Footer
+    printf("\x1b[%d;1H\x1b[90m A: Edit | D-Pad: Navigate\x1b[0m", TOP_ROWS);
+}
+
+bool ui_show_config_editor(AppConfig *config) {
+    // Make a working copy
+    AppConfig working;
+    memcpy(&working, config, sizeof(AppConfig));
+
+    int selected = 0;
+    bool changed = false;
+    bool running = true;
+
+    while (running && aptMainLoop()) {
+        // Draw menu to both buffers
+        for (int buf = 0; buf < 2; buf++) {
+            draw_config_menu(&working, selected);
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+        }
+
+        // Wait for input
+        while (aptMainLoop()) {
+            hidScanInput();
+            u32 kDown = hidKeysDown();
+
+            if (kDown & KEY_UP) {
+                selected = (selected - 1 + 4) % 4;
+                break;
+            }
+            if (kDown & KEY_DOWN) {
+                selected = (selected + 1) % 4;
+                break;
+            }
+            if (kDown & KEY_B) {
+                // Cancel without saving
+                running = false;
+                break;
+            }
+            if (kDown & KEY_A) {
+                if (selected == 0) {
+                    // Edit server URL
+                    if (config_edit_field("http://192.168.1.100:8000", working.server_url, MAX_URL_LEN)) {
+                        changed = true;
+                    }
+                    break;
+                } else if (selected == 1) {
+                    // Edit API key
+                    if (config_edit_field("your-api-key", working.api_key, MAX_API_KEY_LEN)) {
+                        changed = true;
+                    }
+                    break;
+                } else if (selected == 2) {
+                    // Save & Exit
+                    if (changed) {
+                        memcpy(config, &working, sizeof(AppConfig));
+                        config_save(config);
+                    }
+                    running = false;
+                    break;
+                } else if (selected == 3) {
+                    // Cancel
+                    changed = false;
+                    running = false;
+                    break;
+                }
+            }
+
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+        }
+    }
+
+    return changed;
 }

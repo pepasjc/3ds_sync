@@ -365,6 +365,16 @@ int main(int argc, char *argv[]) {
             redraw = true;
         }
 
+        // L button - config editor
+        if (kDown & KEY_L) {
+            if (ui_show_config_editor(&config)) {
+                snprintf(status, sizeof(status), "Config saved. Server: %.30s", config.server_url);
+            } else {
+                snprintf(status, sizeof(status), "Config unchanged");
+            }
+            redraw = true;
+        }
+
         if (redraw) {
             // Draw to both buffers to prevent flicker with double buffering
             for (int buf = 0; buf < 2; buf++) {

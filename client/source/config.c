@@ -134,3 +134,48 @@ bool config_load(AppConfig *config, char *error_out, int error_size) {
 
     return true;
 }
+
+bool config_save(const AppConfig *config) {
+    // Ensure directory exists
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/3dssync", 0777);
+
+    FILE *f = fopen(CONFIG_PATH, "w");
+    if (!f) return false;
+
+    fprintf(f, "# 3DS Save Sync Configuration\n");
+    fprintf(f, "server_url=%s\n", config->server_url);
+    fprintf(f, "api_key=%s\n", config->api_key);
+
+    fclose(f);
+    return true;
+}
+
+bool config_edit_field(const char *hint, char *buffer, int max_len) {
+    SwkbdState swkbd;
+    char temp[256];
+
+    // Copy current value to temp buffer
+    strncpy(temp, buffer, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    // Initialize keyboard
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, max_len);
+    swkbdSetInitialText(&swkbd, temp);
+    swkbdSetHintText(&swkbd, hint);
+    swkbdSetButton(&swkbd, SWKBD_BUTTON_LEFT, "Cancel", false);
+    swkbdSetButton(&swkbd, SWKBD_BUTTON_RIGHT, "OK", true);
+    swkbdSetFeatures(&swkbd, SWKBD_PREDICTIVE_INPUT);
+
+    // Show keyboard
+    SwkbdButton button = swkbdInputText(&swkbd, temp, sizeof(temp));
+
+    if (button == SWKBD_BUTTON_RIGHT) {
+        // User confirmed - copy back
+        strncpy(buffer, temp, max_len - 1);
+        buffer[max_len - 1] = '\0';
+        return true;
+    }
+
+    return false;  // Cancelled
+}

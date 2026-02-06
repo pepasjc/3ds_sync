@@ -27,4 +27,8 @@ void ui_clear(void);
 // Returns when user presses B to close
 void ui_show_save_details(const TitleInfo *title, const SaveDetails *details);
 
+// Show config editor menu on top screen
+// Returns true if config was changed, false otherwise
+bool ui_show_config_editor(AppConfig *config);
+
 #endif // UI_H
