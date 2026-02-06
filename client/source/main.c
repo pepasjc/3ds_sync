@@ -19,6 +19,12 @@ static void scan_titles(void) {
     title_count = titles_scan(titles, MAX_TITLES);
     selected = 0;
     scroll_offset = 0;
+
+    // Fetch game names from server
+    if (title_count > 0) {
+        ui_draw_message("Fetching game names...");
+        titles_fetch_names(&config, titles, title_count);
+    }
 }
 
 // Clamp scroll so the selected item is always visible
@@ -146,20 +152,92 @@ int main(int argc, char *argv[]) {
 
         if (kDown & KEY_A && title_count > 0) {
             SyncResult res = sync_title(&config, &titles[selected], sync_progress);
-            if (res == SYNC_OK)
-                snprintf(status, sizeof(status), "Uploaded: %s", titles[selected].title_id_hex);
-            else
-                snprintf(status, sizeof(status), "\x1b[31mSync failed\x1b[0m: %s (err %d)",
-                    titles[selected].title_id_hex, res);
+            if (res == SYNC_OK) {
+                snprintf(status, sizeof(status), "Uploaded: %.40s", titles[selected].name);
+                titles[selected].in_conflict = false;  // Resolved by uploading
+            } else {
+                snprintf(status, sizeof(status), "\x1b[31mUpload failed\x1b[0m: %s",
+                    sync_result_str(res));
+            }
+            redraw = true;
+        }
+
+        if (kDown & KEY_B && title_count > 0) {
+            // Force download from server
+            SyncResult res = sync_download_title(&config, &titles[selected], sync_progress);
+            if (res == SYNC_OK) {
+                snprintf(status, sizeof(status), "Downloaded: %.40s", titles[selected].name);
+                titles[selected].in_conflict = false;  // Resolved by downloading
+            } else {
+                snprintf(status, sizeof(status), "\x1b[31mDownload failed\x1b[0m: %s",
+                    sync_result_str(res));
+            }
             redraw = true;
         }
 
         if (kDown & KEY_X && title_count > 0) {
-            int synced = sync_all(&config, titles, title_count, sync_progress);
-            if (synced >= 0)
-                snprintf(status, sizeof(status), "Sync complete: %d title(s) synced.", synced);
-            else
+            // Clear all conflict flags before sync
+            for (int i = 0; i < title_count; i++)
+                titles[i].in_conflict = false;
+
+            SyncSummary summary;
+            bool ok = sync_all(&config, titles, title_count, sync_progress, &summary);
+            if (ok) {
+                // Mark conflicting titles in our list
+                for (int i = 0; i < summary.conflicts && i < MAX_CONFLICT_DISPLAY; i++) {
+                    for (int j = 0; j < title_count; j++) {
+                        if (strcmp(titles[j].title_id_hex, summary.conflict_titles[i]) == 0) {
+                            titles[j].in_conflict = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (summary.conflicts > 0) {
+                    // Show conflict details - use game names
+                    char conflict_msg[512];
+                    int pos = snprintf(conflict_msg, sizeof(conflict_msg),
+                        "\x1b[33mSync completed with %d conflict(s):\x1b[0m\n\n",
+                        summary.conflicts);
+
+                    // List conflicting titles by name
+                    for (int i = 0; i < title_count && pos < (int)sizeof(conflict_msg) - 50; i++) {
+                        if (titles[i].in_conflict) {
+                            pos += snprintf(conflict_msg + pos, sizeof(conflict_msg) - pos,
+                                "  %.35s\n", titles[i].name);
+                        }
+                    }
+                    if (summary.conflicts > MAX_CONFLICT_DISPLAY) {
+                        pos += snprintf(conflict_msg + pos, sizeof(conflict_msg) - pos,
+                            "  ...and %d more\n", summary.conflicts - MAX_CONFLICT_DISPLAY);
+                    }
+
+                    snprintf(conflict_msg + pos, sizeof(conflict_msg) - pos,
+                        "\nConflicts shown in \x1b[31mred\x1b[0m.\n"
+                        "Select and use A/B to resolve.\n\n"
+                        "Press any button to continue.");
+
+                    ui_draw_message(conflict_msg);
+                    // Wait for any button press
+                    while (aptMainLoop()) {
+                        gspWaitForVBlank();
+                        hidScanInput();
+                        if (hidKeysDown()) break;
+                    }
+
+                    snprintf(status, sizeof(status),
+                        "Up:%d Dn:%d OK:%d \x1b[33mConflict:%d\x1b[0m Fail:%d",
+                        summary.uploaded, summary.downloaded, summary.up_to_date,
+                        summary.conflicts, summary.failed);
+                } else {
+                    snprintf(status, sizeof(status),
+                        "Up:%d Dn:%d OK:%d Fail:%d",
+                        summary.uploaded, summary.downloaded, summary.up_to_date,
+                        summary.failed);
+                }
+            } else {
                 snprintf(status, sizeof(status), "\x1b[31mSync failed!\x1b[0m Check server.");
+            }
             redraw = true;
         }
 

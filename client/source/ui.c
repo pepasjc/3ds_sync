@@ -44,15 +44,28 @@ void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int sc
 
         const TitleInfo *t = &titles[idx];
         const char *cursor = (idx == selected) ? ">" : " ";
-        const char *highlight = (idx == selected) ? "\x1b[33m" : "";
-        const char *reset = (idx == selected) ? "\x1b[0m" : "";
 
-        printf(" %s %s%-4s %s%s\n",
+        // Color: red for conflict, cyan for cartridge, yellow for selected, white otherwise
+        const char *color;
+        if (t->in_conflict) {
+            color = "\x1b[31m";  // Red for conflict
+        } else if (t->media_type == MEDIATYPE_GAME_CARD) {
+            color = "\x1b[36m";  // Cyan for cartridge (manual sync only)
+        } else if (idx == selected) {
+            color = "\x1b[33m";  // Yellow for selected
+        } else {
+            color = "";
+        }
+
+        // Truncate name to fit (50 cols - cursor(2) - media(5) - space(1) = 42 chars)
+        char display_name[43];
+        snprintf(display_name, sizeof(display_name), "%.42s", t->name);
+
+        printf(" %s %s%-4s %s\x1b[0m\n",
             cursor,
-            highlight,
+            color,
             media_type_str(t->media_type),
-            t->title_id_hex,
-            reset);
+            display_name);
     }
 
     // Footer with count
@@ -64,10 +77,12 @@ void ui_draw_status(const char *status_line) {
     consoleClear();
 
     printf("\x1b[1;1H\x1b[36mActions:\x1b[0m\n\n");
-    printf(" A  - Sync this title\n");
-    printf(" X  - Sync all titles\n");
+    printf(" A  - Upload save to server\n");
+    printf(" B  - Download save from server\n");
+    printf(" X  - Sync all (SD only)\n");
     printf(" Y  - Rescan titles\n");
     printf(" START - Exit\n");
+    printf("\n\x1b[36mCyan\x1b[0m = cartridge (A/B only)\n");
     printf("\n\x1b[90m%s\x1b[0m", status_line ? status_line : "Ready.");
 }
 

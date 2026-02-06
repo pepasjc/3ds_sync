@@ -10,6 +10,7 @@ from pydantic import BaseModel, field_validator
 
 BUNDLE_MAGIC = b"3DSS"
 BUNDLE_VERSION = 1
+BUNDLE_VERSION_COMPRESSED = 2
 
 
 @dataclass

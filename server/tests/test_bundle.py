@@ -95,10 +95,20 @@ class TestBundleErrors:
         with pytest.raises(BundleError, match="Unsupported version"):
             parse_bundle(data)
 
-    def test_corrupted_hash(self):
+    def test_corrupted_compressed_data(self):
+        """Corrupting compressed data should cause decompression failure."""
         original = _make_bundle()
-        data = bytearray(create_bundle(original))
-        # Corrupt the last byte of data
+        data = bytearray(create_bundle(original, compress=True))
+        # Corrupt the last byte of compressed data
+        data[-1] ^= 0xFF
+        with pytest.raises(BundleError, match="Decompression failed"):
+            parse_bundle(bytes(data))
+
+    def test_corrupted_hash_uncompressed(self):
+        """Corrupting uncompressed file data should cause hash mismatch."""
+        original = _make_bundle()
+        data = bytearray(create_bundle(original, compress=False))
+        # Corrupt the last byte of file data
         data[-1] ^= 0xFF
         with pytest.raises(BundleError, match="Hash mismatch"):
             parse_bundle(bytes(data))

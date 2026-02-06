@@ -23,7 +23,10 @@ typedef struct {
     u64 title_id;
     FS_MediaType media_type;
     char title_id_hex[17]; // 16 hex chars + null
+    char product_code[16]; // Product code from AM (e.g., CTR-P-BRBE)
+    char name[64];         // Game name (from server lookup or product code)
     bool has_save_data;
+    bool in_conflict;      // Set after sync if this title has a conflict
 } TitleInfo;
 
 // App configuration loaded from SD card

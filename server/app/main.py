@@ -5,11 +5,15 @@ from fastapi import FastAPI
 from app.config import settings
 from app.middleware.auth import APIKeyMiddleware
 from app.routes import saves, status, sync, titles
+from app.services import game_names
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.save_dir.mkdir(parents=True, exist_ok=True)
+    # Load game names database
+    count = game_names.load_database()
+    print(f"Loaded {count} game names from database")
     yield
 
 

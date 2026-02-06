@@ -9,6 +9,19 @@
 
 #define MAX_SAVE_FILES 64
 #define STATE_DIR "sdmc:/3ds/3dssync/state"
+#define MAX_UPLOAD_SIZE 0x70000  // 448KB compressed - bundles are zlib compressed
+
+const char *sync_result_str(SyncResult result) {
+    switch (result) {
+        case SYNC_OK:           return "OK";
+        case SYNC_ERR_NETWORK:  return "Network error";
+        case SYNC_ERR_SERVER:   return "Server error";
+        case SYNC_ERR_ARCHIVE:  return "Save read/write error";
+        case SYNC_ERR_BUNDLE:   return "Bundle format error";
+        case SYNC_ERR_TOO_LARGE: return "Save too large";
+        default:                return "Unknown error";
+    }
+}
 
 // Load the last synced hash for a title from the state file.
 // Returns true and fills hash_out (65 bytes) on success.
@@ -158,6 +171,12 @@ static SyncResult upload_title_with_hash(const AppConfig *config, const TitleInf
 
     if (!bundle) return SYNC_ERR_BUNDLE;
 
+    // Check size before attempting upload
+    if (bundle_size > MAX_UPLOAD_SIZE) {
+        free(bundle);
+        return SYNC_ERR_TOO_LARGE;
+    }
+
     // POST to server
     char path[64];
     snprintf(path, sizeof(path), "/saves/%s", title->title_id_hex);
@@ -197,8 +216,14 @@ static SyncResult download_title(const AppConfig *config, const TitleInfo *title
 
     u64 tid;
     u32 ts;
-    int file_count = bundle_parse(resp, resp_size, &tid, &ts, files, MAX_SAVE_FILES);
-    if (file_count < 0) { free(files); free(resp); return SYNC_ERR_BUNDLE; }
+    u8 *decompressed = NULL;
+    int file_count = bundle_parse(resp, resp_size, &tid, &ts, files, MAX_SAVE_FILES, &decompressed);
+    if (file_count < 0) {
+        free(files);
+        if (decompressed) free(decompressed);
+        free(resp);
+        return SYNC_ERR_BUNDLE;
+    }
 
     // Compute hash of downloaded save (before write, while data is valid)
     char new_hash[65];
@@ -210,7 +235,10 @@ static SyncResult download_title(const AppConfig *config, const TitleInfo *title
     // Write to save archive
     bool ok = archive_write(title->title_id, title->media_type, files, file_count);
     free(files);
-    free(resp); // frees the parsed file data too (pointers into resp)
+    // Free decompressed buffer if we had a compressed bundle
+    // (file data pointers point into decompressed, not resp)
+    if (decompressed) free(decompressed);
+    free(resp);
 
     if (ok) {
         // Download and write succeeded - save this hash as last synced state
@@ -227,27 +255,43 @@ SyncResult sync_title(const AppConfig *config, const TitleInfo *title,
     return upload_title_with_hash(config, title, progress, NULL);
 }
 
-int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
-             SyncProgressCb progress) {
+SyncResult sync_download_title(const AppConfig *config, const TitleInfo *title,
+                               SyncProgressCb progress) {
+    // Force download from server, ignoring local state
+    return download_title(config, title, progress);
+}
+
+bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
+              SyncProgressCb progress, SyncSummary *summary) {
+    // Initialize summary
+    SyncSummary local_summary = {0};
+
     if (progress) progress("Preparing sync metadata...");
 
     // Cache for computed hashes (needed for upload later)
     char (*hash_cache)[65] = (char (*)[65])malloc(title_count * 65);
-    if (!hash_cache) return -1;
+    if (!hash_cache) return false;
 
     // Heap-allocate files array to avoid stack overflow
     ArchiveFile *files = (ArchiveFile *)malloc(MAX_SAVE_FILES * sizeof(ArchiveFile));
-    if (!files) { free(hash_cache); return -1; }
+    if (!files) { free(hash_cache); return false; }
 
     // Build JSON for sync request
     // Estimate: ~230 bytes per title (with last_synced_hash) + overhead
     int json_cap = title_count * 230 + 64;
     char *json = (char *)malloc(json_cap);
-    if (!json) { free(files); free(hash_cache); return -1; }
+    if (!json) { free(files); free(hash_cache); return false; }
 
     int pos = snprintf(json, json_cap, "{\"titles\":[");
+    bool first_title = true;
 
     for (int i = 0; i < title_count; i++) {
+        // Skip cartridge games in automatic sync (use manual A/B buttons instead)
+        if (titles[i].media_type == MEDIATYPE_GAME_CARD) {
+            hash_cache[i][0] = '\0';  // Mark as skipped
+            continue;
+        }
+
         char msg[128];
         snprintf(msg, sizeof(msg), "Hashing save %d/%d: %s",
             i + 1, title_count, titles[i].title_id_hex);
@@ -275,7 +319,8 @@ int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
         char last_synced[65] = {0};
         bool has_last_synced = load_last_synced_hash(titles[i].title_id_hex, last_synced);
 
-        if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
+        if (!first_title) pos += snprintf(json + pos, json_cap - pos, ",");
+        first_title = false;
         pos += build_title_json(json + pos, json_cap - pos, &titles[i],
                                current_hash, total_size,
                                has_last_synced ? last_synced : NULL);
@@ -293,36 +338,57 @@ int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
     u8 *resp = network_post_json(config, "/sync", json, &resp_size, &status);
     free(json);
 
-    if (!resp) { free(hash_cache); return -1; }
-    if (status != 200) { free(resp); free(hash_cache); return -1; }
+    if (!resp) { free(hash_cache); return false; }
+    if (status != 200) { free(resp); free(hash_cache); return false; }
 
     // Null-terminate response for string parsing
     u8 *resp_str = (u8 *)realloc(resp, resp_size + 1);
-    if (!resp_str) { free(resp); free(hash_cache); return -1; }
+    if (!resp_str) { free(resp); free(hash_cache); return false; }
     resp_str[resp_size] = '\0';
     char *plan = (char *)resp_str;
 
-    // Parse sync plan - heap allocate to avoid stack overflow (256 * 17 * 3 = 13KB)
+    // Parse sync plan - heap allocate to avoid stack overflow (256 * 17 * 5 = 21KB)
     char (*upload_ids)[17] = (char (*)[17])malloc(MAX_TITLES * 17);
     char (*download_ids)[17] = (char (*)[17])malloc(MAX_TITLES * 17);
     char (*server_only_ids)[17] = (char (*)[17])malloc(MAX_TITLES * 17);
+    char (*conflict_ids)[17] = (char (*)[17])malloc(MAX_TITLES * 17);
+    char (*up_to_date_ids)[17] = (char (*)[17])malloc(MAX_TITLES * 17);
 
-    if (!upload_ids || !download_ids || !server_only_ids) {
+    if (!upload_ids || !download_ids || !server_only_ids || !conflict_ids || !up_to_date_ids) {
         free(upload_ids);
         free(download_ids);
         free(server_only_ids);
+        free(conflict_ids);
+        free(up_to_date_ids);
         free(resp_str);
         free(hash_cache);
-        return -1;
+        return false;
     }
 
     int upload_count = json_parse_string_array(plan, "upload", upload_ids, MAX_TITLES);
     int download_count = json_parse_string_array(plan, "download", download_ids, MAX_TITLES);
     int server_only_count = json_parse_string_array(plan, "server_only", server_only_ids, MAX_TITLES);
+    int conflict_count = json_parse_string_array(plan, "conflict", conflict_ids, MAX_TITLES);
+    int up_to_date_count = json_parse_string_array(plan, "up_to_date", up_to_date_ids, MAX_TITLES);
 
     free(resp_str);
 
-    int synced = 0;
+    // Record counts in summary
+    local_summary.up_to_date = up_to_date_count;
+    local_summary.conflicts = conflict_count;
+    local_summary.skipped = server_only_count; // Will reduce as we download
+
+    // Copy conflict title IDs for UI display (up to MAX_CONFLICT_DISPLAY)
+    int copy_count = conflict_count < MAX_CONFLICT_DISPLAY ? conflict_count : MAX_CONFLICT_DISPLAY;
+    for (int i = 0; i < copy_count; i++) {
+        strncpy(local_summary.conflict_titles[i], conflict_ids[i], 16);
+        local_summary.conflict_titles[i][16] = '\0';
+    }
+    // Clear remaining slots
+    for (int i = copy_count; i < MAX_CONFLICT_DISPLAY; i++) {
+        local_summary.conflict_titles[i][0] = '\0';
+    }
+
     char msg[128];
 
     // Process uploads
@@ -335,7 +401,9 @@ int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
                 if (progress) progress(msg);
 
                 if (upload_title_with_hash(config, &titles[j], NULL, hash_cache[j]) == SYNC_OK)
-                    synced++;
+                    local_summary.uploaded++;
+                else
+                    local_summary.failed++;
                 break;
             }
         }
@@ -353,13 +421,15 @@ int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
                 if (progress) progress(msg);
 
                 if (download_title(config, &titles[j], NULL) == SYNC_OK)
-                    synced++;
+                    local_summary.downloaded++;
+                else
+                    local_summary.failed++;
                 break;
             }
         }
     }
 
-    // server_only titles also need download, but only if title exists locally
+    // server_only titles: download if title exists locally
     for (int i = 0; i < server_only_count; i++) {
         for (int j = 0; j < title_count; j++) {
             if (strcmp(titles[j].title_id_hex, server_only_ids[i]) == 0) {
@@ -367,16 +437,26 @@ int sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
                     ++dl_done, total_dl, server_only_ids[i]);
                 if (progress) progress(msg);
 
-                if (download_title(config, &titles[j], NULL) == SYNC_OK)
-                    synced++;
+                if (download_title(config, &titles[j], NULL) == SYNC_OK) {
+                    local_summary.downloaded++;
+                    local_summary.skipped--; // Was counted as skipped, now downloaded
+                } else {
+                    local_summary.failed++;
+                    local_summary.skipped--;
+                }
                 break;
             }
         }
+        // If not found locally, remains in skipped count
     }
 
     free(upload_ids);
     free(download_ids);
     free(server_only_ids);
+    free(conflict_ids);
+    free(up_to_date_ids);
     free(hash_cache);
-    return synced;
+
+    if (summary) *summary = local_summary;
+    return true;
 }
