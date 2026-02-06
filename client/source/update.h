@@ -23,6 +23,11 @@ bool update_download(const AppConfig *config, const char *url, UpdateProgressCb 
 
 // Install CIA from SD card using AM service.
 // Returns true on success.
-bool update_install(UpdateProgressCb progress);
+// error_out receives a description of what failed (if not NULL).
+bool update_install(UpdateProgressCb progress, char *error_out, int error_size);
+
+// Relaunch the application (works for CIA apps only).
+// This function does not return on success.
+void update_relaunch(void);
 
 #endif // UPDATE_H

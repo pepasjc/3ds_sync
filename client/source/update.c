@@ -11,6 +11,14 @@
 // Download buffer size
 #define DOWNLOAD_CHUNK_SIZE 0x8000  // 32KB
 
+// Helper to set error message
+static void set_error(char *error_out, int error_size, const char *msg) {
+    if (error_out && error_size > 0) {
+        strncpy(error_out, msg, error_size - 1);
+        error_out[error_size - 1] = '\0';
+    }
+}
+
 // Simple JSON string extraction (no external library needed)
 // Finds "key": "value" and copies value to out (up to out_size - 1 chars)
 static bool json_get_string(const char *json, const char *key, char *out, int out_size) {
@@ -166,10 +174,11 @@ bool update_download(const AppConfig *config, const char *url, UpdateProgressCb 
     return true;
 }
 
-bool update_install(UpdateProgressCb progress) {
+bool update_install(UpdateProgressCb progress, char *error_out, int error_size) {
     // Open the CIA file
     FILE *f = fopen(UPDATE_CIA_PATH, "rb");
     if (!f) {
+        set_error(error_out, error_size, "Cannot open CIA file");
         return false;
     }
 
@@ -180,6 +189,7 @@ bool update_install(UpdateProgressCb progress) {
 
     if (file_size == 0) {
         fclose(f);
+        set_error(error_out, error_size, "CIA file is empty");
         return false;
     }
 
@@ -190,6 +200,9 @@ bool update_install(UpdateProgressCb progress) {
     Result res = AM_StartCiaInstall(MEDIATYPE_SD, &cia_handle);
     if (R_FAILED(res)) {
         fclose(f);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "AM_StartCiaInstall: %08lX", res);
+        set_error(error_out, error_size, msg);
         return false;
     }
 
@@ -198,11 +211,13 @@ bool update_install(UpdateProgressCb progress) {
     if (!buffer) {
         AM_CancelCIAInstall(cia_handle);
         fclose(f);
+        set_error(error_out, error_size, "Out of memory");
         return false;
     }
 
     u32 total_written = 0;
     bool success = true;
+    Result write_res = 0;
 
     while (total_written < file_size) {
         u32 to_read = file_size - total_written;
@@ -210,14 +225,18 @@ bool update_install(UpdateProgressCb progress) {
 
         size_t read = fread(buffer, 1, to_read, f);
         if (read != to_read) {
+            set_error(error_out, error_size, "Failed to read CIA");
             success = false;
             break;
         }
 
         // Write to CIA handle
         u32 written = 0;
-        res = FSFILE_Write(cia_handle, &written, total_written, buffer, to_read, FS_WRITE_FLUSH);
-        if (R_FAILED(res) || written != to_read) {
+        write_res = FSFILE_Write(cia_handle, &written, total_written, buffer, to_read, FS_WRITE_FLUSH);
+        if (R_FAILED(write_res) || written != to_read) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "FSFILE_Write: %08lX", write_res);
+            set_error(error_out, error_size, msg);
             success = false;
             break;
         }
@@ -241,6 +260,9 @@ bool update_install(UpdateProgressCb progress) {
     // Finish installation
     res = AM_FinishCiaInstall(cia_handle);
     if (R_FAILED(res)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "AM_FinishCiaInstall: %08lX", res);
+        set_error(error_out, error_size, msg);
         return false;
     }
 
@@ -249,4 +271,23 @@ bool update_install(UpdateProgressCb progress) {
 
     if (progress) progress(100);
     return true;
+}
+
+void update_relaunch(void) {
+    // Get our own title ID
+    u64 title_id = 0;
+    APT_GetProgramID(&title_id);
+
+    if (title_id == 0) {
+        // Can't get title ID (likely running as 3dsx)
+        return;
+    }
+
+    // Prepare and execute application jump to ourselves
+    // This relaunches the app with the newly installed version
+    Result res = APT_PrepareToDoApplicationJump(0, title_id, MEDIATYPE_SD);
+    if (R_SUCCEEDED(res)) {
+        // This doesn't return on success
+        APT_DoApplicationJump(NULL, 0, NULL);
+    }
 }

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.venv/
+venv/
+env/
+
+# Server save data
+server/saves/
+
+# 3DS build artifacts
+client/build/
+client/*.3dsx
+client/*.smdh
+client/*.elf
+client/*.map
+client/*.cia
+client/*.bnr
+
+# Dumps
+*.dmp
+
+
+# IDE
+.vscode/
+.idea/
+
+# uv
+*.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

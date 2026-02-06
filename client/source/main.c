@@ -295,23 +295,33 @@ int main(int argc, char *argv[]) {
                         snprintf(status, sizeof(status), "\x1b[31mDownload failed!\x1b[0m");
                     } else {
                         ui_draw_message("Installing update...\n\nPlease wait, do not power off.");
-                        if (!update_install(update_progress_cb)) {
-                            snprintf(status, sizeof(status), "\x1b[31mInstall failed!\x1b[0m");
+                        char install_error[64] = {0};
+                        if (!update_install(update_progress_cb, install_error, sizeof(install_error))) {
+                            snprintf(status, sizeof(status), "\x1b[31mInstall failed:\x1b[0m %s", install_error);
                         } else {
+                            ui_draw_message(
+                                "\x1b[32mUpdate installed!\x1b[0m\n\n"
+                                "Restarting application...");
+
+                            // Brief delay so user can see the message
+                            svcSleepThread(1500000000LL);  // 1.5 seconds
+
+                            // Try to relaunch (works for CIA apps)
+                            update_relaunch();
+
+                            // If relaunch failed (e.g., running as 3dsx), show manual message
                             ui_draw_message(
                                 "\x1b[32mUpdate installed!\x1b[0m\n\n"
                                 "Please restart the application\n"
                                 "to use the new version.\n\n"
                                 "Press START to exit.");
 
-                            // Wait for START to exit
                             while (aptMainLoop()) {
                                 gspWaitForVBlank();
                                 hidScanInput();
                                 if (hidKeysDown() & KEY_START) break;
                             }
 
-                            // Exit the app
                             goto cleanup;
                         }
                     }
