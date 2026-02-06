@@ -282,7 +282,7 @@ bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
     char *json = (char *)malloc(json_cap);
     if (!json) { free(files); free(hash_cache); return false; }
 
-    int pos = snprintf(json, json_cap, "{\"titles\":[");
+    int pos = snprintf(json, json_cap, "{\"console_id\":\"%s\",\"titles\":[", config->console_id);
     bool first_title = true;
 
     for (int i = 0; i < title_count; i++) {

@@ -77,6 +77,7 @@ u8 *network_get(const AppConfig *config, const char *path,
     httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
     httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
     httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "X-Console-ID", config->console_id);
     httpcAddRequestHeaderField(&context, "Connection", "close");
 
     res = httpcBeginRequest(&context);
@@ -113,6 +114,7 @@ u8 *network_post(const AppConfig *config, const char *path,
     httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
     httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
     httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "X-Console-ID", config->console_id);
     httpcAddRequestHeaderField(&context, "Connection", "close");
     httpcAddRequestHeaderField(&context, "Content-Type", "application/octet-stream");
 
@@ -157,6 +159,7 @@ u8 *network_post_json(const AppConfig *config, const char *path,
     httpcSetKeepAlive(&context, HTTPC_KEEPALIVE_DISABLED);
     httpcAddRequestHeaderField(&context, "User-Agent", "3DSSaveSync/" APP_VERSION);
     httpcAddRequestHeaderField(&context, "X-API-Key", config->api_key);
+    httpcAddRequestHeaderField(&context, "X-Console-ID", config->console_id);
     httpcAddRequestHeaderField(&context, "Connection", "close");
     httpcAddRequestHeaderField(&context, "Content-Type", "application/json");
 

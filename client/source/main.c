@@ -64,6 +64,7 @@ int main(int argc, char *argv[]) {
     ui_init();
     amInit();
     fsInit();
+    psInit();  // For random number generation (console ID)
 
     ui_draw_message("Loading config...");
 
@@ -341,6 +342,7 @@ int main(int argc, char *argv[]) {
 cleanup:
     // Cleanup
     network_exit();
+    psExit();
     fsExit();
     amExit();
     gfxExit();

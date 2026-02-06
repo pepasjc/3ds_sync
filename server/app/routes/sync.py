@@ -1,9 +1,35 @@
 from fastapi import APIRouter
 
-from app.models.save import SyncPlan, SyncRequest
+from app.models.save import ConflictInfo, SyncPlan, SyncRequest
 from app.services import storage
 
 router = APIRouter()
+
+
+def _add_conflict(
+    conflict_list: list[str],
+    conflict_info: list[ConflictInfo],
+    title_id: str,
+    server_meta,
+    client_hash: str,
+    client_size: int,
+    console_id: str | None,
+) -> None:
+    """Add a conflict with detailed info."""
+    conflict_list.append(title_id)
+    same_console = bool(console_id and server_meta.console_id == console_id)
+    conflict_info.append(
+        ConflictInfo(
+            title_id=title_id,
+            server_hash=server_meta.save_hash,
+            server_size=server_meta.save_size,
+            server_timestamp=server_meta.server_timestamp,
+            server_console_id=server_meta.console_id or "unknown",
+            client_hash=client_hash,
+            client_size=client_size,
+            same_console=same_console,
+        )
+    )
 
 
 @router.post("/sync")
@@ -12,9 +38,11 @@ async def sync(request: SyncRequest) -> SyncPlan:
     upload: list[str] = []
     download: list[str] = []
     conflict: list[str] = []
+    conflict_info: list[ConflictInfo] = []
     up_to_date: list[str] = []
 
     client_title_ids = set()
+    console_id = request.console_id
 
     for title in request.titles:
         client_title_ids.add(title.title_id)
@@ -38,11 +66,24 @@ async def sync(request: SyncRequest) -> SyncPlan:
                 # Client unchanged since last sync, only server changed -> download
                 download.append(title.title_id)
             else:
-                # Both changed since last sync -> conflict
-                conflict.append(title.title_id)
+                # Both changed since last sync -> true conflict
+                _add_conflict(
+                    conflict, conflict_info, title.title_id,
+                    server_meta, title.save_hash, title.size, console_id
+                )
         else:
-            # No sync history -> can't determine direction safely
-            conflict.append(title.title_id)
+            # No sync history - first time syncing this title on this console
+            # If server version was uploaded by THIS console, we can safely download
+            # (our previous session on this console uploaded it)
+            if console_id and server_meta.console_id == console_id:
+                # Same console uploaded it before -> auto-download (we have old local data)
+                download.append(title.title_id)
+            else:
+                # Different console or unknown -> need user decision
+                _add_conflict(
+                    conflict, conflict_info, title.title_id,
+                    server_meta, title.save_hash, title.size, console_id
+                )
 
     # Find titles that exist only on the server
     server_only: list[str] = []
@@ -57,4 +98,5 @@ async def sync(request: SyncRequest) -> SyncPlan:
         conflict=conflict,
         up_to_date=up_to_date,
         server_only=server_only,
+        conflict_info=conflict_info,
     )

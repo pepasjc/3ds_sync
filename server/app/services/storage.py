@@ -66,7 +66,7 @@ def get_metadata(title_id: str) -> SaveMetadata | None:
     return SaveMetadata(**data)
 
 
-def store_save(bundle: SaveBundle, source: str = "3ds") -> SaveMetadata:
+def store_save(bundle: SaveBundle, source: str = "3ds", console_id: str = "") -> SaveMetadata:
     """Store a save bundle to disk, archiving any existing save to history."""
     title_id = bundle.title_id_hex
     current = _current_dir(title_id)
@@ -112,6 +112,7 @@ def store_save(bundle: SaveBundle, source: str = "3ds") -> SaveMetadata:
         file_count=len(bundle.files),
         client_timestamp=bundle.timestamp,
         server_timestamp=now,
+        console_id=console_id,
     )
 
     meta_path = _metadata_path(title_id)

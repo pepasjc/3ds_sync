@@ -47,6 +47,7 @@ class SaveMetadata:
     file_count: int
     client_timestamp: int  # timestamp reported by the 3DS
     server_timestamp: str  # server wall-clock time at upload
+    console_id: str = ""  # ID of the console that uploaded this save
 
     def to_dict(self) -> dict:
         return {
@@ -59,6 +60,7 @@ class SaveMetadata:
             "file_count": self.file_count,
             "client_timestamp": self.client_timestamp,
             "server_timestamp": self.server_timestamp,
+            "console_id": self.console_id,
         }
 
 
@@ -69,6 +71,7 @@ class TitleSyncInfo(BaseModel):
     timestamp: int
     size: int
     last_synced_hash: str | None = None
+    console_id: str | None = None  # ID of the console sending this
 
     @field_validator("title_id")
     @classmethod
@@ -82,6 +85,19 @@ class TitleSyncInfo(BaseModel):
 class SyncRequest(BaseModel):
     """Batch metadata from 3DS for sync planning."""
     titles: list[TitleSyncInfo]
+    console_id: str | None = None  # ID of the console making the request
+
+
+class ConflictInfo(BaseModel):
+    """Details about a conflicting save to help user decide."""
+    title_id: str
+    server_hash: str
+    server_size: int
+    server_timestamp: str  # ISO 8601 when server version was uploaded
+    server_console_id: str  # Which console uploaded the server version
+    client_hash: str
+    client_size: int
+    same_console: bool  # True if conflict is with our own previous upload
 
 
 class SyncPlan(BaseModel):
@@ -91,3 +107,4 @@ class SyncPlan(BaseModel):
     conflict: list[str]  # title IDs where both changed -> needs user decision
     up_to_date: list[str]  # title IDs with matching hashes
     server_only: list[str]  # title IDs only on server -> 3DS should download
+    conflict_info: list[ConflictInfo] = []  # Details for each conflict

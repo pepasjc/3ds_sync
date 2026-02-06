@@ -78,6 +78,9 @@ async def upload_save(
 ):
     title_id = _validate_title_id(title_id)
 
+    # Get console ID from header
+    console_id = request.headers.get("X-Console-ID", "")
+
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body")
@@ -107,7 +110,7 @@ async def upload_save(
                 },
             )
 
-    meta = storage.store_save(bundle, source=source)
+    meta = storage.store_save(bundle, source=source, console_id=console_id)
     return {
         "status": "ok",
         "timestamp": meta.last_sync,

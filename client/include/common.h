@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define APP_VERSION "0.2.0"
+#define APP_VERSION "0.3.0"
 
 // Max values
 #define MAX_TITLES        256
@@ -29,10 +29,14 @@ typedef struct {
     bool in_conflict;      // Set after sync if this title has a conflict
 } TitleInfo;
 
+// Console ID file location
+#define CONSOLE_ID_PATH "sdmc:/3ds/3dssync/console_id.txt"
+
 // App configuration loaded from SD card
 typedef struct {
     char server_url[MAX_URL_LEN];
     char api_key[MAX_API_KEY_LEN];
+    char console_id[17];  // 16 hex chars + null (generated on first run)
 } AppConfig;
 
 #endif // COMMON_H

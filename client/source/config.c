@@ -1,4 +1,51 @@
 #include "config.h"
+#include <sys/stat.h>
+
+// Generate a random 16-char hex ID using 3DS random number generator
+static void generate_console_id(char *out) {
+    u8 random[8];
+    // Use PS service for random data
+    PS_GenerateRandomBytes(random, 8);
+
+    for (int i = 0; i < 8; i++) {
+        snprintf(out + (i * 2), 3, "%02X", random[i]);
+    }
+    out[16] = '\0';
+}
+
+// Load or generate console ID
+static void load_or_generate_console_id(AppConfig *config) {
+    FILE *f = fopen(CONSOLE_ID_PATH, "r");
+    if (f) {
+        // Read existing ID
+        if (fgets(config->console_id, sizeof(config->console_id), f)) {
+            // Trim any whitespace
+            char *end = config->console_id + strlen(config->console_id) - 1;
+            while (end > config->console_id && (*end == '\r' || *end == '\n' || *end == ' '))
+                *end-- = '\0';
+        }
+        fclose(f);
+
+        // Validate it's 16 hex chars
+        if (strlen(config->console_id) == 16) {
+            return;  // Valid ID loaded
+        }
+    }
+
+    // Generate new ID
+    generate_console_id(config->console_id);
+
+    // Ensure directory exists
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/3dssync", 0777);
+
+    // Save it
+    f = fopen(CONSOLE_ID_PATH, "w");
+    if (f) {
+        fprintf(f, "%s\n", config->console_id);
+        fclose(f);
+    }
+}
 
 // Trim leading/trailing whitespace in-place
 static void trim(char *str) {
@@ -81,6 +128,9 @@ bool config_load(AppConfig *config, char *error_out, int error_size) {
         snprintf(error_out, error_size, "Config missing 'api_key' field.");
         return false;
     }
+
+    // Load or generate console ID
+    load_or_generate_console_id(config);
 
     return true;
 }
