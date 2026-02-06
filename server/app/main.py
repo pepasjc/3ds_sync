@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.middleware.auth import APIKeyMiddleware
-from app.routes import saves, status, sync, titles
+from app.routes import saves, status, sync, titles, update
 from app.services import game_names
 
 
@@ -26,6 +26,7 @@ def create_app() -> FastAPI:
     app.include_router(titles.router, prefix="/api/v1")
     app.include_router(saves.router, prefix="/api/v1")
     app.include_router(sync.router, prefix="/api/v1")
+    app.include_router(update.router, prefix="/api/v1")
 
     return app
 

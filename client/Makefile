@@ -107,7 +107,7 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(DEPSDIR)
@@ -122,9 +122,24 @@ $(DEPSDIR):
 endif
 
 #---------------------------------------------------------------------------------
+# CIA build target
+# Requires makerom and bannertool in PATH or client/ directory
+# Download from:
+#   makerom: https://github.com/3DSGuy/Project_CTR/releases
+#   bannertool: https://github.com/Steveice10/bannertool/releases
+#---------------------------------------------------------------------------------
+cia: $(BUILD) $(DEPSDIR)
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+	@echo "Creating banner..."
+	bannertool makebanner -i banner_img.png -a silent.wav -o banner.bnr
+	@echo "Building CIA..."
+	makerom -f cia -o $(TARGET).cia -elf $(TARGET).elf -rsf cia.rsf -icon $(TARGET).smdh -banner banner.bnr
+	@echo "Built $(TARGET).cia"
+
+#---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia banner.bnr
 
 #---------------------------------------------------------------------------------
 else

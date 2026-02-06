@@ -4,6 +4,7 @@
 #include "sync.h"
 #include "title.h"
 #include "ui.h"
+#include "update.h"
 
 static AppConfig config;
 static TitleInfo titles[MAX_TITLES];
@@ -40,6 +41,19 @@ static void sync_progress(const char *message) {
     ui_update_progress(message);
     // Don't call gfxSwapBuffers here - let the main loop handle it
     // This avoids GPU overload during rapid sync operations
+}
+
+// Update progress callback
+static void update_progress_cb(int pct) {
+    static int last_pct = -1;
+    if (pct != last_pct) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Progress: %d%%", pct);
+        ui_update_progress(msg);
+        last_pct = pct;
+    }
+    // Reset for next use when complete
+    if (pct >= 100) last_pct = -1;
 }
 
 int main(int argc, char *argv[]) {
@@ -241,12 +255,80 @@ int main(int argc, char *argv[]) {
             redraw = true;
         }
 
+        // SELECT button - check for updates
+        if (kDown & KEY_SELECT) {
+            ui_draw_message("Checking for updates...");
+
+            UpdateInfo update_info;
+            if (!update_check(&config, &update_info)) {
+                snprintf(status, sizeof(status), "Update check failed");
+            } else if (!update_info.available) {
+                snprintf(status, sizeof(status), "You have the latest version (%s)", APP_VERSION);
+            } else {
+                // Show update confirmation
+                char confirm_msg[512];
+                snprintf(confirm_msg, sizeof(confirm_msg),
+                    "\x1b[33mUpdate available!\x1b[0m\n\n"
+                    "Current: %s\n"
+                    "Latest:  %s\n"
+                    "Size:    %lu KB\n\n"
+                    "Press A to download and install\n"
+                    "Press B to cancel",
+                    APP_VERSION,
+                    update_info.latest_version,
+                    (unsigned long)(update_info.file_size / 1024));
+                ui_draw_message(confirm_msg);
+
+                // Wait for A or B
+                bool do_update = false;
+                while (aptMainLoop()) {
+                    gspWaitForVBlank();
+                    hidScanInput();
+                    u32 k = hidKeysDown();
+                    if (k & KEY_A) { do_update = true; break; }
+                    if (k & KEY_B) { break; }
+                }
+
+                if (do_update) {
+                    ui_draw_message("Downloading update...");
+                    if (!update_download(&config, update_info.download_url, update_progress_cb)) {
+                        snprintf(status, sizeof(status), "\x1b[31mDownload failed!\x1b[0m");
+                    } else {
+                        ui_draw_message("Installing update...\n\nPlease wait, do not power off.");
+                        if (!update_install(update_progress_cb)) {
+                            snprintf(status, sizeof(status), "\x1b[31mInstall failed!\x1b[0m");
+                        } else {
+                            ui_draw_message(
+                                "\x1b[32mUpdate installed!\x1b[0m\n\n"
+                                "Please restart the application\n"
+                                "to use the new version.\n\n"
+                                "Press START to exit.");
+
+                            // Wait for START to exit
+                            while (aptMainLoop()) {
+                                gspWaitForVBlank();
+                                hidScanInput();
+                                if (hidKeysDown() & KEY_START) break;
+                            }
+
+                            // Exit the app
+                            goto cleanup;
+                        }
+                    }
+                } else {
+                    snprintf(status, sizeof(status), "Update cancelled");
+                }
+            }
+            redraw = true;
+        }
+
         if (redraw) {
             ui_draw_title_list(titles, title_count, selected, scroll_offset);
             ui_draw_status(status);
         }
     }
 
+cleanup:
     // Cleanup
     network_exit();
     fsExit();

@@ -1,0 +1,128 @@
+BasicInfo:
+  Title                   : "3DS Save Sync"
+  CompanyCode             : "00"
+  ProductCode             : "CTR-H-SYNC"
+  ContentType             : Application
+  Logo                    : Nintendo
+
+TitleInfo:
+  UniqueId                : 0xF3D55
+  Category                : Application
+
+Option:
+  UseOnSD                 : true
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  EnableCrypt             : false
+  EnableCompress          : true
+
+AccessControlInfo:
+  IdealProcessor                : 0
+  AffinityMask                  : 1
+  Priority                      : 16
+  DisableDebug                  : false
+  EnableForceDebug              : false
+  CanWriteSharedPage            : false
+  CanUsePrivilegedPriority      : false
+  CanUseNonAlphabetAndNumber    : false
+  PermitMainFunctionArgument    : false
+  CanShareDeviceMemory          : false
+  RunnableOnSleep               : false
+  SpecialMemoryArrange          : false
+  ResourceLimitCategory         : Application
+  CoreVersion                   : 2
+  DescVersion                   : 2
+
+  MemoryType                    : Application
+  SystemMode                    : 64MB
+  HandleTableSize               : 512
+
+  FileSystemAccess:
+    - DirectSdmc
+    - CtrNandRo
+    - CtrNandRw
+
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    SetThreadPriority: 6
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetThreadId: 55
+    GetResourceLimit: 56
+    GetResourceLimitLimitValues: 57
+    GetResourceLimitCurrentValues: 58
+    Break: 60
+    OutputDebugString: 61
+    CreatePort: 71
+    CreateSessionToPort: 72
+    CreateSession: 73
+    AcceptSession: 74
+    ReplyAndReceive1: 75
+    ReplyAndReceive2: 76
+    ReplyAndReceive3: 77
+    ReplyAndReceive4: 78
+    ReplyAndReceive: 79
+
+  ServiceAccessControl:
+    - APT:U
+    - ac:u
+    - am:net
+    - cfg:u
+    - fs:USER
+    - gsp::Gpu
+    - hid:USER
+    - http:C
+    - ndm:u
+    - ptm:u
+    - soc:U
+    - ssl:C
+
+SystemControlInfo:
+  SaveDataSize              : 0KB
+  RemasterVersion           : 0
+  StackSize                 : 0x40000
+
+  Dependency:
+    ac: 0x0004013000002402
+    am: 0x0004013000001502
+    cfg: 0x0004013000001702
+    gsp: 0x0004013000001c02
+    hid: 0x0004013000001d02
+    http: 0x0004013000002902
+    ndm: 0x0004013000002b02
+    ptm: 0x0004013000002202
+    socket: 0x0004013000002e02
+    ssl: 0x0004013000002f02

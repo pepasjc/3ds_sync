@@ -11,6 +11,7 @@ Sync Nintendo 3DS save files between multiple CFW consoles via a PC server over 
 - **Game name lookup**: Shows actual game names instead of title IDs (4500+ games in database)
 - **Conflict detection**: Highlights conflicting saves in red for manual resolution
 - **Save history**: Server keeps previous versions of saves for recovery
+- **Auto-update**: Check for and install updates directly from the 3DS (no FBI needed)
 
 ## Requirements
 
@@ -74,6 +75,7 @@ Copy `client/3dssync.3dsx` to `sdmc:/3ds/` on your SD card and launch via Homebr
 | B | Download save from server |
 | X | Sync all SD titles automatically |
 | Y | Rescan titles |
+| SELECT | Check for updates |
 | START | Exit |
 
 ### Title List Colors
@@ -110,6 +112,14 @@ This lets you transfer saves between:
 - Physical cartridge ↔ Digital copy
 - Cartridge on one console ↔ Cartridge on another console
 
+### Auto-Update
+
+Press SELECT to check for new versions. If an update is available:
+1. Press A to download and install directly (no FBI needed)
+2. Restart the application after installation
+
+Updates are downloaded from the server, which proxies GitHub releases.
+
 ## Server Configuration
 
 Environment variables (prefix with `SYNC_`):
@@ -132,7 +142,7 @@ uv sync
 uv run pytest tests/ -v  # Run tests
 ```
 
-### Client
+### Client (.3dsx)
 
 Requires [devkitPro](https://devkitpro.org/) with 3DS development tools.
 
@@ -145,7 +155,25 @@ cd client
 make
 ```
 
-The output is `3dssync.3dsx`.
+The output is `3dssync.3dsx` (launch via Homebrew Launcher).
+
+### Client (.cia)
+
+To build an installable CIA (appears on home menu):
+
+1. Download additional tools and place in `C:\devkitPro\tools\bin\` (or `client/` directory):
+   - [makerom](https://github.com/3DSGuy/Project_CTR/releases) - get `makerom-*-win_x86_64.zip`
+   - [bannertool](https://github.com/Steveice10/bannertool/releases) - get `bannertool.zip`
+
+2. Build:
+```bash
+cd client
+make cia
+```
+
+The output is `3dssync.cia` (~210KB) - install with FBI or other CIA installer.
+
+Note: The required files (`banner_img.png`, `silent.wav`, `icon.png`, `cia.rsf`) are included in the repository.
 
 ## Technical Details
 

@@ -8,6 +8,8 @@ dependencies = [
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.6",
     "pydantic-settings>=2.1.0",
+    "pillow>=12.1.0",
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]

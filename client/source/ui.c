@@ -81,6 +81,7 @@ void ui_draw_status(const char *status_line) {
     printf(" B  - Download save from server\n");
     printf(" X  - Sync all (SD only)\n");
     printf(" Y  - Rescan titles\n");
+    printf(" SELECT - Check for updates\n");
     printf(" START - Exit\n");
     printf("\n\x1b[36mCyan\x1b[0m = cartridge (A/B only)\n");
     printf("\n\x1b[90m%s\x1b[0m", status_line ? status_line : "Ready.");
