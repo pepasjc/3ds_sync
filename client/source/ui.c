@@ -13,6 +13,11 @@ void ui_init(void) {
     consoleInit(GFX_BOTTOM, &bottom_screen);
 }
 
+void ui_reinit(void) {
+    consoleInit(GFX_TOP, &top_screen);
+    consoleInit(GFX_BOTTOM, &bottom_screen);
+}
+
 static const char *media_type_str(FS_MediaType mt) {
     switch (mt) {
         case MEDIATYPE_SD:        return "SD";

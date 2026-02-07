@@ -46,7 +46,11 @@ AccessControlInfo:
     ControlMemory: 1
     QueryMemory: 2
     ExitProcess: 3
+    CreateThread: 4
+    ExitThread: 5
     SetThreadPriority: 6
+    SleepThread: 7
+    GetThreadPriority: 8
     CreateMutex: 19
     ReleaseMutex: 20
     CreateSemaphore: 21
@@ -112,7 +116,7 @@ AccessControlInfo:
 
 SystemControlInfo:
   SaveDataSize              : 0KB
-  RemasterVersion           : 53  # v0.3.5 = (0<<10)|(3<<4)|5
+  RemasterVersion           : 54  # v0.3.6 = (0<<10)|(3<<4)|6
   StackSize                 : 0x40000
 
   Dependency:

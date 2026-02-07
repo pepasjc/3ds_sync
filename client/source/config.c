@@ -151,38 +151,139 @@ bool config_save(const AppConfig *config) {
     return true;
 }
 
-bool config_edit_field(const char *hint, char *buffer, int max_len) {
-    // Use static to keep large SwkbdState off the stack (avoids VFP alignment issues)
-    static SwkbdState swkbd;
-    static char temp[512];
+// Characters available in the D-pad text editor
+static const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789.:/-_ABCDEFGHIJKLMNOPQRSTUVWXYZ@?=&#%+!";
+static const int charset_len = sizeof(charset) - 1;
 
-    // Copy current value to temp buffer
+// Find character index in charset, or 0 if not found
+static int charset_index(char c) {
+    for (int i = 0; i < charset_len; i++) {
+        if (charset[i] == c) return i;
+    }
+    return 0;
+}
+
+bool config_edit_field(const char *hint, char *buffer, int max_len) {
+    char temp[256];
     strncpy(temp, buffer, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
 
-    // Ensure GPU is idle before launching swkbd applet
-    gfxFlushBuffers();
-    gspWaitForVBlank();
+    int cursor = strlen(temp);
+    int len = cursor;
+    bool running = true;
+    bool confirmed = false;
 
-    // Initialize keyboard
-    memset(&swkbd, 0, sizeof(swkbd));
-    int keyboard_max = max_len - 1;
-    if (keyboard_max > (int)sizeof(temp) - 1) keyboard_max = sizeof(temp) - 1;
-    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, keyboard_max);
-    swkbdSetInitialText(&swkbd, temp);
-    swkbdSetHintText(&swkbd, hint);
-    swkbdSetButton(&swkbd, SWKBD_BUTTON_LEFT, "Cancel", false);
-    swkbdSetButton(&swkbd, SWKBD_BUTTON_RIGHT, "OK", true);
+    while (running && aptMainLoop()) {
+        // Draw editor on top screen
+        consoleClear();
+        printf("\x1b[1;1H\x1b[36m--- Edit Field ---\x1b[0m\n\n");
+        printf(" \x1b[90m%s\x1b[0m\n\n", hint);
 
-    // Show keyboard
-    SwkbdButton button = swkbdInputText(&swkbd, temp, sizeof(temp));
+        // Show text with cursor
+        printf(" ");
+        for (int i = 0; i < len; i++) {
+            if (i == cursor)
+                printf("\x1b[7m%c\x1b[0m", temp[i]); // Inverted at cursor
+            else
+                printf("%c", temp[i]);
+        }
+        if (cursor == len)
+            printf("\x1b[7m \x1b[0m"); // Cursor at end
+        printf("\n\n");
 
-    if (button == SWKBD_BUTTON_RIGHT) {
-        // User confirmed - copy back
+        printf(" \x1b[90mD-Pad L/R: move cursor\x1b[0m\n");
+        printf(" \x1b[90mD-Pad U/D: change character\x1b[0m\n");
+        printf(" \x1b[90mA: insert | B: delete\x1b[0m\n");
+        printf(" \x1b[90mY: confirm | X: cancel\x1b[0m\n");
+
+        // Draw to both buffers
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+
+        // Wait for input
+        while (aptMainLoop()) {
+            hidScanInput();
+            u32 kDown = hidKeysDown();
+            if (!kDown) {
+                gfxFlushBuffers();
+                gfxSwapBuffers();
+                gspWaitForVBlank();
+                continue;
+            }
+
+            if (kDown & KEY_LEFT) {
+                if (cursor > 0) cursor--;
+                break;
+            }
+            if (kDown & KEY_RIGHT) {
+                if (cursor < len) cursor++;
+                break;
+            }
+            if (kDown & KEY_UP) {
+                // Cycle character forward
+                if (cursor < len) {
+                    int idx = (charset_index(temp[cursor]) + 1) % charset_len;
+                    temp[cursor] = charset[idx];
+                } else if (len < max_len - 1) {
+                    // At end: insert 'a'
+                    temp[len] = 'a';
+                    len++;
+                    temp[len] = '\0';
+                }
+                break;
+            }
+            if (kDown & KEY_DOWN) {
+                // Cycle character backward
+                if (cursor < len) {
+                    int idx = (charset_index(temp[cursor]) - 1 + charset_len) % charset_len;
+                    temp[cursor] = charset[idx];
+                } else if (len < max_len - 1) {
+                    temp[len] = 'a';
+                    len++;
+                    temp[len] = '\0';
+                }
+                break;
+            }
+            if (kDown & KEY_A) {
+                // Insert character at cursor
+                if (len < max_len - 1) {
+                    memmove(&temp[cursor + 1], &temp[cursor], len - cursor + 1);
+                    temp[cursor] = 'a';
+                    len++;
+                    cursor++;
+                }
+                break;
+            }
+            if (kDown & KEY_B) {
+                // Delete character before cursor
+                if (cursor > 0) {
+                    memmove(&temp[cursor - 1], &temp[cursor], len - cursor + 1);
+                    cursor--;
+                    len--;
+                }
+                break;
+            }
+            if (kDown & KEY_Y) {
+                confirmed = true;
+                running = false;
+                break;
+            }
+            if (kDown & KEY_X) {
+                running = false;
+                break;
+            }
+
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+        }
+    }
+
+    if (confirmed) {
         strncpy(buffer, temp, max_len - 1);
         buffer[max_len - 1] = '\0';
         return true;
     }
-
-    return false;  // Cancelled
+    return false;
 }

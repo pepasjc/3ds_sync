@@ -7,6 +7,9 @@
 // Initialize both screens for console output
 void ui_init(void);
 
+// Reinitialize after gfx restart (e.g., after swkbd applet)
+void ui_reinit(void);
+
 // Draw the title list on the top screen.
 // selected = currently highlighted index, count = number of titles.
 void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset);
