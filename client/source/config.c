@@ -152,20 +152,27 @@ bool config_save(const AppConfig *config) {
 }
 
 bool config_edit_field(const char *hint, char *buffer, int max_len) {
-    SwkbdState swkbd;
-    char temp[256];
+    // Use static to keep large SwkbdState off the stack (avoids VFP alignment issues)
+    static SwkbdState swkbd;
+    static char temp[512];
 
     // Copy current value to temp buffer
     strncpy(temp, buffer, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
 
+    // Ensure GPU is idle before launching swkbd applet
+    gfxFlushBuffers();
+    gspWaitForVBlank();
+
     // Initialize keyboard
-    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, max_len);
+    memset(&swkbd, 0, sizeof(swkbd));
+    int keyboard_max = max_len - 1;
+    if (keyboard_max > (int)sizeof(temp) - 1) keyboard_max = sizeof(temp) - 1;
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, keyboard_max);
     swkbdSetInitialText(&swkbd, temp);
     swkbdSetHintText(&swkbd, hint);
     swkbdSetButton(&swkbd, SWKBD_BUTTON_LEFT, "Cancel", false);
     swkbdSetButton(&swkbd, SWKBD_BUTTON_RIGHT, "OK", true);
-    swkbdSetFeatures(&swkbd, SWKBD_PREDICTIVE_INPUT);
 
     // Show keyboard
     SwkbdButton button = swkbdInputText(&swkbd, temp, sizeof(temp));

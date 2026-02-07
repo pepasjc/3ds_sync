@@ -5,6 +5,9 @@
 #define MAX_RESPONSE  (2 * 1024 * 1024) // 2MB max response
 #define MAX_POST_SIZE 0x70000 // 448KB max POST body (leave headroom in 512KB buffer)
 
+#define TIMEOUT_RESPONSE (15ULL * 1000000000ULL) // 15s for server to respond
+#define TIMEOUT_TRANSFER (30ULL * 1000000000ULL) // 30s per data chunk
+
 // Brief delay between requests to let httpc clean up
 static void request_delay(void) {
     svcSleepThread(50000000LL); // 50ms
@@ -22,6 +25,21 @@ void network_exit(void) {
 // Build full URL from config base + path
 static void build_url(const AppConfig *config, const char *path, char *url, int url_size) {
     snprintf(url, url_size, "%s/api/v1%s", config->server_url, path);
+}
+
+// Download data with timeout - wraps httpcReceiveDataTimeout + httpcGetDownloadSizeState
+static Result download_data_timeout(httpcContext *context, u8 *buffer, u32 size, u32 *downloadedsize, u64 timeout) {
+    u32 pos_before = 0, contentsize = 0;
+    Result ret = httpcGetDownloadSizeState(context, &pos_before, &contentsize);
+    if (R_FAILED(ret)) return ret;
+
+    ret = httpcReceiveDataTimeout(context, buffer, size, timeout);
+
+    u32 pos_after = 0;
+    httpcGetDownloadSizeState(context, &pos_after, &contentsize);
+    if (downloadedsize) *downloadedsize = pos_after - pos_before;
+
+    return ret;
 }
 
 // Read full response body with dynamic buffer
@@ -49,8 +67,13 @@ static u8 *read_response(httpcContext *context, u32 *out_size) {
         }
 
         u32 read = 0;
-        res = httpcDownloadData(context, buf + size, HTTP_BUF_SIZE, &read);
+        res = download_data_timeout(context, buf + size, HTTP_BUF_SIZE, &read, TIMEOUT_TRANSFER);
         size += read;
+
+        if (res == (Result)HTTPC_RESULTCODE_TIMEDOUT) {
+            free(buf);
+            return NULL;
+        }
     } while (res == (s32)HTTPC_RESULTCODE_DOWNLOADPENDING);
 
     if (R_FAILED(res) && res != HTTPC_RESULTCODE_DOWNLOADPENDING) {
@@ -87,7 +110,12 @@ u8 *network_get(const AppConfig *config, const char *path,
         return NULL;
     }
 
-    httpcGetResponseStatusCode(&context, out_status);
+    res = httpcGetResponseStatusCodeTimeout(&context, out_status, TIMEOUT_RESPONSE);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
 
     u8 *body = read_response(&context, out_size);
     httpcCancelConnection(&context);
@@ -132,7 +160,12 @@ u8 *network_post(const AppConfig *config, const char *path,
         return NULL;
     }
 
-    httpcGetResponseStatusCode(&context, out_status);
+    res = httpcGetResponseStatusCodeTimeout(&context, out_status, TIMEOUT_RESPONSE);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
 
     u8 *resp = read_response(&context, out_size);
     httpcCancelConnection(&context);
@@ -177,7 +210,12 @@ u8 *network_post_json(const AppConfig *config, const char *path,
         return NULL;
     }
 
-    httpcGetResponseStatusCode(&context, out_status);
+    res = httpcGetResponseStatusCodeTimeout(&context, out_status, TIMEOUT_RESPONSE);
+    if (R_FAILED(res)) {
+        httpcCancelConnection(&context);
+        httpcCloseContext(&context);
+        return NULL;
+    }
 
     u8 *resp = read_response(&context, out_size);
     httpcCancelConnection(&context);
