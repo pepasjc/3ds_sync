@@ -1,6 +1,6 @@
 # 3DS Save Sync
 
-Sync Nintendo 3DS save files between multiple CFW consoles via a PC server over local WiFi.
+Sync Nintendo 3DS save files between multiple CFW consoles via a PC server over WiFi.
 
 ## Features
 
