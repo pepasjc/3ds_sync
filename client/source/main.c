@@ -15,6 +15,10 @@ static char status[MAX_URL_LEN + 64];
 
 #define LIST_VISIBLE 27 // TOP_ROWS(30) - header(2) - footer(1)
 
+static int title_compare(const void *a, const void *b) {
+    return strcasecmp(((const TitleInfo *)a)->name, ((const TitleInfo *)b)->name);
+}
+
 static void scan_titles(void) {
     ui_draw_message("Scanning titles...");
     title_count = titles_scan(titles, MAX_TITLES);
@@ -25,6 +29,7 @@ static void scan_titles(void) {
     if (title_count > 0) {
         ui_draw_message("Fetching game names...");
         titles_fetch_names(&config, titles, title_count);
+        qsort(titles, title_count, sizeof(TitleInfo), title_compare);
     }
 }
 
