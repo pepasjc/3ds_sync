@@ -179,26 +179,45 @@ int main(int argc, char *argv[]) {
         }
 
         if (kDown & KEY_A && title_count > 0) {
-            SyncResult res = sync_title(&config, &titles[selected], sync_progress);
-            if (res == SYNC_OK) {
-                snprintf(status, sizeof(status), "Uploaded: %.40s", titles[selected].name);
-                titles[selected].in_conflict = false;  // Resolved by uploading
+            ui_draw_message("Loading save details...");
+            SaveDetails details;
+            if (sync_get_save_details(&config, &titles[selected], &details)) {
+                if (ui_confirm_sync(&titles[selected], &details, true)) {
+                    SyncResult res = sync_title(&config, &titles[selected], sync_progress);
+                    if (res == SYNC_OK) {
+                        snprintf(status, sizeof(status), "Uploaded: %.40s", titles[selected].name);
+                        titles[selected].in_conflict = false;
+                    } else {
+                        snprintf(status, sizeof(status), "\x1b[31mUpload failed\x1b[0m: %s",
+                            sync_result_str(res));
+                    }
+                } else {
+                    snprintf(status, sizeof(status), "Upload cancelled");
+                }
             } else {
-                snprintf(status, sizeof(status), "\x1b[31mUpload failed\x1b[0m: %s",
-                    sync_result_str(res));
+                snprintf(status, sizeof(status), "Failed to load save details");
             }
             redraw = true;
         }
 
         if (kDown & KEY_B && title_count > 0) {
-            // Force download from server
-            SyncResult res = sync_download_title(&config, &titles[selected], sync_progress);
-            if (res == SYNC_OK) {
-                snprintf(status, sizeof(status), "Downloaded: %.40s", titles[selected].name);
-                titles[selected].in_conflict = false;  // Resolved by downloading
+            ui_draw_message("Loading save details...");
+            SaveDetails details;
+            if (sync_get_save_details(&config, &titles[selected], &details)) {
+                if (ui_confirm_sync(&titles[selected], &details, false)) {
+                    SyncResult res = sync_download_title(&config, &titles[selected], sync_progress);
+                    if (res == SYNC_OK) {
+                        snprintf(status, sizeof(status), "Downloaded: %.40s", titles[selected].name);
+                        titles[selected].in_conflict = false;
+                    } else {
+                        snprintf(status, sizeof(status), "\x1b[31mDownload failed\x1b[0m: %s",
+                            sync_result_str(res));
+                    }
+                } else {
+                    snprintf(status, sizeof(status), "Download cancelled");
+                }
             } else {
-                snprintf(status, sizeof(status), "\x1b[31mDownload failed\x1b[0m: %s",
-                    sync_result_str(res));
+                snprintf(status, sizeof(status), "Failed to load save details");
             }
             redraw = true;
         }

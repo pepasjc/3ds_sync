@@ -30,6 +30,10 @@ void ui_clear(void);
 // Returns when user presses B to close
 void ui_show_save_details(const TitleInfo *title, const SaveDetails *details);
 
+// Show sync confirmation dialog with save details
+// Returns true if user confirmed (A), false if cancelled (B)
+bool ui_confirm_sync(const TitleInfo *title, const SaveDetails *details, bool is_upload);
+
 // Show config editor menu on top screen
 // Returns true if config was changed, false otherwise
 bool ui_show_config_editor(AppConfig *config);

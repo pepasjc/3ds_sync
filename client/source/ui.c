@@ -152,7 +152,8 @@ static void format_date(const char *iso, char *out, int out_size) {
     }
 }
 
-void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
+// Draw save details on top screen, returns current row for additional content
+static int draw_save_details(const TitleInfo *title, const SaveDetails *details) {
     consoleSelect(&top_screen);
     consoleClear();
 
@@ -221,6 +222,12 @@ void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
         printf("\x1b[%d;1H Last synced: %.32s...", row++, details->last_synced_hash);
     }
 
+    return row;
+}
+
+void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
+    draw_save_details(title, details);
+
     // Footer
     printf("\x1b[%d;1H\x1b[90m Press B to close\x1b[0m", TOP_ROWS);
 
@@ -238,6 +245,38 @@ void ui_show_save_details(const TitleInfo *title, const SaveDetails *details) {
         gfxSwapBuffers();
         gspWaitForVBlank();
     }
+}
+
+bool ui_confirm_sync(const TitleInfo *title, const SaveDetails *details, bool is_upload) {
+    int row = draw_save_details(title, details);
+    row++;
+
+    // Action description
+    if (is_upload) {
+        printf("\x1b[%d;1H\x1b[33;1m >> UPLOAD: local -> server\x1b[0m", row++);
+    } else {
+        printf("\x1b[%d;1H\x1b[33;1m >> DOWNLOAD: server -> local\x1b[0m", row++);
+    }
+
+    // Footer
+    printf("\x1b[%d;1H\x1b[90m A: Confirm | B: Cancel\x1b[0m", TOP_ROWS);
+
+    // Draw to both buffers to prevent flicker
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
+
+    // Wait for A (confirm) or B (cancel)
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kDown = hidKeysDown();
+        if (kDown & KEY_A) return true;
+        if (kDown & KEY_B) return false;
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
+    return false;
 }
 
 #include "config.h"
