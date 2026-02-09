@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 
@@ -11,9 +12,11 @@ from app.services import game_names
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.save_dir.mkdir(parents=True, exist_ok=True)
-    # Load game names database
-    count = game_names.load_database()
-    print(f"Loaded {count} game names from database")
+    # Load game names databases (3DS + DS)
+    data_dir = Path(__file__).parent.parent / "data"
+    count_3ds = game_names.load_database(data_dir / "3dstdb.txt")
+    count_ds = game_names.load_database(data_dir / "dstdb.txt")
+    print(f"Loaded {count_3ds} 3DS + {count_ds} DS game names from database")
     yield
 
 

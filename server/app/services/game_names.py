@@ -1,4 +1,4 @@
-"""Game name lookup service using 3dstdb.txt database."""
+"""Game name lookup service using 3dstdb.txt and dstdb.txt databases."""
 
 from pathlib import Path
 
@@ -7,9 +7,10 @@ _game_names: dict[str, str] = {}
 
 
 def load_database(db_path: Path | None = None) -> int:
-    """Load the game names database from file.
+    """Load a game names database from file, merging into the global cache.
 
-    Returns the number of entries loaded.
+    Can be called multiple times to load multiple databases.
+    Returns the number of NEW entries loaded (not counting duplicates).
     """
     global _game_names
 
@@ -20,8 +21,7 @@ def load_database(db_path: Path | None = None) -> int:
     if not db_path.exists():
         return 0
 
-    _game_names.clear()
-
+    added = 0
     with open(db_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -33,10 +33,11 @@ def load_database(db_path: Path | None = None) -> int:
             if len(parts) == 2:
                 code = parts[0].strip().upper()
                 name = parts[1].strip()
-                if code and name:
+                if code and name and code not in _game_names:
                     _game_names[code] = name
+                    added += 1
 
-    return len(_game_names)
+    return added
 
 
 def lookup_names(product_codes: list[str]) -> dict[str, str]:
