@@ -1,4 +1,5 @@
 #include "title.h"
+#include "nds.h"
 #include "network.h"
 
 void title_id_to_hex(u64 title_id, char *out) {
@@ -21,7 +22,7 @@ static bool title_has_save(u64 title_id, FS_MediaType media_type) {
     return false;
 }
 
-// Scan a single media type for titles with save data
+// Scan a single media type for 3DS titles with save data (AM-based)
 static int scan_media(FS_MediaType media_type, TitleInfo *titles, int offset, int max_titles) {
     u32 count = 0;
     int added = 0;
@@ -50,10 +51,10 @@ static int scan_media(FS_MediaType media_type, TitleInfo *titles, int offset, in
             continue;
 
         TitleInfo *t = &titles[offset + added];
+        memset(t, 0, sizeof(TitleInfo));
         t->title_id = ids[i];
         t->media_type = media_type;
         t->has_save_data = true;
-        t->in_conflict = false;
         title_id_to_hex(ids[i], t->title_id_hex);
 
         // Get product code from AM
@@ -73,14 +74,78 @@ static int scan_media(FS_MediaType media_type, TitleInfo *titles, int offset, in
     return added;
 }
 
-int titles_scan(TitleInfo *titles, int max_titles) {
+// Detect a physical NDS cartridge via FS service and read its ROM header.
+// AM doesn't enumerate NDS carts, so we use FSUSER_GetCardType + GetLegacyRomHeader.
+// Returns 1 if NDS cart found and added, 0 otherwise.
+static int scan_nds_cart(TitleInfo *titles, int offset, int max_titles) {
+    if (offset >= max_titles) return 0;
+
+    // Check if a card is inserted
+    bool inserted = false;
+    if (R_FAILED(FSUSER_CardSlotIsInserted(&inserted)) || !inserted)
+        return 0;
+
+    // Check if it's a TWL (NDS/DSi) card
+    FS_CardType card_type = CARD_CTR;
+    if (R_FAILED(FSUSER_GetCardType(&card_type)) || card_type != CARD_TWL)
+        return 0;
+
+    // Read the NDS ROM header (0x3B4 bytes)
+    u8 *header = (u8 *)malloc(0x3B4);
+    if (!header) return 0;
+
+    Result res = FSUSER_GetLegacyRomHeader(MEDIATYPE_GAME_CARD, 0, header);
+    if (R_FAILED(res)) {
+        free(header);
+        return 0;
+    }
+
+    // Extract game code from offset 0x0C (4 bytes)
+    char code[5];
+    memcpy(code, header + 0x0C, 4);
+    code[4] = '\0';
+    free(header);
+
+    // Validate: game code should be printable ASCII
+    for (int i = 0; i < 4; i++) {
+        if (code[i] < 0x20 || code[i] > 0x7E)
+            return 0;
+    }
+
+    // Build title ID: same format as nds-bootstrap ROMs on SD
+    // 0x00048000 (high) + ASCII game code (low)
+    u64 tid = 0x00048000ULL << 32;
+    tid |= ((u64)(u8)code[0]) << 24;
+    tid |= ((u64)(u8)code[1]) << 16;
+    tid |= ((u64)(u8)code[2]) << 8;
+    tid |= ((u64)(u8)code[3]);
+
+    TitleInfo *t = &titles[offset];
+    memset(t, 0, sizeof(TitleInfo));
+    t->title_id = tid;
+    t->media_type = MEDIATYPE_GAME_CARD;
+    t->is_nds = true;
+    t->has_save_data = true;
+    title_id_to_hex(tid, t->title_id_hex);
+    memcpy(t->product_code, code, 5);
+    snprintf(t->name, sizeof(t->name), "%s", code);
+
+    return 1;
+}
+
+int titles_scan(TitleInfo *titles, int max_titles, const char *nds_dir) {
     int total = 0;
 
-    // Scan SD card (digital games)
+    // Scan SD card (3DS digital games)
     total += scan_media(MEDIATYPE_SD, titles, total, max_titles);
 
-    // Scan game card
+    // Scan game card (3DS cartridge or NDS cartridge)
     total += scan_media(MEDIATYPE_GAME_CARD, titles, total, max_titles);
+    total += scan_nds_cart(titles, total, max_titles);
+
+    // Scan NDS ROMs on SD card (nds-bootstrap)
+    if (nds_dir && nds_dir[0])
+        total += nds_scan(nds_dir, titles, total, max_titles);
 
     return total;
 }

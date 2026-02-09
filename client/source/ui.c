@@ -18,20 +18,30 @@ void ui_reinit(void) {
     consoleInit(GFX_BOTTOM, &bottom_screen);
 }
 
-static const char *media_type_str(FS_MediaType mt) {
-    switch (mt) {
+static const char *media_type_str(const TitleInfo *t) {
+    if (t->is_nds && t->media_type == MEDIATYPE_GAME_CARD) return "Cart";
+    if (t->is_nds) return "NDS";
+    switch (t->media_type) {
         case MEDIATYPE_SD:        return "SD";
         case MEDIATYPE_GAME_CARD: return "Card";
         default:                  return "?";
     }
 }
 
-void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset) {
+static const char *view_mode_str(int view_mode) {
+    switch (view_mode) {
+        case VIEW_3DS: return "[3DS]";
+        case VIEW_NDS: return "[NDS]";
+        default:       return "[All]";
+    }
+}
+
+void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset, int view_mode) {
     consoleSelect(&top_screen);
 
     // Header (line 1) - pad to full width to overwrite without clearing
-    printf("\x1b[1;1H\x1b[36m--- 3DS Save Sync v%s ---\x1b[0m%-*s",
-        APP_VERSION, TOP_COLS - 24, "");
+    printf("\x1b[1;1H\x1b[36m--- Save Sync v%s %s ---\x1b[0m%-*s",
+        APP_VERSION, view_mode_str(view_mode), TOP_COLS - 24, "");
 
     if (count == 0) {
         printf("\x1b[3;1H  No titles with save data found.%-*s", TOP_COLS - 34, "");
@@ -58,13 +68,19 @@ void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int sc
 
         const TitleInfo *t = &titles[idx];
         const char *cursor = (idx == selected) ? ">" : " ";
+        const char *mark = t->marked ? "*" : " ";
 
-        // Color: red for conflict, cyan for cartridge, yellow for selected, white otherwise
+        // Color: red for conflict, cyan for cartridge, magenta for NDS,
+        // yellow for selected, white otherwise
         const char *color;
         if (t->in_conflict) {
             color = "\x1b[31m";  // Red for conflict
+        } else if (t->marked) {
+            color = "\x1b[32m";  // Green for marked
         } else if (t->media_type == MEDIATYPE_GAME_CARD) {
             color = "\x1b[36m";  // Cyan for cartridge (manual sync only)
+        } else if (t->is_nds) {
+            color = "\x1b[35m";  // Magenta for NDS games on SD
         } else if (idx == selected) {
             color = "\x1b[33m";  // Yellow for selected
         } else {
@@ -73,9 +89,9 @@ void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int sc
 
         // Format line and pad to full width
         char line[TOP_COLS + 1];
-        snprintf(line, sizeof(line), " %s %-4s %.42s",
-            cursor,
-            media_type_str(t->media_type),
+        snprintf(line, sizeof(line), "%s%s %-4s %.41s",
+            cursor, mark,
+            media_type_str(t),
             t->name);
 
         printf("%s%-*s\x1b[0m", color, TOP_COLS, line);
@@ -95,13 +111,13 @@ void ui_draw_status(const char *status_line) {
     // Overwrite each line - pad to full width instead of clearing
     printf("\x1b[1;1H\x1b[36mActions:\x1b[0m%-*s", BOT_COLS - 8, "");
     printf("\x1b[2;1H A - Upload | B - Download%-*s", BOT_COLS - 26, "");
-    printf("\x1b[3;1H X - Sync all (SD only)%-*s", BOT_COLS - 23, "");
-    printf("\x1b[4;1H Y - Rescan titles%-*s", BOT_COLS - 18, "");
-    printf("\x1b[5;1H L - Config | R - Save details%-*s", BOT_COLS - 30, "");
-    printf("\x1b[6;1H SELECT - Updates%-*s", BOT_COLS - 17, "");
-    printf("\x1b[7;1H START - Exit%-*s", BOT_COLS - 13, "");
+    printf("\x1b[3;1H X - Sync all | Y - Save details%-*s", BOT_COLS - 32, "");
+    printf("\x1b[4;1H R - Switch tab | SELECT - Mark%-*s", BOT_COLS - 31, "");
+    printf("\x1b[5;1H L - Config | START - Exit%-*s", BOT_COLS - 26, "");
+    printf("\x1b[6;1H%-*s", BOT_COLS, "");
+    printf("\x1b[7;1H\x1b[36mCyan\x1b[0m=cart \x1b[35mMag\x1b[0m=NDS \x1b[32mGrn\x1b[0m=mark%-*s", BOT_COLS - 26, "");
     printf("\x1b[8;1H%-*s", BOT_COLS, "");
-    printf("\x1b[9;1H\x1b[36mCyan\x1b[0m = cartridge (A/B only)%-*s", BOT_COLS - 27, "");
+    printf("\x1b[9;1H%-*s", BOT_COLS, "");
     printf("\x1b[10;1H%-*s", BOT_COLS, "");
     printf("\x1b[11;1H%-*s", BOT_COLS, "");
 
@@ -167,8 +183,15 @@ static int draw_save_details(const TitleInfo *title, const SaveDetails *details)
     printf("\x1b[%d;1H Title ID: %s", row++, title->title_id_hex);
 
     // Media type
-    const char *media = (title->media_type == MEDIATYPE_SD) ? "SD Card" :
-                        (title->media_type == MEDIATYPE_GAME_CARD) ? "Game Card" : "Unknown";
+    const char *media;
+    if (title->is_nds)
+        media = "NDS (nds-bootstrap)";
+    else if (title->media_type == MEDIATYPE_SD)
+        media = "SD Card";
+    else if (title->media_type == MEDIATYPE_GAME_CARD)
+        media = "Game Card";
+    else
+        media = "Unknown";
     printf("\x1b[%d;1H Media:    %s", row++, media);
     row++;
 
@@ -295,10 +318,13 @@ static void draw_config_menu(const AppConfig *config, int selected) {
     const char *items[] = {
         "Server URL",
         "API Key",
+        "NDS ROM Directory",
+        "Rescan Titles",
+        "Check for Updates",
         "Save & Exit",
         "Cancel"
     };
-    const int item_count = 4;
+    const int item_count = 7;
 
     for (int i = 0; i < item_count; i++) {
         const char *cursor = (i == selected) ? ">" : " ";
@@ -317,6 +343,12 @@ static void draw_config_menu(const AppConfig *config, int selected) {
             } else {
                 printf("\x1b[%d;1H   \x1b[90m(not set)\x1b[0m", row++);
             }
+        } else if (i == 2) {
+            if (config->nds_dir[0]) {
+                printf("\x1b[%d;1H   \x1b[90m%.44s\x1b[0m", row++, config->nds_dir);
+            } else {
+                printf("\x1b[%d;1H   \x1b[90m(not set)\x1b[0m", row++);
+            }
         }
         row++;
     }
@@ -325,17 +357,19 @@ static void draw_config_menu(const AppConfig *config, int selected) {
     printf("\x1b[%d;1H\x1b[90mConsole ID: %s\x1b[0m", row++, config->console_id);
 
     // Footer
-    printf("\x1b[%d;1H\x1b[90m A: Edit | D-Pad: Navigate\x1b[0m", TOP_ROWS);
+    printf("\x1b[%d;1H\x1b[90m A: Select | D-Pad: Navigate\x1b[0m", TOP_ROWS);
 }
 
-bool ui_show_config_editor(AppConfig *config) {
+int ui_show_config_editor(AppConfig *config) {
     // Make a working copy
     AppConfig working;
     memcpy(&working, config, sizeof(AppConfig));
 
     int selected = 0;
+    int result = CONFIG_RESULT_UNCHANGED;
     bool changed = false;
     bool running = true;
+    const int item_count = 7;
 
     while (running && aptMainLoop()) {
         // Draw menu to both buffers
@@ -352,11 +386,11 @@ bool ui_show_config_editor(AppConfig *config) {
             u32 kDown = hidKeysDown();
 
             if (kDown & KEY_UP) {
-                selected = (selected - 1 + 4) % 4;
+                selected = (selected - 1 + item_count) % item_count;
                 break;
             }
             if (kDown & KEY_DOWN) {
-                selected = (selected + 1) % 4;
+                selected = (selected + 1) % item_count;
                 break;
             }
             if (kDown & KEY_B) {
@@ -378,16 +412,40 @@ bool ui_show_config_editor(AppConfig *config) {
                     }
                     break;
                 } else if (selected == 2) {
-                    // Save & Exit
+                    // Edit NDS ROM directory
+                    if (config_edit_field("sdmc:/roms/nds", working.nds_dir, MAX_PATH_LEN)) {
+                        changed = true;
+                    }
+                    break;
+                } else if (selected == 3) {
+                    // Rescan Titles
+                    result = CONFIG_RESULT_RESCAN;
                     if (changed) {
                         memcpy(config, &working, sizeof(AppConfig));
                         config_save(config);
                     }
                     running = false;
                     break;
-                } else if (selected == 3) {
+                } else if (selected == 4) {
+                    // Check for Updates
+                    result = CONFIG_RESULT_UPDATE;
+                    if (changed) {
+                        memcpy(config, &working, sizeof(AppConfig));
+                        config_save(config);
+                    }
+                    running = false;
+                    break;
+                } else if (selected == 5) {
+                    // Save & Exit
+                    if (changed) {
+                        memcpy(config, &working, sizeof(AppConfig));
+                        config_save(config);
+                        result = CONFIG_RESULT_SAVED;
+                    }
+                    running = false;
+                    break;
+                } else if (selected == 6) {
                     // Cancel
-                    changed = false;
                     running = false;
                     break;
                 }
@@ -399,5 +457,5 @@ bool ui_show_config_editor(AppConfig *config) {
         }
     }
 
-    return changed;
+    return result;
 }

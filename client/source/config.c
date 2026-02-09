@@ -106,6 +106,8 @@ bool config_load(AppConfig *config, char *error_out, int error_size) {
             strncpy(config->server_url, val, MAX_URL_LEN - 1);
         } else if (strcmp(key, "api_key") == 0) {
             strncpy(config->api_key, val, MAX_API_KEY_LEN - 1);
+        } else if (strcmp(key, "nds_dir") == 0) {
+            strncpy(config->nds_dir, val, MAX_PATH_LEN - 1);
         }
     }
 
@@ -146,6 +148,8 @@ bool config_save(const AppConfig *config) {
     fprintf(f, "# 3DS Save Sync Configuration\n");
     fprintf(f, "server_url=%s\n", config->server_url);
     fprintf(f, "api_key=%s\n", config->api_key);
+    if (config->nds_dir[0])
+        fprintf(f, "nds_dir=%s\n", config->nds_dir);
 
     fclose(f);
     return true;

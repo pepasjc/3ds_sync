@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define APP_VERSION "0.3.8"
+#define APP_VERSION "0.4.0"
 
 // Max values
 #define MAX_TITLES        256
@@ -23,10 +23,13 @@ typedef struct {
     u64 title_id;
     FS_MediaType media_type;
     char title_id_hex[17]; // 16 hex chars + null
-    char product_code[16]; // Product code from AM (e.g., CTR-P-BRBE)
+    char product_code[16]; // Product code from AM (e.g., CTR-P-BRBE) or NDS game code
     char name[64];         // Game name (from server lookup or product code)
     bool has_save_data;
     bool in_conflict;      // Set after sync if this title has a conflict
+    bool is_nds;           // NDS game (via nds-bootstrap on SD) vs 3DS title
+    bool marked;           // User-selected for batch operations
+    char sav_path[MAX_PATH_LEN]; // NDS only: path to .sav file on SD card
 } TitleInfo;
 
 // Console ID file location
@@ -37,6 +40,7 @@ typedef struct {
     char server_url[MAX_URL_LEN];
     char api_key[MAX_API_KEY_LEN];
     char console_id[17];  // 16 hex chars + null (generated on first run)
+    char nds_dir[MAX_PATH_LEN]; // NDS ROM directory on SD (e.g., "sdmc:/roms/nds")
 } AppConfig;
 
 #endif // COMMON_H

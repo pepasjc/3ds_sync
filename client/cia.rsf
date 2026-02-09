@@ -116,7 +116,7 @@ AccessControlInfo:
 
 SystemControlInfo:
   SaveDataSize              : 0KB
-  RemasterVersion           : 56  # v0.3.7 = (0<<10)|(3<<4)|8
+  RemasterVersion           : 64  # v0.4.0 = (0<<10)|(4<<4)|0
   StackSize                 : 0x40000
 
   Dependency:

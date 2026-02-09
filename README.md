@@ -1,17 +1,23 @@
 # 3DS Save Sync
 
-Sync Nintendo 3DS save files between multiple CFW consoles via a PC server over WiFi.
+Sync Nintendo 3DS and DS save files between multiple CFW consoles via a PC server over WiFi.
 
 ## Features
 
 - **Multi-console sync**: Keep saves in sync across multiple 3DS consoles
 - **Three-way hash sync**: Automatically detects which side changed to avoid conflicts
-- **Cartridge support**: Sync saves between digital and physical copies of the same game
-- **Compression**: zlib compression allows syncing saves up to ~1-2MB (compressed to 448KB limit)
-- **Game name lookup**: Shows actual game names instead of title IDs (4500+ games in database)
+- **3DS cartridge support**: Sync saves from physical 3DS game cards
+- **NDS support**: Sync DS games via nds-bootstrap (SD), physical NDS cartridges (SPI), or the PC sync tool
+- **Compression**: zlib compression allows syncing saves up to ~1-2MB
+- **Game name lookup**: Shows actual game names instead of title IDs (4500+ 3DS games, 7000+ DS games)
 - **Conflict detection**: Highlights conflicting saves in red for manual resolution
+- **Batch operations**: Mark multiple titles with SELECT and upload/download them together
+- **Tab filtering**: Cycle between All / 3DS / NDS views with R
+- **Save details**: Press Y to view local and server save metadata, hashes, sync status
 - **Save history**: Server keeps previous versions of saves for recovery
-- **Auto-update**: Check for and install updates directly from the 3DS (no FBI needed)
+- **In-app config editor**: Edit server URL, API key, and NDS path without removing your SD card
+- **Auto-update**: Check for and install updates directly from the 3DS
+- **PC DS sync tool**: Python script to sync DS saves from SD cards, flashcards, or TWiLight Menu++
 
 ## Requirements
 
@@ -21,7 +27,7 @@ Sync Nintendo 3DS save files between multiple CFW consoles via a PC server over 
 
 ### Client (3DS)
 - Custom firmware (Luma3DS recommended)
-- Homebrew Launcher
+- Homebrew Launcher or CIA installer
 - WiFi connection to the same network as the server
 
 ## Quick Start
@@ -34,7 +40,7 @@ uv sync                    # Install dependencies
 uv run python run.py       # Start server on port 8000
 ```
 
-The server will display `Loaded XXXX game names from database` on startup.
+The server will display how many 3DS and DS game names it loaded from the database.
 
 ### 2. Configure the 3DS Client
 
@@ -46,6 +52,16 @@ api_key=your-secret-key
 ```
 
 Replace `192.168.1.100` with your PC's local IP address.
+
+To also sync **NDS games** installed via nds-bootstrap on your SD card, add the path to your NDS ROM directory:
+
+```
+server_url=http://192.168.1.100:8000
+api_key=your-secret-key
+nds_dir=sdmc:/roms/nds
+```
+
+The client will scan this directory for `.nds` ROMs and look for matching `.sav` files next to them. You can also edit all config values in-app by pressing L.
 
 ### 3. Set Server API Key
 
@@ -62,7 +78,9 @@ SYNC_API_KEY=your-secret-key uv run python run.py
 
 ### 4. Install the Client
 
-Copy `client/3dssync.3dsx` to `sdmc:/3ds/` on your SD card and launch via Homebrew Launcher.
+**Homebrew Launcher**: Copy `client/3dssync.3dsx` to `sdmc:/3ds/` on your SD card.
+
+**CIA (Home Menu)**: Install `client/3dssync.cia` using FBI or another CIA installer.
 
 ## Usage
 
@@ -70,53 +88,91 @@ Copy `client/3dssync.3dsx` to `sdmc:/3ds/` on your SD card and launch via Homebr
 
 | Button | Action |
 |--------|--------|
-| D-Pad | Navigate title list |
-| A | Upload selected save to server |
-| B | Download save from server |
+| D-Pad Up/Down | Navigate title list |
+| D-Pad Left/Right | Page up / Page down |
+| A | Upload save to server (or batch upload if titles are marked) |
+| B | Download save from server (or batch download if marked) |
 | X | Sync all SD titles automatically |
-| Y | Rescan titles |
-| SELECT | Check for updates |
+| Y | Show save details (local/server metadata, hashes) |
+| SELECT | Toggle mark on current title (for batch operations) |
+| R | Cycle view filter: All / 3DS / NDS |
+| L | Open config menu (edit settings, rescan titles, check updates) |
 | START | Exit |
 
 ### Title List Colors
 
-- **White**: Normal SD game
-- **Yellow**: Currently selected
-- **Cyan**: Cartridge game (manual A/B sync only)
-- **Red**: Save conflict (needs manual resolution)
+| Color | Meaning |
+|-------|---------|
+| White | Normal SD game |
+| Yellow | Currently selected |
+| Green | Marked for batch operation |
+| Cyan | Physical cartridge (3DS or NDS game card) |
+| Magenta | NDS game on SD (nds-bootstrap) |
+| Red | Save conflict (needs manual resolution) |
 
 ### Syncing Workflow
 
 **First time setup:**
-1. On your "main" 3DS, press X to sync all - this uploads all saves to the server
+1. On your "main" 3DS, press X to sync all — this uploads all saves to the server
 
 **Regular use:**
 1. Play games on any 3DS
 2. Before switching consoles, press X to sync all
-3. On the other console, press X to sync all - changed saves download automatically
+3. On the other console, press X to sync all — changed saves download automatically
 
 **Resolving conflicts:**
 If both consoles changed the same save:
-1. The save shows in red
-2. Select it and press A to keep local version, or B to use server version
+1. The save shows in red and gets auto-marked
+2. Press A to keep local version, or B to use server version
+3. With multiple conflicts, use batch download (B) to accept all server versions
 
 ### Cartridge Saves
 
-Cartridge games appear in cyan and are excluded from "Sync All" to prevent accidental overwrites.
-
-To sync a cartridge save:
-1. Select the cartridge game (cyan, "Card" prefix)
-2. Press A to upload to server, or B to download from server
+Physical cartridge games (3DS and NDS) appear in cyan and are excluded from "Sync All" to prevent accidental overwrites. Use A/B buttons for manual upload/download.
 
 This lets you transfer saves between:
-- Physical cartridge ↔ Digital copy
-- Cartridge on one console ↔ Cartridge on another console
+- Physical cartridge on one console <-> another console
+- Physical cartridge <-> Digital copy (same title ID)
+
+NDS physical cartridges are accessed via SPI and support Flash, EEPROM, and FRAM save types.
+
+### NDS Games on SD (nds-bootstrap)
+
+If you use nds-bootstrap to run DS games from your SD card:
+
+1. Set `nds_dir` in your config to point to your NDS ROM directory (e.g., `sdmc:/roms/nds`)
+2. The client scans for `.nds` files and their matching `.sav` files
+3. NDS games appear in magenta in the title list
+4. They sync like any other title — the server stores saves using a title ID derived from the game code
+
+### Batch Operations
+
+1. Press SELECT on titles to mark them (shown in green with an asterisk)
+2. Press A to batch upload all marked titles, or B to batch download
+3. Marks are cleared after the batch completes
+
+This is useful for resolving multiple conflicts at once or syncing specific titles.
+
+### DS PC Sync Tool
+
+A Python script (`tools/ds_sync.py`) syncs DS `.sav` files from a PC — useful for flashcard saves, TWiLight Menu++ on DSi, or any other DS save files:
+
+```bash
+# Sync from SD card (auto-detects TWiLight Menu++ paths)
+python tools/ds_sync.py --sd-path E:\ --server http://192.168.1.100:8000 --api-key mykey
+
+# Sync from specific directories
+python tools/ds_sync.py --roms-dir E:\nds --saves-dir E:\nds\saves --server ... --api-key ...
+
+# Dry run (show what would happen)
+python tools/ds_sync.py --sd-path E:\ --server ... --api-key ... --dry-run
+```
 
 ### Auto-Update
 
-Press SELECT to check for new versions. If an update is available:
+Press L to open the config menu, then select "Check for updates". If an update is available:
 1. Press A to download and install directly (no FBI needed)
-2. Restart the application after installation
+2. The app restarts automatically after installation
 
 Updates are downloaded from the server, which proxies GitHub releases.
 
@@ -171,9 +227,7 @@ cd client
 make cia
 ```
 
-The output is `3dssync.cia` (~210KB) - install with FBI or other CIA installer.
-
-Note: The required files (`banner_img.png`, `silent.wav`, `icon.png`, `cia.rsf`) are included in the repository.
+The output is `3dssync.cia` — install with FBI or other CIA installer.
 
 ## Technical Details
 
@@ -183,12 +237,12 @@ Note: The required files (`banner_img.png`, `silent.wav`, `icon.png`, `cia.rsf`)
 2. Client sends metadata to `POST /api/v1/sync` with:
    - Current hash
    - Last synced hash (stored locally per title)
-   - Save size
+   - Save size and console ID
 3. Server compares using three-way logic:
-   - Hashes match → up to date
-   - Only client changed (last_synced == server) → upload
-   - Only server changed (last_synced == client) → download
-   - Both changed → conflict
+   - Hashes match -> up to date
+   - Only client changed (last_synced == server) -> upload
+   - Only server changed (last_synced == client) -> download
+   - Both changed -> conflict
 4. Client executes the sync plan (uploads/downloads as needed)
 5. After successful sync, client stores the new hash as "last synced"
 
@@ -237,4 +291,5 @@ MIT
 
 - [devkitPro](https://devkitpro.org/) for the 3DS development toolchain
 - [libctru](https://github.com/devkitPro/libctru) for 3DS homebrew libraries
-- [3dstdb](https://www.3dsdb.com/) for the game names database
+- [3dstdb](https://www.3dsdb.com/) for the 3DS game names database
+- [advanscene](https://www.advanscene.com/) for the DS game names database

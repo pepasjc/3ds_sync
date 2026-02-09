@@ -1,4 +1,5 @@
 #include "common.h"
+#include "card_spi.h"
 #include "config.h"
 #include "network.h"
 #include "sync.h"
@@ -13,17 +14,68 @@ static int selected = 0;
 static int scroll_offset = 0;
 static char status[MAX_URL_LEN + 64];
 
+// View filtering: filtered[] maps visible indices -> titles[] indices
+static int view_mode = VIEW_ALL;
+static int filtered[MAX_TITLES];
+static int filtered_count = 0;
+
 #define LIST_VISIBLE 27 // TOP_ROWS(30) - header(2) - footer(1)
 
 static int title_compare(const void *a, const void *b) {
     return strcasecmp(((const TitleInfo *)a)->name, ((const TitleInfo *)b)->name);
 }
 
-static void scan_titles(void) {
-    ui_draw_message("Scanning titles...");
-    title_count = titles_scan(titles, MAX_TITLES);
+// Rebuild the filtered index list based on current view_mode
+static void rebuild_filter(void) {
+    filtered_count = 0;
+    for (int i = 0; i < title_count; i++) {
+        bool include = false;
+        switch (view_mode) {
+            case VIEW_3DS: include = !titles[i].is_nds; break;
+            case VIEW_NDS: include = titles[i].is_nds; break;
+            default:       include = true; break;
+        }
+        if (include)
+            filtered[filtered_count++] = i;
+    }
+    // Reset selection
     selected = 0;
     scroll_offset = 0;
+}
+
+// Build a temporary TitleInfo array from filtered indices for drawing
+// (ui_draw_title_list expects a contiguous array)
+static TitleInfo filtered_titles[MAX_TITLES];
+
+static void build_filtered_titles(void) {
+    for (int i = 0; i < filtered_count; i++)
+        filtered_titles[i] = titles[filtered[i]];
+}
+
+// Get the actual title index for the current selection
+static int sel_title_idx(void) {
+    if (selected >= 0 && selected < filtered_count)
+        return filtered[selected];
+    return -1;
+}
+
+// Count how many titles are marked (across ALL titles, not just filtered)
+static int count_marked(void) {
+    int count = 0;
+    for (int i = 0; i < title_count; i++)
+        if (titles[i].marked) count++;
+    return count;
+}
+
+// Clear all marks
+static void clear_marks(void) {
+    for (int i = 0; i < title_count; i++)
+        titles[i].marked = false;
+}
+
+static void scan_titles(void) {
+    ui_draw_message("Scanning titles...");
+    title_count = titles_scan(titles, MAX_TITLES, config.nds_dir);
 
     // Fetch game names from server
     if (title_count > 0) {
@@ -31,6 +83,8 @@ static void scan_titles(void) {
         titles_fetch_names(&config, titles, title_count);
         qsort(titles, title_count, sizeof(TitleInfo), title_compare);
     }
+
+    rebuild_filter();
 }
 
 // Clamp scroll so the selected item is always visible
@@ -74,6 +128,7 @@ int main(int argc, char *argv[]) {
     amInit();
     fsInit();
     psInit();  // For random number generation (console ID)
+    card_spi_init();  // For NDS cartridge SPI save access
 
     ui_draw_message("Loading config...");
 
@@ -131,8 +186,9 @@ int main(int argc, char *argv[]) {
 
     snprintf(status, sizeof(status), "Server: %.200s", config.server_url);
     // Draw to both buffers to prevent flicker
+    build_filtered_titles();
     for (int buf = 0; buf < 2; buf++) {
-        ui_draw_title_list(titles, title_count, selected, scroll_offset);
+        ui_draw_title_list(filtered_titles, filtered_count, selected, scroll_offset, view_mode);
         ui_draw_status(status);
         gfxFlushBuffers();
         gfxSwapBuffers();
@@ -149,80 +205,186 @@ int main(int argc, char *argv[]) {
         if (kDown & KEY_START)
             break;
 
-        if (kDown & KEY_DOWN && title_count > 0) {
-            selected = (selected + 1) % title_count;
+        if (kDown & KEY_DOWN && filtered_count > 0) {
+            selected = (selected + 1) % filtered_count;
             update_scroll();
             redraw = true;
         }
 
-        if (kDown & KEY_UP && title_count > 0) {
-            selected = (selected - 1 + title_count) % title_count;
+        if (kDown & KEY_UP && filtered_count > 0) {
+            selected = (selected - 1 + filtered_count) % filtered_count;
             update_scroll();
             redraw = true;
         }
 
         // Page down
-        if (kDown & KEY_RIGHT && title_count > 0) {
+        if (kDown & KEY_RIGHT && filtered_count > 0) {
             selected += LIST_VISIBLE;
-            if (selected >= title_count) selected = title_count - 1;
+            if (selected >= filtered_count) selected = filtered_count - 1;
             update_scroll();
             redraw = true;
         }
 
         // Page up
-        if (kDown & KEY_LEFT && title_count > 0) {
+        if (kDown & KEY_LEFT && filtered_count > 0) {
             selected -= LIST_VISIBLE;
             if (selected < 0) selected = 0;
             update_scroll();
             redraw = true;
         }
 
-        if (kDown & KEY_Y) {
-            scan_titles();
-            snprintf(status, sizeof(status), "Rescanned. %d title(s) found.", title_count);
+        // R button - cycle view mode (All -> 3DS -> NDS -> All)
+        if (kDown & KEY_R) {
+            view_mode = (view_mode + 1) % 3;
+            rebuild_filter();
+            const char *names[] = {"All", "3DS", "NDS"};
+            snprintf(status, sizeof(status), "View: %s (%d title(s))", names[view_mode], filtered_count);
             redraw = true;
         }
 
-        if (kDown & KEY_A && title_count > 0) {
-            ui_draw_message("Loading save details...");
-            SaveDetails details;
-            if (sync_get_save_details(&config, &titles[selected], &details)) {
-                if (ui_confirm_sync(&titles[selected], &details, true)) {
-                    SyncResult res = sync_title(&config, &titles[selected], sync_progress);
-                    if (res == SYNC_OK) {
-                        snprintf(status, sizeof(status), "Uploaded: %.40s", titles[selected].name);
-                        titles[selected].in_conflict = false;
-                    } else {
-                        snprintf(status, sizeof(status), "\x1b[31mUpload failed\x1b[0m: %s",
-                            sync_result_str(res));
-                    }
+        // Y button - show save details
+        if (kDown & KEY_Y && filtered_count > 0) {
+            int idx = sel_title_idx();
+            if (idx >= 0) {
+                ui_draw_message("Loading save details...");
+                SaveDetails details;
+                if (sync_get_save_details(&config, &titles[idx], &details)) {
+                    ui_show_save_details(&titles[idx], &details);
                 } else {
-                    snprintf(status, sizeof(status), "Upload cancelled");
+                    snprintf(status, sizeof(status), "Failed to load save details");
                 }
-            } else {
-                snprintf(status, sizeof(status), "Failed to load save details");
             }
             redraw = true;
         }
 
-        if (kDown & KEY_B && title_count > 0) {
-            ui_draw_message("Loading save details...");
-            SaveDetails details;
-            if (sync_get_save_details(&config, &titles[selected], &details)) {
-                if (ui_confirm_sync(&titles[selected], &details, false)) {
-                    SyncResult res = sync_download_title(&config, &titles[selected], sync_progress);
-                    if (res == SYNC_OK) {
-                        snprintf(status, sizeof(status), "Downloaded: %.40s", titles[selected].name);
-                        titles[selected].in_conflict = false;
-                    } else {
-                        snprintf(status, sizeof(status), "\x1b[31mDownload failed\x1b[0m: %s",
-                            sync_result_str(res));
+        if (kDown & KEY_A && filtered_count > 0) {
+            int marked = count_marked();
+            if (marked > 0) {
+                // Batch upload all marked titles
+                char confirm[128];
+                snprintf(confirm, sizeof(confirm),
+                    "Upload %d marked title(s)?\n\n"
+                    "Press A to confirm, B to cancel", marked);
+                ui_draw_message(confirm);
+                bool go = false;
+                while (aptMainLoop()) {
+                    hidScanInput();
+                    u32 k = hidKeysDown();
+                    if (k & KEY_A) { go = true; break; }
+                    if (k & KEY_B) break;
+                    gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+                }
+                if (go) {
+                    int ok_count = 0, fail_count = 0;
+                    for (int i = 0; i < title_count; i++) {
+                        if (!titles[i].marked) continue;
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "Uploading %d/%d: %.30s",
+                            ok_count + fail_count + 1, marked, titles[i].name);
+                        sync_progress(msg);
+                        SyncResult res = sync_title(&config, &titles[i], sync_progress);
+                        if (res == SYNC_OK) {
+                            ok_count++;
+                            titles[i].in_conflict = false;
+                        } else {
+                            fail_count++;
+                        }
                     }
+                    clear_marks();
+                    snprintf(status, sizeof(status), "Batch upload: %d OK, %d failed",
+                        ok_count, fail_count);
                 } else {
-                    snprintf(status, sizeof(status), "Download cancelled");
+                    snprintf(status, sizeof(status), "Batch upload cancelled");
                 }
             } else {
-                snprintf(status, sizeof(status), "Failed to load save details");
+                // Single upload
+                int idx = sel_title_idx();
+                if (idx >= 0) {
+                    ui_draw_message("Loading save details...");
+                    SaveDetails details;
+                    if (sync_get_save_details(&config, &titles[idx], &details)) {
+                        if (ui_confirm_sync(&titles[idx], &details, true)) {
+                            SyncResult res = sync_title(&config, &titles[idx], sync_progress);
+                            if (res == SYNC_OK) {
+                                snprintf(status, sizeof(status), "Uploaded: %.40s", titles[idx].name);
+                                titles[idx].in_conflict = false;
+                            } else {
+                                snprintf(status, sizeof(status), "\x1b[31mUpload failed\x1b[0m: %s",
+                                    sync_result_str(res));
+                            }
+                        } else {
+                            snprintf(status, sizeof(status), "Upload cancelled");
+                        }
+                    } else {
+                        snprintf(status, sizeof(status), "Failed to load save details");
+                    }
+                }
+            }
+            redraw = true;
+        }
+
+        if (kDown & KEY_B && filtered_count > 0) {
+            int marked = count_marked();
+            if (marked > 0) {
+                // Batch download all marked titles
+                char confirm[128];
+                snprintf(confirm, sizeof(confirm),
+                    "Download %d marked title(s)?\n\n"
+                    "Press A to confirm, B to cancel", marked);
+                ui_draw_message(confirm);
+                bool go = false;
+                while (aptMainLoop()) {
+                    hidScanInput();
+                    u32 k = hidKeysDown();
+                    if (k & KEY_A) { go = true; break; }
+                    if (k & KEY_B) break;
+                    gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+                }
+                if (go) {
+                    int ok_count = 0, fail_count = 0;
+                    for (int i = 0; i < title_count; i++) {
+                        if (!titles[i].marked) continue;
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "Downloading %d/%d: %.30s",
+                            ok_count + fail_count + 1, marked, titles[i].name);
+                        sync_progress(msg);
+                        SyncResult res = sync_download_title(&config, &titles[i], sync_progress);
+                        if (res == SYNC_OK) {
+                            ok_count++;
+                            titles[i].in_conflict = false;
+                        } else {
+                            fail_count++;
+                        }
+                    }
+                    clear_marks();
+                    snprintf(status, sizeof(status), "Batch download: %d OK, %d failed",
+                        ok_count, fail_count);
+                } else {
+                    snprintf(status, sizeof(status), "Batch download cancelled");
+                }
+            } else {
+                // Single download
+                int idx = sel_title_idx();
+                if (idx >= 0) {
+                    ui_draw_message("Loading save details...");
+                    SaveDetails details;
+                    if (sync_get_save_details(&config, &titles[idx], &details)) {
+                        if (ui_confirm_sync(&titles[idx], &details, false)) {
+                            SyncResult res = sync_download_title(&config, &titles[idx], sync_progress);
+                            if (res == SYNC_OK) {
+                                snprintf(status, sizeof(status), "Downloaded: %.40s", titles[idx].name);
+                                titles[idx].in_conflict = false;
+                            } else {
+                                snprintf(status, sizeof(status), "\x1b[31mDownload failed\x1b[0m: %s",
+                                    sync_result_str(res));
+                            }
+                        } else {
+                            snprintf(status, sizeof(status), "Download cancelled");
+                        }
+                    } else {
+                        snprintf(status, sizeof(status), "Failed to load save details");
+                    }
+                }
             }
             redraw = true;
         }
@@ -246,6 +408,12 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (summary.conflicts > 0) {
+                    // Auto-mark conflicting titles for batch resolve
+                    for (int i = 0; i < title_count; i++) {
+                        if (titles[i].in_conflict)
+                            titles[i].marked = true;
+                    }
+
                     // Show conflict details - use game names
                     char conflict_msg[512];
                     int pos = snprintf(conflict_msg, sizeof(conflict_msg),
@@ -265,8 +433,9 @@ int main(int argc, char *argv[]) {
                     }
 
                     snprintf(conflict_msg + pos, sizeof(conflict_msg) - pos,
-                        "\nConflicts shown in \x1b[31mred\x1b[0m.\n"
-                        "Select and use A/B to resolve.\n\n"
+                        "\nConflicts \x1b[32mmarked\x1b[0m for batch resolve.\n"
+                        "Press B to download all, or\n"
+                        "resolve individually.\n\n"
                         "Press any button to continue.");
 
                     ui_draw_message(conflict_msg);
@@ -292,107 +461,101 @@ int main(int argc, char *argv[]) {
             } else {
                 snprintf(status, sizeof(status), "\x1b[31mSync failed!\x1b[0m Check server.");
             }
+            rebuild_filter();
             redraw = true;
         }
 
-        // SELECT button - check for updates
-        if (kDown & KEY_SELECT) {
-            ui_draw_message("Checking for updates...");
-
-            UpdateInfo update_info;
-            if (!update_check(&config, &update_info)) {
-                snprintf(status, sizeof(status), "Update check failed");
-            } else if (!update_info.available) {
-                snprintf(status, sizeof(status), "You have the latest version (%s)", APP_VERSION);
-            } else {
-                // Show update confirmation
-                char confirm_msg[512];
-                snprintf(confirm_msg, sizeof(confirm_msg),
-                    "\x1b[33mUpdate available!\x1b[0m\n\n"
-                    "Current: %s\n"
-                    "Latest:  %s\n"
-                    "Size:    %lu KB\n\n"
-                    "Press A to download and install\n"
-                    "Press B to cancel",
-                    APP_VERSION,
-                    update_info.latest_version,
-                    (unsigned long)(update_info.file_size / 1024));
-                ui_draw_message(confirm_msg);
-
-                // Wait for A or B
-                bool do_update = false;
-                while (aptMainLoop()) {
-                    hidScanInput();
-                    u32 k = hidKeysDown();
-                    if (k & KEY_A) { do_update = true; break; }
-                    if (k & KEY_B) { break; }
-                    gfxFlushBuffers();
-                    gfxSwapBuffers();
-                    gspWaitForVBlank();
-                }
-
-                if (do_update) {
-                    ui_draw_message("Downloading update...");
-                    if (!update_download(&config, update_info.download_url, update_progress_cb)) {
-                        snprintf(status, sizeof(status), "\x1b[31mDownload failed!\x1b[0m");
-                    } else {
-                        ui_draw_message("Installing update...\n\nPlease wait, do not power off.");
-                        char install_error[64] = {0};
-                        if (!update_install(update_progress_cb, install_error, sizeof(install_error))) {
-                            snprintf(status, sizeof(status), "\x1b[31mInstall failed:\x1b[0m %s", install_error);
-                        } else {
-                            ui_draw_message(
-                                "\x1b[32mUpdate installed!\x1b[0m\n\n"
-                                "Restarting application...");
-
-                            // Brief delay so user can see the message
-                            svcSleepThread(1500000000LL);  // 1.5 seconds
-
-                            // Try to relaunch (works for CIA apps)
-                            update_relaunch();
-
-                            // If relaunch failed (e.g., running as 3dsx), show manual message
-                            ui_draw_message(
-                                "\x1b[32mUpdate installed!\x1b[0m\n\n"
-                                "Please restart the application\n"
-                                "to use the new version.\n\n"
-                                "Press START to exit.");
-
-                            while (aptMainLoop()) {
-                                hidScanInput();
-                                if (hidKeysDown() & KEY_START) break;
-                                gfxFlushBuffers();
-                                gfxSwapBuffers();
-                                gspWaitForVBlank();
-                            }
-
-                            goto cleanup;
-                        }
-                    }
-                } else {
-                    snprintf(status, sizeof(status), "Update cancelled");
-                }
+        // SELECT button - toggle mark on current item
+        if (kDown & KEY_SELECT && filtered_count > 0) {
+            int idx = sel_title_idx();
+            if (idx >= 0) {
+                titles[idx].marked = !titles[idx].marked;
+                int mc = count_marked();
+                if (mc > 0)
+                    snprintf(status, sizeof(status), "%d title(s) marked", mc);
+                else
+                    snprintf(status, sizeof(status), "Marks cleared");
             }
             redraw = true;
         }
 
-        // R button - show save details
-        if (kDown & KEY_R && title_count > 0) {
-            ui_draw_message("Loading save details...");
-
-            SaveDetails details;
-            if (sync_get_save_details(&config, &titles[selected], &details)) {
-                ui_show_save_details(&titles[selected], &details);
-            } else {
-                snprintf(status, sizeof(status), "Failed to load save details");
-            }
-            redraw = true;
-        }
-
-        // L button - config editor
+        // L button - config editor (includes rescan + update options)
         if (kDown & KEY_L) {
-            if (ui_show_config_editor(&config)) {
+            int result = ui_show_config_editor(&config);
+            if (result == CONFIG_RESULT_RESCAN) {
+                scan_titles();
+                snprintf(status, sizeof(status), "Rescanned. %d title(s) found.", title_count);
+            } else if (result == CONFIG_RESULT_SAVED) {
                 snprintf(status, sizeof(status), "Config saved. Server: %.30s", config.server_url);
+            } else if (result == CONFIG_RESULT_UPDATE) {
+                // Check for updates (moved from SELECT)
+                ui_draw_message("Checking for updates...");
+
+                UpdateInfo update_info;
+                if (!update_check(&config, &update_info)) {
+                    snprintf(status, sizeof(status), "Update check failed");
+                } else if (!update_info.available) {
+                    snprintf(status, sizeof(status), "You have the latest version (%s)", APP_VERSION);
+                } else {
+                    char confirm_msg[512];
+                    snprintf(confirm_msg, sizeof(confirm_msg),
+                        "\x1b[33mUpdate available!\x1b[0m\n\n"
+                        "Current: %s\n"
+                        "Latest:  %s\n"
+                        "Size:    %lu KB\n\n"
+                        "Press A to download and install\n"
+                        "Press B to cancel",
+                        APP_VERSION,
+                        update_info.latest_version,
+                        (unsigned long)(update_info.file_size / 1024));
+                    ui_draw_message(confirm_msg);
+
+                    bool do_update = false;
+                    while (aptMainLoop()) {
+                        hidScanInput();
+                        u32 k = hidKeysDown();
+                        if (k & KEY_A) { do_update = true; break; }
+                        if (k & KEY_B) { break; }
+                        gfxFlushBuffers();
+                        gfxSwapBuffers();
+                        gspWaitForVBlank();
+                    }
+
+                    if (do_update) {
+                        ui_draw_message("Downloading update...");
+                        if (!update_download(&config, update_info.download_url, update_progress_cb)) {
+                            snprintf(status, sizeof(status), "\x1b[31mDownload failed!\x1b[0m");
+                        } else {
+                            ui_draw_message("Installing update...\n\nPlease wait, do not power off.");
+                            char install_error[64] = {0};
+                            if (!update_install(update_progress_cb, install_error, sizeof(install_error))) {
+                                snprintf(status, sizeof(status), "\x1b[31mInstall failed:\x1b[0m %s", install_error);
+                            } else {
+                                ui_draw_message(
+                                    "\x1b[32mUpdate installed!\x1b[0m\n\n"
+                                    "Restarting application...");
+                                svcSleepThread(1500000000LL);
+                                update_relaunch();
+
+                                ui_draw_message(
+                                    "\x1b[32mUpdate installed!\x1b[0m\n\n"
+                                    "Please restart the application\n"
+                                    "to use the new version.\n\n"
+                                    "Press START to exit.");
+                                while (aptMainLoop()) {
+                                    hidScanInput();
+                                    if (hidKeysDown() & KEY_START) break;
+                                    gfxFlushBuffers();
+                                    gfxSwapBuffers();
+                                    gspWaitForVBlank();
+                                }
+                                goto cleanup;
+                            }
+                        }
+                    } else {
+                        snprintf(status, sizeof(status), "Update cancelled");
+                    }
+                }
             } else {
                 snprintf(status, sizeof(status), "Config unchanged");
             }
@@ -400,9 +563,10 @@ int main(int argc, char *argv[]) {
         }
 
         if (redraw) {
+            build_filtered_titles();
             // Draw to both buffers to prevent flicker with double buffering
             for (int buf = 0; buf < 2; buf++) {
-                ui_draw_title_list(titles, title_count, selected, scroll_offset);
+                ui_draw_title_list(filtered_titles, filtered_count, selected, scroll_offset, view_mode);
                 ui_draw_status(status);
                 gfxFlushBuffers();
                 gfxSwapBuffers();
@@ -417,6 +581,7 @@ int main(int argc, char *argv[]) {
 cleanup:
     // Cleanup
     network_exit();
+    card_spi_exit();
     psExit();
     fsExit();
     amExit();

@@ -10,9 +10,15 @@ void ui_init(void);
 // Reinitialize after gfx restart (e.g., after swkbd applet)
 void ui_reinit(void);
 
+// View mode for title list filtering
+#define VIEW_ALL  0
+#define VIEW_3DS  1
+#define VIEW_NDS  2
+
 // Draw the title list on the top screen.
 // selected = currently highlighted index, count = number of titles.
-void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset);
+// view_mode controls the tab label in the header.
+void ui_draw_title_list(const TitleInfo *titles, int count, int selected, int scroll_offset, int view_mode);
 
 // Draw status/action bar on the bottom screen
 void ui_draw_status(const char *status_line);
@@ -34,8 +40,14 @@ void ui_show_save_details(const TitleInfo *title, const SaveDetails *details);
 // Returns true if user confirmed (A), false if cancelled (B)
 bool ui_confirm_sync(const TitleInfo *title, const SaveDetails *details, bool is_upload);
 
+// Config editor result codes
+#define CONFIG_RESULT_UNCHANGED 0
+#define CONFIG_RESULT_SAVED     1
+#define CONFIG_RESULT_RESCAN    2
+#define CONFIG_RESULT_UPDATE    3
+
 // Show config editor menu on top screen
-// Returns true if config was changed, false otherwise
-bool ui_show_config_editor(AppConfig *config);
+// Returns CONFIG_RESULT_* code
+int ui_show_config_editor(AppConfig *config);
 
 #endif // UI_H

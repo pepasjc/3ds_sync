@@ -1,6 +1,7 @@
 #include "sync.h"
 #include "archive.h"
 #include "bundle.h"
+#include "nds.h"
 #include "network.h"
 #include "sha256.h"
 
@@ -144,7 +145,13 @@ static SyncResult upload_title_with_hash(const AppConfig *config, const TitleInf
     ArchiveFile *files = (ArchiveFile *)malloc(MAX_SAVE_FILES * sizeof(ArchiveFile));
     if (!files) return SYNC_ERR_ARCHIVE;
 
-    int file_count = archive_read(title->title_id, title->media_type,
+    int file_count;
+    if (title->is_nds && title->media_type == MEDIATYPE_GAME_CARD)
+        file_count = nds_cart_read_save(files, MAX_SAVE_FILES);
+    else if (title->is_nds)
+        file_count = nds_read_save(title->sav_path, files, MAX_SAVE_FILES);
+    else
+        file_count = archive_read(title->title_id, title->media_type,
                                   files, MAX_SAVE_FILES);
     if (file_count < 0) { free(files); return SYNC_ERR_ARCHIVE; }
     if (file_count == 0) { free(files); return SYNC_OK; }
@@ -232,8 +239,14 @@ static SyncResult download_title(const AppConfig *config, const TitleInfo *title
     snprintf(msg, sizeof(msg), "Writing save: %s (%d files)", title->title_id_hex, file_count);
     if (progress) progress(msg);
 
-    // Write to save archive
-    bool ok = archive_write(title->title_id, title->media_type, files, file_count);
+    // Write save data
+    bool ok;
+    if (title->is_nds && title->media_type == MEDIATYPE_GAME_CARD)
+        ok = nds_cart_write_save(files, file_count);
+    else if (title->is_nds)
+        ok = nds_write_save(title->sav_path, files, file_count);
+    else
+        ok = archive_write(title->title_id, title->media_type, files, file_count);
     free(files);
     // Free decompressed buffer if we had a compressed bundle
     // (file data pointers point into decompressed, not resp)
@@ -298,7 +311,13 @@ bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
         if (progress) progress(msg);
 
         // Read save to compute current hash
-        int fc = archive_read(titles[i].title_id, titles[i].media_type,
+        int fc;
+        if (titles[i].is_nds && titles[i].media_type == MEDIATYPE_GAME_CARD)
+            fc = nds_cart_read_save(files, MAX_SAVE_FILES);
+        else if (titles[i].is_nds)
+            fc = nds_read_save(titles[i].sav_path, files, MAX_SAVE_FILES);
+        else
+            fc = archive_read(titles[i].title_id, titles[i].media_type,
                               files, MAX_SAVE_FILES);
         if (fc < 0) fc = 0;
 
@@ -372,6 +391,29 @@ bool sync_all(const AppConfig *config, const TitleInfo *titles, int title_count,
     int up_to_date_count = json_parse_string_array(plan, "up_to_date", up_to_date_ids, MAX_TITLES);
 
     free(resp_str);
+
+    // Auto-resolve conflicts for titles without local saves -> download
+    // (no local save means nothing to lose, safe to download from server)
+    for (int i = 0; i < conflict_count; ) {
+        bool resolved = false;
+        for (int j = 0; j < title_count; j++) {
+            if (strcmp(titles[j].title_id_hex, conflict_ids[i]) == 0 &&
+                !titles[j].has_save_data) {
+                // Move to download list
+                if (download_count < MAX_TITLES) {
+                    strcpy(download_ids[download_count], conflict_ids[i]);
+                    download_count++;
+                }
+                // Remove from conflict list (shift remaining)
+                for (int k = i; k < conflict_count - 1; k++)
+                    strcpy(conflict_ids[k], conflict_ids[k + 1]);
+                conflict_count--;
+                resolved = true;
+                break;
+            }
+        }
+        if (!resolved) i++;
+    }
 
     // Record counts in summary
     local_summary.up_to_date = up_to_date_count;
@@ -493,7 +535,13 @@ bool sync_get_save_details(const AppConfig *config, const TitleInfo *title,
     ArchiveFile *files = (ArchiveFile *)malloc(MAX_SAVE_FILES * sizeof(ArchiveFile));
     if (!files) return false;
 
-    int file_count = archive_read(title->title_id, title->media_type,
+    int file_count;
+    if (title->is_nds && title->media_type == MEDIATYPE_GAME_CARD)
+        file_count = nds_cart_read_save(files, MAX_SAVE_FILES);
+    else if (title->is_nds)
+        file_count = nds_read_save(title->sav_path, files, MAX_SAVE_FILES);
+    else
+        file_count = archive_read(title->title_id, title->media_type,
                                   files, MAX_SAVE_FILES);
     if (file_count > 0) {
         details->local_exists = true;
