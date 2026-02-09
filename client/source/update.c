@@ -234,8 +234,9 @@ bool update_install(UpdateProgressCb progress, char *error_out, int error_size) 
         u32 written = 0;
         write_res = FSFILE_Write(cia_handle, &written, total_written, buffer, to_read, FS_WRITE_FLUSH);
         if (R_FAILED(write_res) || written != to_read) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "FSFILE_Write: %08lX", write_res);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "FSFILE_Write: %08lX\nat offset %lu/%lu (wrote %lu/%lu)",
+                write_res, total_written, file_size, written, to_read);
             set_error(error_out, error_size, msg);
             success = false;
             break;

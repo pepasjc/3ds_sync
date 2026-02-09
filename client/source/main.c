@@ -527,9 +527,22 @@ int main(int argc, char *argv[]) {
                             snprintf(status, sizeof(status), "\x1b[31mDownload failed!\x1b[0m");
                         } else {
                             ui_draw_message("Installing update...\n\nPlease wait, do not power off.");
-                            char install_error[64] = {0};
+                            char install_error[128] = {0};
                             if (!update_install(update_progress_cb, install_error, sizeof(install_error))) {
-                                snprintf(status, sizeof(status), "\x1b[31mInstall failed:\x1b[0m %s", install_error);
+                                char errmsg[256];
+                                snprintf(errmsg, sizeof(errmsg),
+                                    "\x1b[31mInstall failed:\x1b[0m\n\n%s\n\n"
+                                    "Press any button to continue.",
+                                    install_error);
+                                ui_draw_message(errmsg);
+                                while (aptMainLoop()) {
+                                    hidScanInput();
+                                    if (hidKeysDown()) break;
+                                    gfxFlushBuffers();
+                                    gfxSwapBuffers();
+                                    gspWaitForVBlank();
+                                }
+                                snprintf(status, sizeof(status), "Install failed");
                             } else {
                                 ui_draw_message(
                                     "\x1b[32mUpdate installed!\x1b[0m\n\n"

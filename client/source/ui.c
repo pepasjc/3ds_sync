@@ -307,12 +307,11 @@ bool ui_confirm_sync(const TitleInfo *title, const SaveDetails *details, bool is
 // Draw config editor menu
 static void draw_config_menu(const AppConfig *config, int selected) {
     consoleSelect(&top_screen);
-    consoleClear();
 
     int row = 1;
 
-    printf("\x1b[%d;1H\x1b[36m--- Configuration ---\x1b[0m", row++);
-    row++;
+    printf("\x1b[%d;1H\x1b[36m%-*s\x1b[0m", row++, TOP_COLS, "--- Configuration ---");
+    printf("\x1b[%d;1H%-*s", row++, TOP_COLS, "");
 
     // Menu items
     const char *items[] = {
@@ -330,34 +329,49 @@ static void draw_config_menu(const AppConfig *config, int selected) {
         const char *cursor = (i == selected) ? ">" : " ";
         const char *color = (i == selected) ? "\x1b[33m" : "\x1b[0m";
 
-        printf("\x1b[%d;1H%s%s %s\x1b[0m", row++, color, cursor, items[i]);
+        char line[TOP_COLS + 1];
+        snprintf(line, sizeof(line), "%s %s", cursor, items[i]);
+        printf("\x1b[%d;1H%s%-*s\x1b[0m", row++, color, TOP_COLS, line);
 
         // Show current value for editable items
         if (i == 0) {
-            printf("\x1b[%d;1H   \x1b[90m%.44s\x1b[0m", row++, config->server_url);
+            char val[TOP_COLS + 1];
+            snprintf(val, sizeof(val), "   %.44s", config->server_url);
+            printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", row++, TOP_COLS, val);
         } else if (i == 1) {
-            // Mask API key for privacy
+            char val[TOP_COLS + 1];
             int len = strlen(config->api_key);
             if (len > 4) {
-                printf("\x1b[%d;1H   \x1b[90m%.4s****\x1b[0m", row++, config->api_key);
+                snprintf(val, sizeof(val), "   %.4s****", config->api_key);
             } else {
-                printf("\x1b[%d;1H   \x1b[90m(not set)\x1b[0m", row++);
+                snprintf(val, sizeof(val), "   (not set)");
             }
+            printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", row++, TOP_COLS, val);
         } else if (i == 2) {
+            char val[TOP_COLS + 1];
             if (config->nds_dir[0]) {
-                printf("\x1b[%d;1H   \x1b[90m%.44s\x1b[0m", row++, config->nds_dir);
+                snprintf(val, sizeof(val), "   %.44s", config->nds_dir);
             } else {
-                printf("\x1b[%d;1H   \x1b[90m(not set)\x1b[0m", row++);
+                snprintf(val, sizeof(val), "   (not set)");
             }
+            printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", row++, TOP_COLS, val);
         }
-        row++;
+        printf("\x1b[%d;1H%-*s", row++, TOP_COLS, "");
     }
 
-    row++;
-    printf("\x1b[%d;1H\x1b[90mConsole ID: %s\x1b[0m", row++, config->console_id);
+    printf("\x1b[%d;1H%-*s", row++, TOP_COLS, "");
+
+    char cid[TOP_COLS + 1];
+    snprintf(cid, sizeof(cid), "Console ID: %s", config->console_id);
+    printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", row++, TOP_COLS, cid);
+
+    // Blank remaining lines
+    while (row < TOP_ROWS) {
+        printf("\x1b[%d;1H%-*s", row++, TOP_COLS, "");
+    }
 
     // Footer
-    printf("\x1b[%d;1H\x1b[90m A: Select | D-Pad: Navigate\x1b[0m", TOP_ROWS);
+    printf("\x1b[%d;1H\x1b[90m%-*s\x1b[0m", TOP_ROWS, TOP_COLS, " A: Select | D-Pad: Navigate");
 }
 
 int ui_show_config_editor(AppConfig *config) {
@@ -368,91 +382,73 @@ int ui_show_config_editor(AppConfig *config) {
     int selected = 0;
     int result = CONFIG_RESULT_UNCHANGED;
     bool changed = false;
-    bool running = true;
     const int item_count = 7;
+    bool redraw = true;
 
-    while (running && aptMainLoop()) {
-        // Draw menu to both buffers
-        for (int buf = 0; buf < 2; buf++) {
-            draw_config_menu(&working, selected);
-            gfxFlushBuffers();
-            gfxSwapBuffers();
-            gspWaitForVBlank();
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kDown = hidKeysDown();
+
+        if (kDown & KEY_UP) {
+            selected = (selected - 1 + item_count) % item_count;
+            redraw = true;
+        }
+        if (kDown & KEY_DOWN) {
+            selected = (selected + 1) % item_count;
+            redraw = true;
+        }
+        if (kDown & KEY_B) {
+            break;
+        }
+        if (kDown & KEY_A) {
+            if (selected == 0) {
+                if (config_edit_field("http://192.168.1.100:8000", working.server_url, MAX_URL_LEN))
+                    changed = true;
+                redraw = true;
+            } else if (selected == 1) {
+                if (config_edit_field("your-api-key", working.api_key, MAX_API_KEY_LEN))
+                    changed = true;
+                redraw = true;
+            } else if (selected == 2) {
+                if (config_edit_field("sdmc:/roms/nds", working.nds_dir, MAX_PATH_LEN))
+                    changed = true;
+                redraw = true;
+            } else if (selected == 3) {
+                result = CONFIG_RESULT_RESCAN;
+                if (changed) {
+                    memcpy(config, &working, sizeof(AppConfig));
+                    config_save(config);
+                }
+                break;
+            } else if (selected == 4) {
+                result = CONFIG_RESULT_UPDATE;
+                if (changed) {
+                    memcpy(config, &working, sizeof(AppConfig));
+                    config_save(config);
+                }
+                break;
+            } else if (selected == 5) {
+                if (changed) {
+                    memcpy(config, &working, sizeof(AppConfig));
+                    config_save(config);
+                    result = CONFIG_RESULT_SAVED;
+                }
+                break;
+            } else if (selected == 6) {
+                break;
+            }
         }
 
-        // Wait for input
-        while (aptMainLoop()) {
-            hidScanInput();
-            u32 kDown = hidKeysDown();
-
-            if (kDown & KEY_UP) {
-                selected = (selected - 1 + item_count) % item_count;
-                break;
+        if (redraw) {
+            // Draw to both buffers to prevent flicker
+            for (int buf = 0; buf < 2; buf++) {
+                draw_config_menu(&working, selected);
+                gfxFlushBuffers();
+                gfxSwapBuffers();
+                gspWaitForVBlank();
             }
-            if (kDown & KEY_DOWN) {
-                selected = (selected + 1) % item_count;
-                break;
-            }
-            if (kDown & KEY_B) {
-                // Cancel without saving
-                running = false;
-                break;
-            }
-            if (kDown & KEY_A) {
-                if (selected == 0) {
-                    // Edit server URL
-                    if (config_edit_field("http://192.168.1.100:8000", working.server_url, MAX_URL_LEN)) {
-                        changed = true;
-                    }
-                    break;
-                } else if (selected == 1) {
-                    // Edit API key
-                    if (config_edit_field("your-api-key", working.api_key, MAX_API_KEY_LEN)) {
-                        changed = true;
-                    }
-                    break;
-                } else if (selected == 2) {
-                    // Edit NDS ROM directory
-                    if (config_edit_field("sdmc:/roms/nds", working.nds_dir, MAX_PATH_LEN)) {
-                        changed = true;
-                    }
-                    break;
-                } else if (selected == 3) {
-                    // Rescan Titles
-                    result = CONFIG_RESULT_RESCAN;
-                    if (changed) {
-                        memcpy(config, &working, sizeof(AppConfig));
-                        config_save(config);
-                    }
-                    running = false;
-                    break;
-                } else if (selected == 4) {
-                    // Check for Updates
-                    result = CONFIG_RESULT_UPDATE;
-                    if (changed) {
-                        memcpy(config, &working, sizeof(AppConfig));
-                        config_save(config);
-                    }
-                    running = false;
-                    break;
-                } else if (selected == 5) {
-                    // Save & Exit
-                    if (changed) {
-                        memcpy(config, &working, sizeof(AppConfig));
-                        config_save(config);
-                        result = CONFIG_RESULT_SAVED;
-                    }
-                    running = false;
-                    break;
-                } else if (selected == 6) {
-                    // Cancel
-                    running = false;
-                    break;
-                }
-            }
-
-            gfxFlushBuffers();
-            gfxSwapBuffers();
+            redraw = false;
+        } else {
             gspWaitForVBlank();
         }
     }
