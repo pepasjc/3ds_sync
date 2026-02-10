@@ -77,6 +77,15 @@ int main(void) {
     saves_scan(&state);
     
     iprintf("\nFound %d saves!\n", state.num_titles);
+    
+    // TODO: Fetch server save list if WiFi available
+    // Currently disabled due to large response size (78KB+ JSON)
+    // Need to implement chunked reading in http.c first
+    // if (has_wifi) {
+    //     iprintf("Fetching server list...\n");
+    //     network_fetch_saves(&state);
+    // }
+    
     iprintf("\nPress A to continue\n");
     
     while(pmMainLoop()) {
@@ -169,8 +178,37 @@ int main(void) {
         if (pressed & KEY_A && state.num_titles > 0 && has_wifi) {
             Title *title = &state.titles[selected];
             
-            // Show confirmation dialog (no server info for now)
-            if (ui_confirm_sync(title, "", 0, true)) {
+            consoleClear();
+            iprintf("Checking server...\n");
+            
+            // Convert title_id to hex string
+            char title_id_hex[17];
+            snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+                title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+                title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+            
+            // Clear hash to force fresh calculation
+            title->hash_calculated = false;
+            
+            // Fetch server save info
+            char server_hash[65] = "";
+            size_t server_size = 0;
+            int check_result = network_get_save_info(&state, title_id_hex, server_hash, &server_size);
+            
+            if (check_result != 0) {
+                iprintf("\nFailed to check server!\n");
+                iprintf("Press B to go back\n");
+                while(pmMainLoop()) {
+                    swiWaitForVBlank();
+                    scanKeys();
+                    if(keysDown() & KEY_B) break;
+                }
+                redraw = true;
+                continue;
+            }
+            
+            // Show confirmation dialog with server info
+            if (ui_confirm_sync(title, server_hash, server_size, true)) {
                 consoleClear();
                 iprintf("Uploading...\n\n");
                 
@@ -180,17 +218,18 @@ int main(void) {
                 } else {
                     iprintf("\nUpload failed!\n");
                 }
+                
+                iprintf("Press B to go back\n");
             } else {
                 consoleClear();
                 iprintf("Upload cancelled\n");
+                iprintf("Press B to go back\n");
             }
-            
-            iprintf("\nPress any button\n");
             
             while(pmMainLoop()) {
                 swiWaitForVBlank();
                 scanKeys();
-                if(keysDown()) break;
+                if(keysDown() & KEY_B) break;
             }
             
             redraw = true;
@@ -200,8 +239,37 @@ int main(void) {
         if (pressed & KEY_B && state.num_titles > 0 && has_wifi) {
             Title *title = &state.titles[selected];
             
-            // Show confirmation dialog (no server info for now)
-            if (ui_confirm_sync(title, "", 0, false)) {
+            consoleClear();
+            iprintf("Checking server...\n");
+            
+            // Convert title_id to hex string
+            char title_id_hex[17];
+            snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+                title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+                title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+            
+            // Fetch server save info
+            char server_hash[65] = "";
+            size_t server_size = 0;
+            int has_server = (network_get_save_info(&state, title_id_hex, server_hash, &server_size) == 0);
+            
+            if (!has_server) {
+                iprintf("\nSave not found on server!\n");
+                iprintf("Press B to go back\n");
+                while(pmMainLoop()) {
+                    swiWaitForVBlank();
+                    scanKeys();
+                    if(keysDown() & KEY_B) break;
+                }
+                redraw = true;
+                continue;
+            }
+            
+            // Clear hash flag so we recalculate from current save file
+            title->hash_calculated = false;
+            
+            // Show confirmation dialog with server info
+            if (ui_confirm_sync(title, server_hash, server_size, false)) {
                 consoleClear();
                 iprintf("Downloading...\n\n");
                 
@@ -211,17 +279,18 @@ int main(void) {
                 } else {
                     iprintf("\nDownload failed!\n");
                 }
+                
+                iprintf("Press B to go back\n");
             } else {
                 consoleClear();
                 iprintf("Download cancelled\n");
+                iprintf("Press B to go back\n");
             }
-            
-            iprintf("\nPress any button\n");
             
             while(pmMainLoop()) {
                 swiWaitForVBlank();
                 scanKeys();
-                if(keysDown()) break;
+                if(keysDown() & KEY_B) break;
             }
             
             redraw = true;
@@ -245,10 +314,13 @@ int main(void) {
                 }
                 
                 // Truncate long names
-                char name[29];
-                strncpy(name, state.titles[i].game_name, 28);
-                name[28] = '\0';
-                iprintf("%-28s\n", name);
+                char name[25];
+                strncpy(name, state.titles[i].game_name, 24);
+                name[24] = '\0';
+                
+                // Show server status indicator
+                char status = state.titles[i].on_server ? 'S' : ' ';
+                iprintf("%-24s [%c]\n", name, status);
             }
             
             iprintf("\n");

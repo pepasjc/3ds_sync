@@ -7,6 +7,106 @@
 // nds-bootstrap save paths
 #define BOOTSTRAP_SAVES_PATH "sd:/roms/nds/saves"
 #define MAX_PATH_LEN 256
+#define NDS_GAMECODE_OFFSET 0x0C
+
+// Compare titles by name for sorting (case-insensitive)
+static int title_compare(const void *a, const void *b) {
+    return strcasecmp(((const Title *)a)->game_name, ((const Title *)b)->game_name);
+}
+
+// Read product code from NDS ROM header
+// Returns true if successful, fills code_out with 4-char code
+static bool read_rom_gamecode(const char *rom_path, char *code_out) {
+    FILE *f = fopen(rom_path, "rb");
+    if (!f) return false;
+    
+    fseek(f, NDS_GAMECODE_OFFSET, SEEK_SET);
+    char code[4];
+    size_t rd = fread(code, 1, 4, f);
+    fclose(f);
+    
+    if (rd != 4) return false;
+    
+    // Validate printable ASCII
+    for (int i = 0; i < 4; i++) {
+        if (code[i] < 0x20 || code[i] > 0x7E)
+            return false;
+    }
+    
+    memcpy(code_out, code, 4);
+    code_out[4] = '\0';
+    return true;
+}
+
+// Find corresponding ROM file for a save file
+// Tries: basename.nds, basename (no ext).nds, etc.
+static bool find_rom_for_save(const char *save_path, char *rom_path_out, size_t rom_path_size) {
+    char base[MAX_PATH_LEN];
+    strncpy(base, save_path, sizeof(base) - 1);
+    
+    // Remove .sav extension
+    char *ext = strrchr(base, '.');
+    if (ext) *ext = '\0';
+    
+    // Try: basename.nds
+    snprintf(rom_path_out, rom_path_size, "%s.nds", base);
+    struct stat st;
+    if (stat(rom_path_out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    
+    // Try: basename.NDS
+    snprintf(rom_path_out, rom_path_size, "%s.NDS", base);
+    if (stat(rom_path_out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    
+    return false;
+}
+
+// Find corresponding save file for a ROM file
+// Tries: basename.sav, saves/basename.sav
+static bool find_sav_for_rom(const char *rom_path, char *sav_path_out, size_t sav_path_size) {
+    char base[MAX_PATH_LEN];
+    strncpy(base, rom_path, sizeof(base) - 1);
+    
+    // Remove .nds extension
+    char *ext = strrchr(base, '.');
+    if (ext) *ext = '\0';
+    
+    // Try: basename.sav
+    snprintf(sav_path_out, sav_path_size, "%s.sav", base);
+    struct stat st;
+    if (stat(sav_path_out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    
+    // Try: basename.SAV
+    snprintf(sav_path_out, sav_path_size, "%s.SAV", base);
+    if (stat(sav_path_out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    
+    // Try saves/ subfolder
+    char dir[MAX_PATH_LEN];
+    strncpy(dir, rom_path, sizeof(dir) - 1);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        char *filename = last_slash + 1;
+        char stem[MAX_PATH_LEN];
+        strncpy(stem, filename, sizeof(stem) - 1);
+        char *dot = strrchr(stem, '.');
+        if (dot) *dot = '\0';
+        *last_slash = '\0';
+        
+        snprintf(sav_path_out, sav_path_size, "%s/saves/%s.sav", dir, stem);
+        if (stat(sav_path_out, &st) == 0 && S_ISREG(st.st_mode)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
 
 // Check if running from nds-bootstrap (saves on SD) or flashcard
 // Returns: 0=flashcard, 1=bootstrap with sd:, 2=bootstrap with sdmc:
@@ -26,8 +126,8 @@ static int is_nds_bootstrap() {
     return 0;
 }
 
-// Scan for .sav files in flashcard directory
-static int scan_flashcard_saves(SyncState *state) {
+// Scan for .nds ROM files in flashcard directory
+static int scan_flashcard_roms(SyncState *state) {
     DIR *dir;
     struct dirent *ent;
     char path[MAX_PATH_LEN];
@@ -52,50 +152,102 @@ static int scan_flashcard_saves(SyncState *state) {
         }
         
         iprintf("  OK!\n");
+        int files_in_dir = 0;
         while ((ent = readdir(dir)) != NULL && count < MAX_TITLES) {
+            files_in_dir++;
+            
             // Skip . and ..
             if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
                 continue;
             }
             
-            // Look for .sav files
+            // Look for .nds ROM files
             char *ext = strrchr(ent->d_name, '.');
-            if (ext && (strcasecmp(ext, ".sav") == 0 || strcasecmp(ext, ".SAV") == 0)) {
+            if (ext && (strcasecmp(ext, ".nds") == 0 || strcasecmp(ext, ".NDS") == 0)) {
+                iprintf("Found ROM: %s\n", ent->d_name);
                 snprintf(path, MAX_PATH_LEN, "%s%s", paths[i], ent->d_name);
                 
                 struct stat st;
                 if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+                    // Read product code from ROM header
+                    char product_code[5];
+                    if (!read_rom_gamecode(path, product_code)) {
+                        continue;  // Skip if can't read product code
+                    }
+                    
                     Title *title = &state->titles[count];
                     
-                    // Extract game name from filename (remove .sav)
+                    // Extract game name from filename (remove .nds)
                     strncpy(title->game_name, ent->d_name, sizeof(title->game_name) - 1);
                     char *dot = strrchr(title->game_name, '.');
                     if (dot) *dot = '\0';
                     
-                    title->save_size = st.st_size;
+                    // Generate title_id from product code
+                    title->title_id[0] = 0x00;
+                    title->title_id[1] = 0x04;
+                    title->title_id[2] = 0x80;
+                    title->title_id[3] = 0x00;
+                    for (int i = 0; i < 4; i++) {
+                        title->title_id[4 + i] = (uint8_t)product_code[i];
+                    }
+                    
+                    // Find corresponding save file
+                    char sav_path[MAX_PATH_LEN];
+                    if (find_sav_for_rom(path, sav_path, sizeof(sav_path))) {
+                        // Save exists, get its size
+                        struct stat sav_st;
+                        if (stat(sav_path, &sav_st) == 0 && S_ISREG(sav_st.st_mode)) {
+                            title->save_size = sav_st.st_size;
+                            strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
+                        }
+                    } else {
+                        // No save yet, use default path for future download
+                        snprintf(sav_path, sizeof(sav_path), "%s", path);
+                        char *dot = strrchr(sav_path, '.');
+                        if (dot) strcpy(dot, ".sav");
+                        title->save_size = 0;
+                        strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
+                    }
+                    
                     title->is_cartridge = 0;
-                    title->hash_calculated = false;  // Don't calculate hash yet
-                    strncpy(title->save_path, path, sizeof(title->save_path) - 1);
+                    title->hash_calculated = false;
                     
                     count++;
                 }
             }
         }
+        iprintf("  Files: %d, Added: %d\n", files_in_dir, count);
         closedir(dir);
     }
     
     return count;
 }
 
-// Scan nds-bootstrap saves directory
-static int scan_bootstrap_saves(SyncState *state, const char *saves_path) {
+// Scan nds-bootstrap ROM directory (ROMs are in sd:/roms/nds, saves in sd:/roms/nds/saves)
+static int scan_bootstrap_roms(SyncState *state, const char *saves_path) {
     DIR *dir;
     struct dirent *ent;
     char path[MAX_PATH_LEN];
     int count = 0;
     
-    dir = opendir(saves_path);
-    if (!dir) return 0;
+    // Extract parent directory (remove /saves suffix to get ROM directory)
+    char rom_dir[MAX_PATH_LEN];
+    strncpy(rom_dir, saves_path, sizeof(rom_dir) - 1);
+    rom_dir[sizeof(rom_dir) - 1] = '\0';
+    char *last_slash = strrchr(rom_dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';  // Now rom_dir is "sd:/roms/nds"
+    } else {
+        return 0;  // Invalid path
+    }
+    
+    iprintf("ROM dir: %s\n", rom_dir);
+    
+    dir = opendir(rom_dir);
+    if (!dir) {
+        iprintf("Failed to open ROM dir\n");
+        return 0;
+    }
     
     while ((ent = readdir(dir)) != NULL && count < MAX_TITLES) {
         // Skip . and ..
@@ -103,25 +255,58 @@ static int scan_bootstrap_saves(SyncState *state, const char *saves_path) {
             continue;
         }
         
-        // Check if this is a .sav file (type 8 = DT_REG = regular file)
+        // Look for .nds ROM files
         char *ext = strrchr(ent->d_name, '.');
-        if (ext && (strcasecmp(ext, ".sav") == 0 || strcasecmp(ext, ".SAV") == 0)) {
-            char savepath[MAX_PATH_LEN];
-            snprintf(savepath, MAX_PATH_LEN, "%s/%s", saves_path, ent->d_name);
+        if (ext && (strcasecmp(ext, ".nds") == 0 || strcasecmp(ext, ".NDS") == 0)) {
+            char rom_path[MAX_PATH_LEN];
+            snprintf(rom_path, MAX_PATH_LEN, "%s/%s", rom_dir, ent->d_name);
             
             struct stat st;
-            if (stat(savepath, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (stat(rom_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                // Read product code from ROM header
+                char product_code[5];
+                if (!read_rom_gamecode(rom_path, product_code)) {
+                    continue;  // Skip if can't read product code
+                }
+                
                 Title *title = &state->titles[count];
                 
-                // Extract game name from filename (remove .sav)
+                // Extract game name from filename (remove .nds)
                 strncpy(title->game_name, ent->d_name, sizeof(title->game_name) - 1);
                 char *dot = strrchr(title->game_name, '.');
                 if (dot) *dot = '\0';
                 
-                title->save_size = st.st_size;
+                // Generate title_id from product code
+                title->title_id[0] = 0x00;
+                title->title_id[1] = 0x04;
+                title->title_id[2] = 0x80;
+                title->title_id[3] = 0x00;
+                for (int i = 0; i < 4; i++) {
+                    title->title_id[4 + i] = (uint8_t)product_code[i];
+                }
+                
+                // Look for save file in saves directory
+                char sav_name[MAX_PATH_LEN];
+                strncpy(sav_name, ent->d_name, sizeof(sav_name) - 1);
+                char *dot2 = strrchr(sav_name, '.');
+                if (dot2) strcpy(dot2, ".sav");
+                
+                char sav_path[MAX_PATH_LEN];
+                snprintf(sav_path, sizeof(sav_path), "%s/%s", saves_path, sav_name);
+                
+                struct stat sav_st;
+                if (stat(sav_path, &sav_st) == 0 && S_ISREG(sav_st.st_mode)) {
+                    // Save exists
+                    title->save_size = sav_st.st_size;
+                    strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
+                } else {
+                    // No save yet
+                    title->save_size = 0;
+                    strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
+                }
+                
                 title->is_cartridge = 0;
-                title->hash_calculated = false;  // Don't calculate hash yet
-                strncpy(title->save_path, savepath, sizeof(title->save_path) - 1);
+                title->hash_calculated = false;
                 
                 count++;
             }
@@ -176,16 +361,21 @@ int saves_scan(SyncState *state) {
     
     if (bootstrap_mode == 1) {
         iprintf("Scanning sd:/roms/nds/saves\n");
-        state->num_titles = scan_bootstrap_saves(state, "sd:/roms/nds/saves");
+        state->num_titles = scan_bootstrap_roms(state, "sd:/roms/nds/saves");
         iprintf("Bootstrap: %d saves\n", state->num_titles);
     } else if (bootstrap_mode == 2) {
         iprintf("Scanning sdmc:/roms/nds/saves\n");
-        state->num_titles = scan_bootstrap_saves(state, "sdmc:/roms/nds/saves");
+        state->num_titles = scan_bootstrap_roms(state, "sdmc:/roms/nds/saves");
         iprintf("Bootstrap: %d saves\n", state->num_titles);
     } else {
         iprintf("Scanning flashcard paths\n");
-        state->num_titles = scan_flashcard_saves(state);
+        state->num_titles = scan_flashcard_roms(state);
         iprintf("Flashcard: %d saves\n", state->num_titles);
+    }
+    
+    // Sort titles alphabetically by name
+    if (state->num_titles > 0) {
+        qsort(state->titles, state->num_titles, sizeof(Title), title_compare);
     }
     
     return 0;

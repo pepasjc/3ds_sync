@@ -287,11 +287,24 @@ int network_upload(SyncState *state, int title_idx) {
         return -1;
     }
     
-    // Build URL - use filename (game name) as identifier
+    // Strip trailing slash from server_url if present
+    char server_url[256];
+    strncpy(server_url, state->server_url, sizeof(server_url) - 1);
+    size_t len = strlen(server_url);
+    if (len > 0 && server_url[len - 1] == '/') {
+        server_url[len - 1] = '\0';
+    }
+    
+    // Build URL - use title_id as identifier
+    char title_id_hex[17];
+    snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+        title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+        title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+    
     char url[512];
-    snprintf(url, sizeof(url), "%s/api/saves/%s",
-        state->server_url,
-        title->game_name);
+    snprintf(url, sizeof(url), "%s/api/v1/saves/%s",
+        server_url,
+        title_id_hex);
     
     iprintf("=== Upload Debug ===\n");
     iprintf("Server: %s\n", state->server_url);
@@ -329,11 +342,24 @@ int network_download(SyncState *state, int title_idx) {
     
     Title *title = &state->titles[title_idx];
     
-    // Build URL - use filename (game name) as identifier
+    // Strip trailing slash from server_url if present
+    char server_url[256];
+    strncpy(server_url, state->server_url, sizeof(server_url) - 1);
+    size_t len = strlen(server_url);
+    if (len > 0 && server_url[len - 1] == '/') {
+        server_url[len - 1] = '\0';
+    }
+    
+    // Build URL - use title_id as identifier with /raw endpoint for direct binary
+    char title_id_hex[17];
+    snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+        title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+        title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+    
     char url[512];
-    snprintf(url, sizeof(url), "%s/api/saves/%s",
-        state->server_url,
-        title->game_name);
+    snprintf(url, sizeof(url), "%s/api/v1/saves/%s/raw",
+        server_url,
+        title_id_hex);
     
     iprintf("GET %s\n", url);
     
@@ -365,9 +391,124 @@ int network_download(SyncState *state, int title_idx) {
     
     iprintf("Wrote %zu bytes\n", written);
     
+    // Update save size
+    title->save_size = response.body_size;
+    
     // Recalculate hash for downloaded file
     if (saves_compute_hash(title->save_path, title->hash) == 0) {
         title->hash_calculated = true;
+    }
+    
+    http_response_free(&response);
+    return 0;
+}
+
+// Fetch list of saves from server
+int network_fetch_saves(SyncState *state) {
+    if (!wifi_connected) {
+        iprintf("No WiFi connection\n");
+        return -1;
+    }
+    
+    // Strip trailing slash from server_url if present
+    char server_url[256];
+    strncpy(server_url, state->server_url, sizeof(server_url) - 1);
+    size_t len = strlen(server_url);
+    if (len > 0 && server_url[len - 1] == '/') {
+        server_url[len - 1] = '\0';
+    }
+    
+    // Build URL: GET /api/v1/titles
+    char url[512];
+    snprintf(url, sizeof(url), "%s/api/v1/titles", server_url);
+    
+    iprintf("Fetching save list...\n");
+    
+    HttpResponse response = http_request(url, HTTP_GET, state->api_key, NULL, 0);
+    
+    iprintf("Status: %d\n", response.status_code);
+    iprintf("Body size: %zu bytes\n", response.body_size);
+    
+    if (!response.success) {
+        iprintf("Failed to fetch saves\n");
+        if (response.body && response.body_size > 0) {
+            iprintf("Error: %.50s\n", (char*)response.body);
+        }
+        http_response_free(&response);
+        return -1;
+    }
+    
+    // Parse JSON response - look for game names in simple format
+    // Expected format: ["game1.sav", "game2.sav", ...]
+    // For now, mark all matching games as on_server
+    
+    if (response.body && response.body_size > 0) {
+        iprintf("Parsing response...\n");
+        int found = 0;
+        for (int i = 0; i < state->num_titles; i++) {
+            // Check if game name appears in response
+            if (strstr((char*)response.body, state->titles[i].game_name)) {
+                state->titles[i].on_server = true;
+                found++;
+            }
+        }
+        iprintf("Checked %d saves\n", state->num_titles);
+        iprintf("Found %d on server\n", found);
+    }
+    
+    http_response_free(&response);
+    return 0;
+}
+
+// Get save info from server
+int network_get_save_info(SyncState *state, const char *title_id_hex, char *hash_out, size_t *size_out) {
+    if (!wifi_connected) {
+        return -1;
+    }
+    
+    // Strip trailing slash from server_url
+    char server_url[256];
+    strncpy(server_url, state->server_url, sizeof(server_url) - 1);
+    size_t len = strlen(server_url);
+    if (len > 0 && server_url[len - 1] == '/') {
+        server_url[len - 1] = '\0';
+    }
+    
+    // Build URL: GET /api/v1/saves/{title_id}/meta
+    char url[512];
+    snprintf(url, sizeof(url), "%s/api/v1/saves/%s/meta", server_url, title_id_hex);
+    
+    HttpResponse response = http_request(url, HTTP_GET, state->api_key, NULL, 0);
+    
+    // If not found, return -1 (save doesn't exist on server)
+    if (response.status_code == 404) {
+        http_response_free(&response);
+        return -1;
+    }
+    
+    if (!response.success || !response.body) {
+        http_response_free(&response);
+        return -1;
+    }
+    
+    // Parse JSON: {"save_hash": "...", "save_size": 123, ...}
+    // Simple string search for hash and size
+    char *body = (char*)response.body;
+    char *hash_ptr = strstr(body, "\"save_hash\":\"");
+    char *size_ptr = strstr(body, "\"save_size\":");
+    
+    if (hash_ptr && hash_out) {
+        hash_ptr += 13; // Skip "save_hash":"
+        int i = 0;
+        while (i < 64 && hash_ptr[i] != '"') {
+            hash_out[i] = hash_ptr[i];
+            i++;
+        }
+        hash_out[i] = '\0';
+    }
+    
+    if (size_ptr && size_out) {
+        sscanf(size_ptr + 12, "%zu", size_out);
     }
     
     http_response_free(&response);

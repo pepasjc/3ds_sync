@@ -81,27 +81,48 @@ HttpResponse http_request(
     char path[512] = {0};
     int port = 80;
     
+    iprintf("\n=== HTTP Debug ===\n");
+    iprintf("URL: %s\n", url);
+    
     // Parse URL
     if (parse_url(url, host, &port, path) != 0) {
+        iprintf("URL parse failed!\n");
         response.success = 0;
         return response;
     }
+    
+    iprintf("Host: %s\n", host);
+    iprintf("Port: %d\n", port);
+    iprintf("Path: %s\n", path);
     
     // Resolve host
+    iprintf("Resolving DNS...\n");
     struct hostent *he = gethostbyname(host);
     if (!he) {
-        printf("DNS lookup failed for %s\n", host);
+        iprintf("DNS lookup failed for %s\n", host);
         response.success = 0;
         return response;
     }
     
+    char *ip = inet_ntoa(*(struct in_addr*)he->h_addr_list[0]);
+    iprintf("Resolved to: %s\n", ip);
+    
     // Create socket
+    iprintf("Creating socket...\n");
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
-        printf("Socket creation failed\n");
+        iprintf("Socket creation failed\n");
         response.success = 0;
         return response;
     }
+    iprintf("Socket created: %d\n", socket_fd);
+    
+    // Set socket timeout (30 seconds)
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
     
     // Connect to host
     struct sockaddr_in server_addr;
@@ -110,13 +131,18 @@ HttpResponse http_request(
     server_addr.sin_port = htons(port);
     server_addr.sin_addr = *(struct in_addr*)he->h_addr_list[0];
     
+    iprintf("Connecting to %s:%d...\n", 
+            inet_ntoa(server_addr.sin_addr), port);
+    
     if (connect(socket_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        printf("Connection failed to %s:%d\n", host, port);
+        iprintf("Connection failed to %s:%d\n", host, port);
         close(socket_fd);
         socket_fd = -1;
         response.success = 0;
         return response;
     }
+    
+    iprintf("Connected successfully!\n");
     
     // Build HTTP request
     char request[HTTP_BUFFER_SIZE];
@@ -139,8 +165,9 @@ HttpResponse http_request(
     strcat(request, "Connection: close\r\n\r\n");
     
     // Send request headers
+    iprintf("Sending headers...\n");
     if (send(socket_fd, request, strlen(request), 0) < 0) {
-        printf("Failed to send request\n");
+        iprintf("Failed to send request\n");
         close(socket_fd);
         socket_fd = -1;
         response.success = 0;
@@ -149,56 +176,191 @@ HttpResponse http_request(
     
     // Send body if present
     if (body && body_size > 0) {
-        if (send(socket_fd, body, body_size, 0) < 0) {
-            printf("Failed to send body\n");
+        iprintf("Uploading %d bytes...\n", (int)body_size);
+        int sent = send(socket_fd, body, body_size, 0);
+        if (sent < 0) {
+            iprintf("Failed to send body\n");
             close(socket_fd);
             socket_fd = -1;
             response.success = 0;
             return response;
         }
+        iprintf("Sent %d bytes\n", sent);
     }
     
-    // Read response headers
+    // Read response (loop until we have complete headers + body)
+    iprintf("Waiting for response...\n");
     char header_buf[HTTP_BUFFER_SIZE];
-    int header_len = recv(socket_fd, header_buf, sizeof(header_buf) - 1, 0);
-    if (header_len < 0) {
-        printf("Failed to receive response\n");
-        close(socket_fd);
-        socket_fd = -1;
-        response.success = 0;
-        return response;
+    int total_received = 0;
+    char *body_separator = NULL;
+    int content_length = -1;
+    int loop_count = 0;
+    
+    while (total_received < sizeof(header_buf) - 1) {
+        loop_count++;
+        iprintf("Loop %d: Calling recv...\n", loop_count);
+        int chunk = recv(socket_fd, header_buf + total_received, sizeof(header_buf) - 1 - total_received, 0);
+        iprintf("Loop %d: recv returned %d\n", loop_count, chunk);
+        
+        if (chunk <= 0) {
+            if (total_received == 0) {
+                iprintf("Failed to receive response (timeout?)\n");
+                close(socket_fd);
+                socket_fd = -1;
+                response.success = 0;
+                return response;
+            }
+            iprintf("recv returned %d, breaking\n", chunk);
+            break;  // Got some data, proceed
+        }
+        total_received += chunk;
+        header_buf[total_received] = '\0';
+        iprintf("Total so far: %d bytes\n", total_received);
+        
+        // Check if we have the body separator yet
+        if (!body_separator) {
+            body_separator = strstr(header_buf, "\r\n\r\n");
+            if (!body_separator) {
+                body_separator = strstr(header_buf, "\n\n");
+                if (body_separator) {
+                    body_separator += 2;
+                    iprintf("Found \\n\\n separator\n");
+                }
+            } else {
+                body_separator += 4;
+                iprintf("Found \\r\\n\\r\\n separator\n");
+            }
+        }
+        
+        // If we found separator, parse Content-Length
+        if (body_separator && content_length < 0) {
+            char *cl = strstr(header_buf, "Content-Length:");
+            if (!cl) cl = strstr(header_buf, "content-length:");
+            if (cl) {
+                sscanf(cl + 15, " %d", &content_length);
+                iprintf("Content-Length: %d\n", content_length);
+            } else {
+                iprintf("Content-Length header not found yet\n");
+                // Don't set to 0 - keep reading to find it
+            }
+        }
+        
+        // Check if we have everything (headers + full body)
+        if (body_separator && content_length >= 0) {
+            int body_offset = body_separator - header_buf;
+            int body_received = total_received - body_offset;
+            iprintf("Body: %d/%d bytes\n", body_received, content_length);
+            
+            // If body is large and won't fit in buffer, break early
+            if (content_length > (int)(sizeof(header_buf) - body_offset - 100)) {
+                iprintf("Large body detected, breaking to read separately\n");
+                break;
+            }
+            
+            if (body_received >= content_length) {
+                iprintf("Got full body, breaking\n");
+                break;  // Got everything
+            }
+        } else if (body_separator && content_length < 0) {
+            iprintf("Have separator but no Content-Length yet, keep reading\n");
+        }
     }
     
-    header_buf[header_len] = '\0';
+    iprintf("Got %d bytes total\n", total_received);
     
+    int header_len = total_received;
+    
+    iprintf("Parsing status...\n");
     // Parse status code
     sscanf(header_buf, "HTTP/%*d.%*d %d", &response.status_code);
+    iprintf("Status: %d\n", response.status_code);
     
+    iprintf("Finding body...\n");
     // Find body start (after blank line)
     char *body_start = strstr(header_buf, "\r\n\r\n");
     if (!body_start) {
         body_start = strstr(header_buf, "\n\n");
-        if (body_start) body_start += 2;
+        if (body_start) {
+            body_start += 2;
+        }
     } else {
         body_start += 4;
     }
     
-    // Calculate body size from header
-    int body_offset = body_start - header_buf;
-    response.body_size = header_len - body_offset;
-    
-    if (response.body_size > 0) {
-        response.body = malloc(response.body_size);
-        memcpy(response.body, body_start, response.body_size);
+    iprintf("Extracting body...\n");
+    // Calculate body size from Content-Length header
+    if (body_start && content_length >= 0) {
+        int body_offset = body_start - header_buf;
+        int body_in_buffer = header_len - body_offset;
+        
+        iprintf("Content-Length: %d bytes\n", content_length);
+        iprintf("Body in buffer: %d bytes\n", body_in_buffer);
+        
+        // Allocate memory for full body
+        response.body_size = content_length;
+        response.body = malloc(response.body_size + 1);
+        if (!response.body) {
+            iprintf("Failed to allocate %d bytes!\n", content_length);
+            closesocket(socket_fd);
+            socket_fd = -1;
+            response.success = 0;
+            return response;
+        }
+        
+        // Copy what we already have
+        if (body_in_buffer > 0) {
+            int to_copy = (body_in_buffer < content_length) ? body_in_buffer : content_length;
+            memcpy(response.body, body_start, to_copy);
+            iprintf("Copied %d bytes from buffer\n", to_copy);
+        }
+        
+        // Read remaining body data
+        int remaining = content_length - body_in_buffer;
+        int received = body_in_buffer;
+        
+        while (remaining > 0) {
+            iprintf("Reading %d more bytes...\n", remaining);
+            int chunk = recv(socket_fd, response.body + received, remaining, 0);
+            if (chunk <= 0) {
+                iprintf("recv failed: %d\n", chunk);
+                break;
+            }
+            received += chunk;
+            remaining -= chunk;
+            iprintf("Progress: %d/%d bytes\n", received, content_length);
+        }
+        
+        if (received == content_length) {
+            iprintf("Downloaded complete: %d bytes\n", received);
+            response.body[response.body_size] = '\0';
+        } else {
+            iprintf("Incomplete download: %d/%d\n", received, content_length);
+            free(response.body);
+            response.body = NULL;
+            response.body_size = 0;
+            closesocket(socket_fd);
+            socket_fd = -1;
+            response.success = 0;
+            return response;
+        }
+    } else {
+        iprintf("No body separator or Content-Length\n");
+        response.body_size = 0;
     }
     
     // Read remaining response body
     // (For now, we're keeping it simple with first chunk)
     
-    close(socket_fd);
+    iprintf("Shutting down socket...\n");
+    shutdown(socket_fd, 0); // SHUT_RD - like dswifi example
+    iprintf("Closing socket...\n");
+    closesocket(socket_fd); // Use closesocket() not close()
     socket_fd = -1;
+    iprintf("Socket closed\n");
     
+    iprintf("Setting success flag...\n");
     response.success = (response.status_code >= 200 && response.status_code < 300);
+    iprintf("Returning response\n");
     return response;
 }
 

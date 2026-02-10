@@ -28,6 +28,32 @@ async def get_save_meta(title_id: str):
     return meta.to_dict()
 
 
+@router.get("/saves/{title_id}/raw")
+async def download_save_raw(title_id: str):
+    """Download raw save file (first file only) - for DS client compatibility."""
+    title_id = _validate_title_id(title_id)
+    meta = storage.get_metadata(title_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    files = storage.load_save_files(title_id)
+    if files is None or len(files) == 0:
+        raise HTTPException(status_code=404, detail="Save data missing on disk")
+
+    # Return first file as raw binary (DS games typically have one save file)
+    path, data = files[0]
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "X-Save-Timestamp": str(meta.client_timestamp),
+            "X-Save-Hash": meta.save_hash,
+            "X-Save-Size": str(len(data)),
+            "X-Save-Path": path,
+        },
+    )
+
+
 @router.get("/saves/{title_id}")
 async def download_save(title_id: str):
     title_id = _validate_title_id(title_id)
