@@ -21,6 +21,23 @@ APP_DESCRIPTION	:=	Sync save files between consoles
 APP_AUTHOR		:=	3dssync
 
 #---------------------------------------------------------------------------------
+# Version handling (from common.h)
+#---------------------------------------------------------------------------------
+
+APP_VERSION_STR := $(shell \
+	sed -n 's/^#define APP_VERSION "\(.*\)"/\1/p' $(TOPDIR)/include/common.h)
+
+APP_VERSION_CIA := $(shell \
+	echo $(APP_VERSION_STR) | \
+	awk -F. '{ printf "%d", ($$1 * 1024) + ($$2 * 16) + $$3 }')
+
+ifeq ($(APP_VERSION_CIA),)
+$(error Failed to parse APP_VERSION from common.h)
+endif
+
+GEN_RSF := $(BUILD)/cia.gen.rsf
+
+#---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
@@ -60,20 +77,14 @@ BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
 
 #---------------------------------------------------------------------------------
 ifeq ($(strip $(CPPFILES)),)
-#---------------------------------------------------------------------------------
 	export LD	:=	$(CC)
-#---------------------------------------------------------------------------------
 else
-#---------------------------------------------------------------------------------
 	export LD	:=	$(CXX)
-#---------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------
 
 export OFILES_SOURCES 	:=	$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
-
 export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES))
-
 export OFILES := $(OFILES_BIN) $(OFILES_SOURCES)
 
 export HFILES	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
@@ -90,10 +101,8 @@ ifeq ($(strip $(ICON)),)
 	icons := $(wildcard *.png)
 	ifneq (,$(findstring $(TARGET).png,$(icons)))
 		export APP_ICON := $(TOPDIR)/$(TARGET).png
-	else
-		ifneq (,$(findstring icon.png,$(icons)))
-			export APP_ICON := $(TOPDIR)/icon.png
-		endif
+	else ifneq (,$(findstring icon.png,$(icons)))
+		export APP_ICON := $(TOPDIR)/icon.png
 	endif
 else
 	export APP_ICON := $(TOPDIR)/$(ICON)
@@ -122,18 +131,25 @@ $(DEPSDIR):
 endif
 
 #---------------------------------------------------------------------------------
-# CIA build target
-# Requires makerom and bannertool in PATH or client/ directory
-# Download from:
-#   makerom: https://github.com/3DSGuy/Project_CTR/releases
-#   bannertool: https://github.com/Steveice10/bannertool/releases
+# RSF build
 #---------------------------------------------------------------------------------
-cia: $(BUILD) $(DEPSDIR)
+$(GEN_RSF): cia.rsf
+	@sed "s/^\([[:space:]]*RemasterVersion[[:space:]]*:[[:space:]]*\).*/\1$(APP_VERSION_CIA)/" $< > $@
+
+
+#---------------------------------------------------------------------------------
+# CIA build
+#---------------------------------------------------------------------------------
+cia: $(BUILD) $(DEPSDIR) $(GEN_RSF)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 	@echo "Creating banner..."
 	bannertool makebanner -i banner_img.png -a silent.wav -o banner.bnr
-	@echo "Building CIA..."
-	makerom -f cia -o $(TARGET).cia -elf $(TARGET).elf -rsf cia.rsf -icon $(TARGET).smdh -banner banner.bnr
+	@echo "Building CIA (version $(APP_VERSION_STR))..."
+	makerom -f cia -o $(TARGET).cia \
+		-elf $(TARGET).elf \
+		-rsf $(GEN_RSF) \
+		-icon $(TARGET).smdh \
+		-banner banner.bnr
 	@echo "Built $(TARGET).cia"
 
 #---------------------------------------------------------------------------------
@@ -144,23 +160,15 @@ clean:
 #---------------------------------------------------------------------------------
 else
 
-#---------------------------------------------------------------------------------
-# main targets
-#---------------------------------------------------------------------------------
 $(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS)
-
 $(OFILES_SOURCES) : $(HFILES)
-
 $(OUTPUT).elf	:	$(OFILES)
 
-#---------------------------------------------------------------------------------
-%.bin.o	%_bin.h :	%.bin
-#---------------------------------------------------------------------------------
+%.bin.o %_bin.h : %.bin
 	@echo $(notdir $<)
 	@$(bin2o)
 
 -include $(DEPSDIR)/*.d
 
-#---------------------------------------------------------------------------------------
 endif
-#---------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------
