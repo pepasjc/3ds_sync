@@ -295,14 +295,14 @@ int network_upload(SyncState *state, int title_idx) {
         server_url[len - 1] = '\0';
     }
     
-    // Build URL - use title_id as identifier
+    // Build URL - use title_id as identifier with /raw endpoint
     char title_id_hex[17];
     snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
         title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
         title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
     
     char url[512];
-    snprintf(url, sizeof(url), "%s/api/v1/saves/%s",
+    snprintf(url, sizeof(url), "%s/api/v1/saves/%s/raw",
         server_url,
         title_id_hex);
     

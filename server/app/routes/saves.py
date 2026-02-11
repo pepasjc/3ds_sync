@@ -142,3 +142,58 @@ async def upload_save(
         "timestamp": meta.last_sync,
         "sha256": meta.save_hash,
     }
+
+
+@router.post("/saves/{title_id}/raw")
+async def upload_save_raw(
+    title_id: str,
+    request: Request,
+    force: bool = Query(False),
+):
+    """Upload raw save file - wraps into bundle format for compatibility with 3DS client."""
+    title_id = _validate_title_id(title_id)
+    
+    # Get console ID from header
+    console_id = request.headers.get("X-Console-ID", "")
+    
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    
+    # Wrap raw save data into a bundle with a single file
+    # Use standard save.bin filename for compatibility
+    import time
+    timestamp = int(time.time())
+    
+    bundle_file = BundleFile(
+        path="save.bin",
+        size=len(body),
+        sha256=hashlib.sha256(body).digest(),
+        data=body,
+    )
+    
+    bundle = SaveBundle(
+        title_id=int(title_id, 16),
+        timestamp=timestamp,
+        files=[bundle_file],
+    )
+    
+    # Conflict check
+    if not force:
+        existing = storage.get_metadata(title_id)
+        if existing and existing.client_timestamp >= timestamp:
+            raise HTTPException(
+                status_code=409,
+                detail="Server has a newer or equal save. Use ?force=true to override.",
+                headers={
+                    "X-Server-Timestamp": str(existing.client_timestamp),
+                    "X-Server-Hash": existing.save_hash,
+                },
+            )
+    
+    meta = storage.store_save(bundle, source="nds", console_id=console_id)
+    return {
+        "status": "ok",
+        "timestamp": meta.last_sync,
+        "sha256": meta.save_hash,
+    }
