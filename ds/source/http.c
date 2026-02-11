@@ -177,15 +177,21 @@ HttpResponse http_request(
     // Send body if present
     if (body && body_size > 0) {
         iprintf("Uploading %d bytes...\n", (int)body_size);
-        int sent = send(socket_fd, body, body_size, 0);
-        if (sent < 0) {
-            iprintf("Failed to send body\n");
-            close(socket_fd);
-            socket_fd = -1;
-            response.success = 0;
-            return response;
+        int total_sent = 0;
+        while (total_sent < body_size) {
+            int remaining = body_size - total_sent;
+            int chunk = send(socket_fd, body + total_sent, remaining, 0);
+            if (chunk < 0) {
+                iprintf("Failed to send body\n");
+                closesocket(socket_fd);
+                socket_fd = -1;
+                response.success = 0;
+                return response;
+            }
+            total_sent += chunk;
+            iprintf("Sent %d/%d bytes\n", total_sent, (int)body_size);
         }
-        iprintf("Sent %d bytes\n", sent);
+        iprintf("Upload complete\n");
     }
     
     // Read response (loop until we have complete headers + body)
