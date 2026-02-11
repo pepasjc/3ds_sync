@@ -175,6 +175,18 @@ static int scan_flashcard_roms(SyncState *state) {
                         continue;  // Skip if can't read product code
                     }
                     
+                    // Check for duplicate product codes (already scanned from different path)
+                    bool is_duplicate = false;
+                    for (int j = 0; j < count; j++) {
+                        // Compare product codes (title_id bytes 4-7)
+                        if (memcmp(&state->titles[j].title_id[4], product_code, 4) == 0) {
+                            is_duplicate = true;
+                            iprintf("  Duplicate (already added)\n");
+                            break;
+                        }
+                    }
+                    if (is_duplicate) continue;
+                    
                     Title *title = &state->titles[count];
                     
                     // Extract game name from filename (remove .nds)
