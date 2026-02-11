@@ -3,16 +3,18 @@
 from pathlib import Path
 
 # Global cache for game names (loaded once at startup)
-_game_names: dict[str, str] = {}
+# Keep DS and 3DS databases separate to handle duplicate product codes
+_3ds_names: dict[str, str] = {}
+_ds_names: dict[str, str] = {}
 
 
 def load_database(db_path: Path | None = None) -> int:
-    """Load a game names database from file, merging into the global cache.
+    """Load a game names database from file into the appropriate cache.
 
-    Can be called multiple times to load multiple databases.
-    Returns the number of NEW entries loaded (not counting duplicates).
+    Automatically detects whether it's loading a 3DS or DS database based on filename.
+    Returns the number of entries loaded.
     """
-    global _game_names
+    global _3ds_names, _ds_names
 
     if db_path is None:
         # Default path relative to server root
@@ -20,6 +22,10 @@ def load_database(db_path: Path | None = None) -> int:
 
     if not db_path.exists():
         return 0
+
+    # Determine which database to load into based on filename
+    is_ds = "ds" in db_path.name.lower() and "3ds" not in db_path.name.lower()
+    target_dict = _ds_names if is_ds else _3ds_names
 
     added = 0
     with open(db_path, "r", encoding="utf-8") as f:
@@ -33,8 +39,8 @@ def load_database(db_path: Path | None = None) -> int:
             if len(parts) == 2:
                 code = parts[0].strip().upper()
                 name = parts[1].strip()
-                if code and name and code not in _game_names:
-                    _game_names[code] = name
+                if code and name:
+                    target_dict[code] = name
                     added += 1
 
     return added
@@ -44,8 +50,12 @@ def lookup_names(product_codes: list[str]) -> dict[str, str]:
     """Look up game names for a list of product codes.
 
     Product codes can be:
-    - Full format: CTR-P-XXXX or CTR-N-XXXX
-    - Short format: Just the 4-char code (XXXX)
+    - Full format: CTR-P-XXXX or CTR-N-XXXX (3DS games)
+    - Short format: Just the 4-char code (XXXX) - could be DS or 3DS
+
+    For duplicate product codes (exist in both databases), prioritize:
+    - 3DS database if product code starts with "CTR"
+    - DS database otherwise (short codes are assumed to be DS)
 
     Returns a dict mapping the input codes to their game names.
     Unknown codes are omitted from the result.
@@ -55,6 +65,7 @@ def lookup_names(product_codes: list[str]) -> dict[str, str]:
     for code in product_codes:
         # Extract the 4-char game code
         code_upper = code.upper().strip()
+        is_3ds_format = code_upper.startswith("CTR-")
 
         if len(code_upper) >= 10 and "-" in code_upper:
             # Full format like CTR-P-BRBE - extract last 4 chars before any suffix
@@ -70,8 +81,17 @@ def lookup_names(product_codes: list[str]) -> dict[str, str]:
             # Try last 4 chars as fallback
             game_code = code_upper[-4:] if len(code_upper) >= 4 else code_upper
 
-        if game_code in _game_names:
-            result[code] = _game_names[game_code]
+        # Check appropriate database based on format
+        # For CTR- prefix, check 3DS first, then DS as fallback
+        # For short codes, check DS first, then 3DS as fallback
+        name = None
+        if is_3ds_format:
+            name = _3ds_names.get(game_code) or _ds_names.get(game_code)
+        else:
+            name = _ds_names.get(game_code) or _3ds_names.get(game_code)
+
+        if name:
+            result[code] = name
 
     return result
 
