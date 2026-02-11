@@ -100,9 +100,11 @@ bool config_load(SyncState *state, char *error, size_t error_size) {
     state->wifi_wep_key[0] = '\0';
     
     while (fgets(line, sizeof(line), f)) {
-        // Remove trailing newline
+        // Remove trailing newline and carriage return
         char *newline = strchr(line, '\n');
         if (newline) *newline = '\0';
+        char *cr = strchr(line, '\r');
+        if (cr) *cr = '\0';
         
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '\0') continue;
@@ -114,6 +116,13 @@ bool config_load(SyncState *state, char *error, size_t error_size) {
         *equals = '\0';
         char *key = line;
         char *value = equals + 1;
+        
+        // Trim trailing whitespace from value
+        char *end = value + strlen(value) - 1;
+        while (end > value && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+            *end = '\0';
+            end--;
+        }
         
         if (strcmp(key, "server_url") == 0) {
             strncpy(state->server_url, value, sizeof(state->server_url) - 1);

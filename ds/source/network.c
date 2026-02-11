@@ -88,6 +88,8 @@ int network_init(SyncState *state) {
         }
         
         iprintf("Found %u AP(s)\n", count);
+        iprintf("Looking for '%s' (len %u)\n", 
+            state->wifi_ssid, strlen(state->wifi_ssid));
         
         // Find our AP by SSID
         WlanBssDesc* target_ap = NULL;

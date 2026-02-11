@@ -22,7 +22,7 @@ static const char *media_type_str(const TitleInfo *t) {
     if (t->is_nds && t->media_type == MEDIATYPE_GAME_CARD) return "Cart";
     if (t->is_nds) return "NDS";
     switch (t->media_type) {
-        case MEDIATYPE_SD:        return "SD";
+        case MEDIATYPE_SD:        return "3DS";
         case MEDIATYPE_GAME_CARD: return "Card";
         default:                  return "?";
     }

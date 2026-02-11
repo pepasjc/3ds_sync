@@ -205,12 +205,6 @@ int nds_read_save(const char *sav_path, ArchiveFile *files, int max_files) {
     // Get file size
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (size <= 0) {
-        fclose(f);
-        return -1;
-    }
 
     u8 *data = (u8 *)malloc((size_t)size);
     if (!data) {
