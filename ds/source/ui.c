@@ -1,0 +1,104 @@
+#include "ui.h"
+#include "saves.h"
+#include <stdio.h>
+#include <string.h>
+
+void ui_show_save_details(Title *title) {
+    consoleClear();
+    iprintf("=== Save Details ===\n\n");
+    
+    iprintf("Game: %s\n", title->game_name);
+    iprintf("Size: %lu KB\n", (unsigned long)(title->save_size / 1024));
+    iprintf("Path: %s\n\n", title->save_path);
+    
+    // Show hash if calculated
+    if (title->hash_calculated) {
+        iprintf("Hash:\n");
+        for (int i = 0; i < 32; i++) {
+            iprintf("%02x", title->hash[i]);
+            if (i % 16 == 15) iprintf("\n");
+        }
+    } else {
+        iprintf("Hash: Not calculated\n");
+    }
+    
+    iprintf("\nPress any button\n");
+    
+    while(pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+        if(keysDown()) break;
+    }
+}
+
+bool ui_confirm_sync(Title *title, const char *server_hash, size_t server_size, bool is_upload) {
+    consoleClear();
+    
+    // Ensure local hash is calculated
+    if (!title->hash_calculated) {
+        iprintf("Calculating hash...\n");
+        if (saves_ensure_hash(title) != 0) {
+            iprintf("Failed to calculate hash!\n");
+            iprintf("\nPress any button\n");
+            while(pmMainLoop()) {
+                swiWaitForVBlank();
+                scanKeys();
+                if(keysDown()) break;
+            }
+            return false;
+        }
+    }
+    
+    // Show confirmation dialog
+    iprintf("=== %s Confirmation ===\n\n", is_upload ? "Upload" : "Download");
+    iprintf("Game: %.25s\n\n", title->game_name);
+    
+    // Local save info
+    iprintf("Local Save:\n");
+    iprintf("  Size: %lu bytes\n", (unsigned long)title->save_size);
+    iprintf("  Hash: ");
+    for (int i = 0; i < 8; i++) iprintf("%02x", title->hash[i]);
+    iprintf("...\n\n");
+    
+    // Server save info
+    if (server_hash && server_hash[0] != '\0') {
+        iprintf("Server Save:\n");
+        iprintf("  Size: %lu bytes\n", (unsigned long)server_size);
+        iprintf("  Hash: %.16s...\n\n", server_hash);
+        
+        // Check if they match - convert local hash to hex string
+        char local_hash_str[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(&local_hash_str[i*2], "%02x", title->hash[i]);
+        }
+        local_hash_str[64] = '\0';
+        
+        if (strncmp(local_hash_str, server_hash, 64) == 0) {
+            iprintf("Status: Match (up to date)\n\n");
+        } else {
+            iprintf("Status: Different\n\n");
+        }
+    } else {
+        iprintf("Server Save: Not found\n\n");
+    }
+    
+    if (is_upload) {
+        iprintf("Upload local save to server?\n\n");
+    } else {
+        iprintf("Download server save to local?\n\n");
+    }
+    
+    iprintf("A = Confirm, B = Cancel\n");
+    
+    // Wait for input
+    while(pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+        int pressed = keysDown();
+        
+        if (pressed & KEY_A) return true;
+        if (pressed & KEY_B) return false;
+    }
+    
+    return false;
+}

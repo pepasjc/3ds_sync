@@ -22,7 +22,16 @@ static int filtered_count = 0;
 #define LIST_VISIBLE 27 // TOP_ROWS(30) - header(2) - footer(1)
 
 static int title_compare(const void *a, const void *b) {
-    return strcasecmp(((const TitleInfo *)a)->name, ((const TitleInfo *)b)->name);
+    const TitleInfo *ta = (const TitleInfo *)a;
+    const TitleInfo *tb = (const TitleInfo *)b;
+    
+    // Sort 3DS games before DS games
+    if (ta->is_nds != tb->is_nds) {
+        return ta->is_nds ? 1 : -1;  // 3DS (is_nds=false) comes first
+    }
+    
+    // Within same type, sort alphabetically
+    return strcasecmp(ta->name, tb->name);
 }
 
 // Rebuild the filtered index list based on current view_mode

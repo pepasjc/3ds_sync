@@ -28,6 +28,32 @@ async def get_save_meta(title_id: str):
     return meta.to_dict()
 
 
+@router.get("/saves/{title_id}/raw")
+async def download_save_raw(title_id: str):
+    """Download raw save file (first file only) - for DS client compatibility."""
+    title_id = _validate_title_id(title_id)
+    meta = storage.get_metadata(title_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    files = storage.load_save_files(title_id)
+    if files is None or len(files) == 0:
+        raise HTTPException(status_code=404, detail="Save data missing on disk")
+
+    # Return first file as raw binary (DS games typically have one save file)
+    path, data = files[0]
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "X-Save-Timestamp": str(meta.client_timestamp),
+            "X-Save-Hash": meta.save_hash,
+            "X-Save-Size": str(len(data)),
+            "X-Save-Path": path,
+        },
+    )
+
+
 @router.get("/saves/{title_id}")
 async def download_save(title_id: str):
     title_id = _validate_title_id(title_id)
@@ -111,6 +137,61 @@ async def upload_save(
             )
 
     meta = storage.store_save(bundle, source=source, console_id=console_id)
+    return {
+        "status": "ok",
+        "timestamp": meta.last_sync,
+        "sha256": meta.save_hash,
+    }
+
+
+@router.post("/saves/{title_id}/raw")
+async def upload_save_raw(
+    title_id: str,
+    request: Request,
+    force: bool = Query(False),
+):
+    """Upload raw save file - wraps into bundle format for compatibility with 3DS client."""
+    title_id = _validate_title_id(title_id)
+    
+    # Get console ID from header
+    console_id = request.headers.get("X-Console-ID", "")
+    
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    
+    # Wrap raw save data into a bundle with a single file
+    # Use standard save.bin filename for compatibility
+    import time
+    timestamp = int(time.time())
+    
+    bundle_file = BundleFile(
+        path="save.bin",
+        size=len(body),
+        sha256=hashlib.sha256(body).digest(),
+        data=body,
+    )
+    
+    bundle = SaveBundle(
+        title_id=int(title_id, 16),
+        timestamp=timestamp,
+        files=[bundle_file],
+    )
+    
+    # Conflict check
+    if not force:
+        existing = storage.get_metadata(title_id)
+        if existing and existing.client_timestamp >= timestamp:
+            raise HTTPException(
+                status_code=409,
+                detail="Server has a newer or equal save. Use ?force=true to override.",
+                headers={
+                    "X-Server-Timestamp": str(existing.client_timestamp),
+                    "X-Server-Hash": existing.save_hash,
+                },
+            )
+    
+    meta = storage.store_save(bundle, source="nds", console_id=console_id)
     return {
         "status": "ok",
         "timestamp": meta.last_sync,
