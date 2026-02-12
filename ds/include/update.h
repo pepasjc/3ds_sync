@@ -22,6 +22,7 @@ bool update_check(SyncState *state, UpdateInfo *info);
 bool update_download(SyncState *state, const char *url, void (*progress_cb)(int percent));
 
 // Apply pending update (called on startup)
-bool update_apply_pending(void);
+// self_path: argv[0] from homebrew loader (path to running executable), or NULL
+bool update_apply_pending(const char *self_path);
 
 #endif

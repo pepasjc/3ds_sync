@@ -23,7 +23,9 @@ static void update_scroll(void) {
         scroll_offset = selected - LIST_VISIBLE + 1;
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    // argv[0] is the executable path (provided by homebrew loader)
+    const char *self_path = (argc > 0 && argv && argv[0]) ? argv[0] : NULL;
     // Initialize FAT first
     if (!fatInitDefault()) {
         consoleDemoInit();
@@ -76,7 +78,7 @@ int main(void) {
     }
     
     // Check for pending update before continuing
-    if (update_apply_pending()) {
+    if (update_apply_pending(self_path)) {
         iprintf("\nPress START to exit\n");
         while(pmMainLoop()) {
             swiWaitForVBlank();
@@ -480,7 +482,7 @@ int main(void) {
             // Draw saves list on bottom screen
             consoleSelect(&bottomScreen);
             consoleClear();
-            iprintf("=== NDS Save Sync ===\n");
+            iprintf("=== NDS Save Sync v%s ===\n", APP_VERSION);
             iprintf("Found %d saves\n\n", state.num_titles);
             
             // Display visible titles

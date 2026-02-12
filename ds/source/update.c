@@ -179,7 +179,7 @@ bool update_download(SyncState *state, const char *url, void (*progress_cb)(int 
     return true;
 }
 
-bool update_apply_pending(void) {
+bool update_apply_pending(const char *self_path) {
     // Check if update file exists
     FILE *f = fopen(UPDATE_NDS_PATH, "rb");
     if (!f) {
@@ -190,33 +190,46 @@ bool update_apply_pending(void) {
     iprintf("Pending update found!\n");
     iprintf("Applying update...\n\n");
 
-    // Try to determine the current running path
-    // Common locations for DS homebrew
-    const char *possible_paths[] = {
-        "sd:/ndssync.nds",
-        "fat:/ndssync.nds",
-        "sd:/apps/ndssync/ndssync.nds",
-        "fat:/apps/ndssync/ndssync.nds",
-        NULL
-    };
-
-    // Try to find existing file to replace
+    // Use argv[0] (the path the loader used to run us)
     const char *target_path = NULL;
-    for (int i = 0; possible_paths[i]; i++) {
-        FILE *test = fopen(possible_paths[i], "rb");
+
+    if (self_path && self_path[0]) {
+        // Verify we can actually open this path
+        FILE *test = fopen(self_path, "rb");
         if (test) {
             fclose(test);
-            target_path = possible_paths[i];
-            break;
+            target_path = self_path;
+            iprintf("Executable path:\n%s\n\n", target_path);
+        } else {
+            iprintf("argv[0] not accessible:\n%s\n\n", self_path);
         }
     }
 
     if (!target_path) {
-        // Default to root if we can't find it
-        target_path = "sd:/ndssync.nds";
-        iprintf("Using default path:\n%s\n\n", target_path);
-    } else {
-        iprintf("Found existing:\n%s\n\n", target_path);
+        // Fallback: search common locations
+        const char *possible_paths[] = {
+            "sd:/ndssync.nds",
+            "fat:/ndssync.nds",
+            "sd:/apps/ndssync/ndssync.nds",
+            "fat:/apps/ndssync/ndssync.nds",
+            NULL
+        };
+
+        for (int i = 0; possible_paths[i]; i++) {
+            FILE *test = fopen(possible_paths[i], "rb");
+            if (test) {
+                fclose(test);
+                target_path = possible_paths[i];
+                break;
+            }
+        }
+
+        if (!target_path) {
+            target_path = "sd:/ndssync.nds";
+            iprintf("Using default path:\n%s\n\n", target_path);
+        } else {
+            iprintf("Found existing:\n%s\n\n", target_path);
+        }
     }
 
     // Create backup
