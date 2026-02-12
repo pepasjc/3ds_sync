@@ -16,6 +16,10 @@ int network_fetch_saves(SyncState *state);
 // title_id_hex should be 16-char uppercase hex string like "0004800041324445"
 int network_get_save_info(SyncState *state, const char *title_id_hex, char *hash_out, size_t *size_out);
 
+// Extended version that also returns client_timestamp from server metadata
+int network_get_save_info_ext(SyncState *state, const char *title_id_hex,
+                               char *hash_out, size_t *size_out, uint32_t *timestamp_out);
+
 // Upload save bundle
 int network_upload(SyncState *state, int title_idx);
 

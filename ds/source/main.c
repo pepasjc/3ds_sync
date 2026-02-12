@@ -5,6 +5,7 @@
 #include "config.h"
 #include "saves.h"
 #include "network.h"
+#include "sync.h"
 #include "ui.h"
 #include "update.h"
 
@@ -349,30 +350,20 @@ int main(int argc, char *argv[]) {
             redraw = true;
         }
         
-        // A button - upload with confirmation (only when focused on saves)
+        // A button - smart sync (only when focused on saves)
         if (pressed & KEY_A && !focus_on_config && state.num_titles > 0 && has_wifi) {
             consoleSelect(&bottomScreen);
             Title *title = &state.titles[selected];
-            
+
             consoleClear();
-            iprintf("Checking server...\n");
-            
-            // Convert title_id to hex string
-            char title_id_hex[17];
-            snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
-                title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
-                title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
-            
-            // Clear hash to force fresh calculation
+            iprintf("Analyzing sync...\n");
+
+            // Force fresh hash calculation
             title->hash_calculated = false;
-            
-            // Fetch server save info
-            char server_hash[65] = "";
-            size_t server_size = 0;
-            int check_result = network_get_save_info(&state, title_id_hex, server_hash, &server_size);
-            
-            if (check_result != 0) {
-                iprintf("\nFailed to check server!\n");
+
+            SyncDecision decision;
+            if (sync_decide(&state, selected, &decision) != 0) {
+                iprintf("\nFailed to check sync!\n");
                 iprintf("Press B to go back\n");
                 while(pmMainLoop()) {
                     swiWaitForVBlank();
@@ -382,54 +373,136 @@ int main(int argc, char *argv[]) {
                 redraw = true;
                 continue;
             }
-            
-            // Show confirmation dialog with server info
+
+            // Show decision and get user confirmation
+            SyncAction chosen = ui_confirm_smart_sync(title, &decision);
+
+            if (chosen == SYNC_UPLOAD || chosen == SYNC_DOWNLOAD) {
+                consoleClear();
+                iprintf("%s...\n\n", chosen == SYNC_UPLOAD ? "Uploading" : "Downloading");
+
+                int result = sync_execute(&state, selected, chosen);
+                if (result == 0) {
+                    iprintf("\nSuccess!\n");
+                } else {
+                    iprintf("\nFailed!\n");
+                }
+
+                iprintf("Press B to go back\n");
+                while(pmMainLoop()) {
+                    swiWaitForVBlank();
+                    scanKeys();
+                    if(keysDown() & KEY_B) break;
+                }
+            } else if (chosen == SYNC_UP_TO_DATE && decision.action == SYNC_UP_TO_DATE) {
+                // Write state file if missing for up-to-date saves
+                if (!decision.has_last_synced && title->hash_calculated) {
+                    sync_execute(&state, selected, SYNC_UP_TO_DATE);
+                }
+            }
+
+            redraw = true;
+        }
+
+        // R button - manual upload (only when focused on saves)
+        if (pressed & KEY_R && !focus_on_config && state.num_titles > 0 && has_wifi) {
+            consoleSelect(&bottomScreen);
+            Title *title = &state.titles[selected];
+
+            consoleClear();
+            iprintf("Checking server...\n");
+
+            char title_id_hex[17];
+            snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+                title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+                title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+
+            title->hash_calculated = false;
+
+            char server_hash[65] = "";
+            size_t server_size = 0;
+            network_get_save_info(&state, title_id_hex, server_hash, &server_size);
+
             if (ui_confirm_sync(title, server_hash, server_size, true)) {
                 consoleClear();
                 iprintf("Uploading...\n\n");
-                
+
                 int result = network_upload(&state, selected);
                 if (result == 0) {
                     iprintf("\nUpload successful!\n");
+                    // Save state after manual upload
+                    if (title->hash_calculated) {
+                        char hash_hex[65];
+                        for (int i = 0; i < 32; i++)
+                            sprintf(&hash_hex[i*2], "%02x", title->hash[i]);
+                        hash_hex[64] = '\0';
+                        sync_save_last_hash(title_id_hex, hash_hex);
+                    }
                 } else {
                     iprintf("\nUpload failed!\n");
                 }
-                
+
                 iprintf("Press B to go back\n");
             } else {
                 consoleClear();
                 iprintf("Upload cancelled\n");
                 iprintf("Press B to go back\n");
             }
-            
+
             while(pmMainLoop()) {
                 swiWaitForVBlank();
                 scanKeys();
                 if(keysDown() & KEY_B) break;
             }
-            
+
+            redraw = true;
+        }
+
+        // X button - sync all saves
+        if (pressed & KEY_X && !focus_on_config && state.num_titles > 0 && has_wifi) {
+            consoleSelect(&bottomScreen);
+            consoleClear();
+            iprintf("=== Sync All ===\n\n");
+            iprintf("Syncing %d saves...\n\n", state.num_titles);
+
+            SyncSummary summary;
+            sync_all(&state, &summary);
+
+            consoleClear();
+            iprintf("=== Sync Complete ===\n\n");
+            iprintf("Uploaded:    %d\n", summary.uploaded);
+            iprintf("Downloaded:  %d\n", summary.downloaded);
+            iprintf("Up to date:  %d\n", summary.up_to_date);
+            iprintf("Conflicts:   %d\n", summary.conflicts);
+            iprintf("Failed:      %d\n", summary.failed);
+            iprintf("\nPress any button\n");
+
+            while(pmMainLoop()) {
+                swiWaitForVBlank();
+                scanKeys();
+                if(keysDown()) break;
+            }
+
             redraw = true;
         }
         
-        // B button - download with confirmation (only when focused on saves)
+        // B button - manual download with confirmation (only when focused on saves)
         if (pressed & KEY_B && !focus_on_config && state.num_titles > 0 && has_wifi) {
             consoleSelect(&bottomScreen);
             Title *title = &state.titles[selected];
-            
+
             consoleClear();
             iprintf("Checking server...\n");
-            
-            // Convert title_id to hex string
+
             char title_id_hex[17];
             snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
                 title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
                 title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
-            
-            // Fetch server save info
+
             char server_hash[65] = "";
             size_t server_size = 0;
             int has_server = (network_get_save_info(&state, title_id_hex, server_hash, &server_size) == 0);
-            
+
             if (!has_server) {
                 iprintf("\nSave not found on server!\n");
                 iprintf("Press B to go back\n");
@@ -441,35 +514,41 @@ int main(int argc, char *argv[]) {
                 redraw = true;
                 continue;
             }
-            
-            // Clear hash flag so we recalculate from current save file
+
             title->hash_calculated = false;
-            
-            // Show confirmation dialog with server info
+
             if (ui_confirm_sync(title, server_hash, server_size, false)) {
                 consoleClear();
                 iprintf("Downloading...\n\n");
-                
+
                 int result = network_download(&state, selected);
                 if (result == 0) {
                     iprintf("\nDownload successful!\n");
+                    // Save state after manual download
+                    if (title->hash_calculated) {
+                        char hash_hex[65];
+                        for (int i = 0; i < 32; i++)
+                            sprintf(&hash_hex[i*2], "%02x", title->hash[i]);
+                        hash_hex[64] = '\0';
+                        sync_save_last_hash(title_id_hex, hash_hex);
+                    }
                 } else {
                     iprintf("\nDownload failed!\n");
                 }
-                
+
                 iprintf("Press B to go back\n");
             } else {
                 consoleClear();
                 iprintf("Download cancelled\n");
                 iprintf("Press B to go back\n");
             }
-            
+
             while(pmMainLoop()) {
                 swiWaitForVBlank();
                 scanKeys();
                 if(keysDown() & KEY_B) break;
             }
-            
+
             redraw = true;
         }
         
@@ -511,6 +590,20 @@ int main(int argc, char *argv[]) {
             redraw = false;
         }
     }
-    
+
+    // Clean up hardware before exit so nds-bootstrap can load other games
+    network_cleanup();
+
+    // Disable WiFi-related interrupts that dswifi set up.
+    // These persist after disconnect and interfere with nds-bootstrap.
+    // Don't disable ALL interrupts — that breaks reset button on some flashcards.
+    // IRQ_WIFI = (1U << 24), not exposed through libnds compat headers.
+    #define IRQ_WIFI_BIT (1U << 24)
+    irqDisable(IRQ_WIFI_BIT | IRQ_TIMER3 | IRQ_PXI_SYNC | IRQ_PXI_SEND | IRQ_PXI_RECV);
+    irqClear(IRQ_WIFI_BIT | IRQ_TIMER3 | IRQ_PXI_SYNC | IRQ_PXI_SEND | IRQ_PXI_RECV);
+
+    // Stop timer 3 (commonly used by dswifi for polling)
+    TIMER_CR(3) = 0;
+
     return 0;
 }

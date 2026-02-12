@@ -210,6 +210,7 @@ static int scan_flashcard_roms(SyncState *state) {
                         struct stat sav_st;
                         if (stat(sav_path, &sav_st) == 0 && S_ISREG(sav_st.st_mode)) {
                             title->save_size = sav_st.st_size;
+                            title->timestamp = (uint32_t)sav_st.st_mtime;
                             strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
                         }
                     } else {
@@ -220,10 +221,10 @@ static int scan_flashcard_roms(SyncState *state) {
                         title->save_size = 0;
                         strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
                     }
-                    
+
                     title->is_cartridge = 0;
                     title->hash_calculated = false;
-                    
+
                     count++;
                 }
             }
@@ -310,6 +311,7 @@ static int scan_bootstrap_roms(SyncState *state, const char *saves_path) {
                 if (stat(sav_path, &sav_st) == 0 && S_ISREG(sav_st.st_mode)) {
                     // Save exists
                     title->save_size = sav_st.st_size;
+                    title->timestamp = (uint32_t)sav_st.st_mtime;
                     strncpy(title->save_path, sav_path, sizeof(title->save_path) - 1);
                 } else {
                     // No save yet

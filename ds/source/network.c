@@ -543,8 +543,76 @@ int network_get_save_info(SyncState *state, const char *title_id_hex, char *hash
     return 0;
 }
 
+// Extended version: also parses client_timestamp from /meta response
+int network_get_save_info_ext(SyncState *state, const char *title_id_hex,
+                               char *hash_out, size_t *size_out, uint32_t *timestamp_out) {
+    if (!wifi_connected) {
+        return -1;
+    }
+
+    // Strip trailing slash from server_url
+    char server_url[256];
+    strncpy(server_url, state->server_url, sizeof(server_url) - 1);
+    size_t len = strlen(server_url);
+    if (len > 0 && server_url[len - 1] == '/') {
+        server_url[len - 1] = '\0';
+    }
+
+    // Build URL: GET /api/v1/saves/{title_id}/meta
+    char url[512];
+    snprintf(url, sizeof(url), "%s/api/v1/saves/%s/meta", server_url, title_id_hex);
+
+    HttpResponse response = http_request(url, HTTP_GET, state->api_key, NULL, 0);
+
+    if (response.status_code == 404) {
+        http_response_free(&response);
+        return -1;
+    }
+
+    if (!response.success || !response.body) {
+        http_response_free(&response);
+        return -1;
+    }
+
+    char *body = (char*)response.body;
+
+    // Parse save_hash
+    char *hash_ptr = strstr(body, "\"save_hash\":\"");
+    if (hash_ptr && hash_out) {
+        hash_ptr += 13;
+        int i = 0;
+        while (i < 64 && hash_ptr[i] != '"') {
+            hash_out[i] = hash_ptr[i];
+            i++;
+        }
+        hash_out[i] = '\0';
+    }
+
+    // Parse save_size
+    if (size_out) {
+        char *size_ptr = strstr(body, "\"save_size\":");
+        if (size_ptr) {
+            sscanf(size_ptr + 12, "%zu", size_out);
+        }
+    }
+
+    // Parse client_timestamp
+    if (timestamp_out) {
+        *timestamp_out = 0;
+        char *ts_ptr = strstr(body, "\"client_timestamp\":");
+        if (ts_ptr) {
+            *timestamp_out = (uint32_t)strtoul(ts_ptr + 19, NULL, 10);
+        }
+    }
+
+    http_response_free(&response);
+    return 0;
+}
+
 void network_cleanup(void) {
     http_cleanup();
-    // Wifi_Disconnect();
+    if (wifi_connected) {
+        Wifi_DisconnectAP();
+    }
     wifi_connected = false;
 }

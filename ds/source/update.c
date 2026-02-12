@@ -198,21 +198,23 @@ bool update_apply_pending(const char *self_path) {
     fclose(f);
 
     iprintf("Pending update found!\n");
-    iprintf("Applying update...\n\n");
+    iprintf("Running v%s\n\n", APP_VERSION);
 
     // Use argv[0] (the path the loader used to run us)
     const char *target_path = NULL;
 
     if (self_path && self_path[0]) {
+        iprintf("argv[0]: %s\n", self_path);
         // Verify we can actually open this path
         FILE *test = fopen(self_path, "rb");
         if (test) {
             fclose(test);
             target_path = self_path;
-            iprintf("Executable path:\n%s\n\n", target_path);
         } else {
-            iprintf("argv[0] not accessible:\n%s\n\n", self_path);
+            iprintf("(not accessible)\n");
         }
+    } else {
+        iprintf("argv[0]: (none)\n");
     }
 
     if (!target_path) {
@@ -289,8 +291,9 @@ bool update_apply_pending(const char *self_path) {
     // Remove update file
     remove(UPDATE_NDS_PATH);
 
-    iprintf("Update applied!\n");
-    iprintf("Backup saved to:\n%s\n\n", backup_path);
+    iprintf("Update applied!\n\n");
+    iprintf("Replaced:\n%s\n\n", target_path);
+    iprintf("Backup:\n%s\n\n", backup_path);
     iprintf("Please restart\n");
 
     return true;
