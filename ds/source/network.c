@@ -613,6 +613,11 @@ void network_cleanup(void) {
     http_cleanup();
     if (wifi_connected) {
         Wifi_DisconnectAP();
+        // Wait for WiFi to fully disconnect (about 1 second)
+        // This helps other apps initialize WiFi cleanly after we exit
+        for (int i = 0; i < 60; i++) {
+            swiWaitForVBlank();
+        }
     }
     wifi_connected = false;
 }

@@ -591,19 +591,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Clean up hardware before exit so nds-bootstrap can load other games
+    // Disconnect WiFi before exit to allow other games to initialize it cleanly
+    // This may help avoid the nds-bootstrap issue where games won't load after WiFi apps
     network_cleanup();
-
-    // Disable WiFi-related interrupts that dswifi set up.
-    // These persist after disconnect and interfere with nds-bootstrap.
-    // Don't disable ALL interrupts — that breaks reset button on some flashcards.
-    // IRQ_WIFI = (1U << 24), not exposed through libnds compat headers.
-    #define IRQ_WIFI_BIT (1U << 24)
-    irqDisable(IRQ_WIFI_BIT | IRQ_TIMER3 | IRQ_PXI_SYNC | IRQ_PXI_SEND | IRQ_PXI_RECV);
-    irqClear(IRQ_WIFI_BIT | IRQ_TIMER3 | IRQ_PXI_SYNC | IRQ_PXI_SEND | IRQ_PXI_RECV);
-
-    // Stop timer 3 (commonly used by dswifi for polling)
-    TIMER_CR(3) = 0;
-
+    
     return 0;
 }
