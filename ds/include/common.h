@@ -15,6 +15,14 @@
 #define HASH_SIZE 32
 #define CONFIG_SIZE 256
 
+// Sync action
+typedef enum {
+    SYNC_UP_TO_DATE,
+    SYNC_UPLOAD,
+    SYNC_DOWNLOAD,
+    SYNC_CONFLICT
+} SyncAction;
+
 // Title information
 typedef struct {
     uint8_t title_id[TITLE_ID_SIZE];
@@ -30,6 +38,8 @@ typedef struct {
     int needs_sync;
     bool hash_calculated;  // True if hash has been computed
     bool on_server;        // True if save exists on server
+    bool scanned;          // True if scan has been performed
+    SyncAction scan_result; // Result of last scan (UP_TO_DATE, UPLOAD, DOWNLOAD, CONFLICT)
 } Title;
 
 // Sync state
@@ -43,13 +53,5 @@ typedef struct {
     int num_titles;
     Title titles[MAX_TITLES];
 } SyncState;
-
-// Sync action
-typedef enum {
-    SYNC_UP_TO_DATE,
-    SYNC_UPLOAD,
-    SYNC_DOWNLOAD,
-    SYNC_CONFLICT
-} SyncAction;
 
 #endif

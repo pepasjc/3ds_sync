@@ -235,6 +235,48 @@ int sync_execute(SyncState *state, int title_idx, SyncAction action) {
     return result;
 }
 
+int sync_scan_all(SyncState *state, SyncSummary *summary) {
+    memset(summary, 0, sizeof(SyncSummary));
+
+    for (int i = 0; i < state->num_titles; i++) {
+        Title *title = &state->titles[i];
+
+        iprintf("  [%d/%d] %.20s\n", i + 1, state->num_titles, title->game_name);
+
+        SyncDecision decision;
+        if (sync_decide(state, i, &decision) != 0) {
+            summary->failed++;
+            title->scanned = true;
+            title->scan_result = SYNC_CONFLICT;
+            iprintf("    -> FAILED\n");
+            continue;
+        }
+
+        title->scanned = true;
+        title->scan_result = decision.action;
+
+        switch (decision.action) {
+            case SYNC_UP_TO_DATE:
+                summary->up_to_date++;
+                break;
+            case SYNC_UPLOAD:
+                summary->uploaded++;
+                iprintf("    -> Needs upload\n");
+                break;
+            case SYNC_DOWNLOAD:
+                summary->downloaded++;
+                iprintf("    -> Needs download\n");
+                break;
+            case SYNC_CONFLICT:
+                summary->conflicts++;
+                iprintf("    -> CONFLICT\n");
+                break;
+        }
+    }
+
+    return 0;
+}
+
 int sync_all(SyncState *state, SyncSummary *summary) {
     memset(summary, 0, sizeof(SyncSummary));
 

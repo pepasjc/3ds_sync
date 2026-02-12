@@ -384,6 +384,9 @@ int main(int argc, char *argv[]) {
                 int result = sync_execute(&state, selected, chosen);
                 if (result == 0) {
                     iprintf("\nSuccess!\n");
+                    // Clear red highlight after successful sync
+                    title->scanned = true;
+                    title->scan_result = SYNC_UP_TO_DATE;
                 } else {
                     iprintf("\nFailed!\n");
                 }
@@ -430,6 +433,9 @@ int main(int argc, char *argv[]) {
                 int result = network_upload(&state, selected);
                 if (result == 0) {
                     iprintf("\nUpload successful!\n");
+                    // Clear red highlight after successful upload
+                    title->scanned = true;
+                    title->scan_result = SYNC_UP_TO_DATE;
                     // Save state after manual upload
                     if (title->hash_calculated) {
                         char hash_hex[65];
@@ -458,23 +464,25 @@ int main(int argc, char *argv[]) {
             redraw = true;
         }
 
-        // X button - sync all saves
+        // X button - scan all saves (check sync status only)
         if (pressed & KEY_X && !focus_on_config && state.num_titles > 0 && has_wifi) {
             consoleSelect(&bottomScreen);
             consoleClear();
-            iprintf("=== Sync All ===\n\n");
-            iprintf("Syncing %d saves...\n\n", state.num_titles);
+            iprintf("=== Scan All ===\n\n");
+            iprintf("Scanning %d saves...\n\n", state.num_titles);
 
             SyncSummary summary;
-            sync_all(&state, &summary);
+            sync_scan_all(&state, &summary);
 
             consoleClear();
-            iprintf("=== Sync Complete ===\n\n");
-            iprintf("Uploaded:    %d\n", summary.uploaded);
-            iprintf("Downloaded:  %d\n", summary.downloaded);
-            iprintf("Up to date:  %d\n", summary.up_to_date);
-            iprintf("Conflicts:   %d\n", summary.conflicts);
-            iprintf("Failed:      %d\n", summary.failed);
+            iprintf("=== Scan Complete ===\n\n");
+            iprintf("Up to date:    %d\n", summary.up_to_date);
+            iprintf("Need upload:   %d\n", summary.uploaded);
+            iprintf("Need download: %d\n", summary.downloaded);
+            iprintf("Conflicts:     %d\n", summary.conflicts);
+            iprintf("Failed:        %d\n", summary.failed);
+            iprintf("\nOut-of-sync saves are\n");
+            iprintf("highlighted in red.\n");
             iprintf("\nPress any button\n");
 
             while(pmMainLoop()) {
@@ -524,6 +532,9 @@ int main(int argc, char *argv[]) {
                 int result = network_download(&state, selected);
                 if (result == 0) {
                     iprintf("\nDownload successful!\n");
+                    // Clear red highlight after successful download
+                    title->scanned = true;
+                    title->scan_result = SYNC_UP_TO_DATE;
                     // Save state after manual download
                     if (title->hash_calculated) {
                         char hash_hex[65];
@@ -570,20 +581,33 @@ int main(int argc, char *argv[]) {
                       scroll_offset + LIST_VISIBLE : state.num_titles;
             
             for (int i = start; i < end; i++) {
+                // Apply color based on scan status
+                if (state.titles[i].scanned) {
+                    if (state.titles[i].scan_result != SYNC_UP_TO_DATE) {
+                        iprintf("\x1b[31m");  // Red for out-of-sync
+                    }
+                }
+
                 if (i == selected) {
                     iprintf("> ");
                 } else {
                     iprintf("  ");
                 }
-                
+
                 // Truncate long names
                 char name[25];
                 strncpy(name, state.titles[i].game_name, 24);
                 name[24] = '\0';
-                
+
                 // Show server status indicator
                 char status = state.titles[i].on_server ? 'S' : ' ';
-                iprintf("%-24s [%c]\n", name, status);
+                iprintf("%-24s [%c]", name, status);
+
+                // Reset color
+                if (state.titles[i].scanned) {
+                    iprintf("\x1b[39m");
+                }
+                iprintf("\n");
             }
             
             

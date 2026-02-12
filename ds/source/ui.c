@@ -287,7 +287,7 @@ void ui_draw_config(const SyncState *state, int selected, bool focused, bool has
     if (focused) {
         iprintf("A:Edit/Action L:Back START:Exit\n");
     } else if (has_wifi) {
-        iprintf("A:Sync B:DL X:SyncAll R:UL\n");
+        iprintf("A:Sync B:DL X:Scan R:UL\n");
         iprintf("Y:Info L:Config START:Exit\n");
     } else {
         iprintf("Y:Info L:Config START:Exit\n");

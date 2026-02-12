@@ -43,4 +43,8 @@ int sync_execute(SyncState *state, int title_idx, SyncAction action);
 // Returns 0 on success, -1 on fatal error
 int sync_all(SyncState *state, SyncSummary *summary);
 
+// Scan all titles: decide sync status for each, store in title->scan_result
+// Does NOT upload/download — only checks status
+int sync_scan_all(SyncState *state, SyncSummary *summary);
+
 #endif
