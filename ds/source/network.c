@@ -29,9 +29,14 @@ void wifi_event_handler(int event) {
     // }
 }
 
-int network_init(SyncState *state) {
-    iprintf("Connecting WiFi...\n");
-    
+static void wifi_retry_delay(int attempt) {
+    int frames = 60 * attempt; // 1s, 2s, 3s
+    for (int i = 0; i < frames; i++) {
+        swiWaitForVBlank();
+    }
+}
+
+static int network_init_once(SyncState *state) {
     // Try DSi/3DS firmware settings first (works on DSi/3DS, not on DS Lite)
     if (Wifi_InitDefault(WFC_CONNECT)) {
         wifi_connected = true;
@@ -192,6 +197,27 @@ int network_init(SyncState *state) {
     iprintf("or add to config.txt:\n");
     iprintf("wifi_ssid=YourSSID\n");
     iprintf("wifi_wep_key=YourKey\n");
+    return -1;
+}
+
+int network_init(SyncState *state) {
+    iprintf("Connecting WiFi...\n");
+    wifi_connected = false;
+
+    const int max_attempts = 3;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        iprintf("Attempt %d/%d\n", attempt, max_attempts);
+        if (network_init_once(state) == 0) {
+            return 0;
+        }
+
+        wifi_connected = false;
+        if (attempt < max_attempts) {
+            iprintf("Retrying...\n");
+            wifi_retry_delay(attempt);
+        }
+    }
+
     return -1;
 }
 

@@ -10,6 +10,14 @@ static void ensure_directory(const char *path) {
     mkdir(path, 0777);
 }
 
+static const char *config_paths[] = {
+    "sd:/dssync/config.txt",
+    "fat:/dssync/config.txt",
+    "/dssync/config.txt",
+    "sdmc:/dssync/config.txt",
+    NULL
+};
+
 // Create default config file
 static bool create_default_config(const char *path) {
     // Extract directory from path
@@ -42,35 +50,27 @@ static bool create_default_config(const char *path) {
 
 // Try to load config from multiple possible paths
 bool config_load(SyncState *state, char *error, size_t error_size) {
-    const char *paths[] = {
-        "sd:/dssync/config.txt",
-        "fat:/dssync/config.txt",
-        "/dssync/config.txt",
-        "sdmc:/dssync/config.txt",
-        NULL
-    };
-    
     FILE *f = NULL;
     const char *loaded_path = NULL;
     const char *tried_create = NULL;
     
     // Try each path
-    for (int i = 0; paths[i]; i++) {
-        f = fopen(paths[i], "r");
+    for (int i = 0; config_paths[i]; i++) {
+        f = fopen(config_paths[i], "r");
         if (f) {
-            loaded_path = paths[i];
+            loaded_path = config_paths[i];
             break;
         }
     }
     
     // If no config found, try to create one
     if (!f) {
-        for (int i = 0; paths[i]; i++) {
-            if (create_default_config(paths[i])) {
-                tried_create = paths[i];
-                f = fopen(paths[i], "r");
+        for (int i = 0; config_paths[i]; i++) {
+            if (create_default_config(config_paths[i])) {
+                tried_create = config_paths[i];
+                f = fopen(config_paths[i], "r");
                 if (f) {
-                    loaded_path = paths[i];
+                    loaded_path = config_paths[i];
                     break;
                 }
             }
@@ -165,4 +165,167 @@ bool config_load(SyncState *state, char *error, size_t error_size) {
     state->console_id = 0x4E445300;  // "NDS\0"
     
     return true;
+}
+
+// Save config to first available path
+bool config_save(const SyncState *state) {
+    const char *path = NULL;
+    FILE *f = NULL;
+
+    // Prefer an existing config path
+    for (int i = 0; config_paths[i]; i++) {
+        f = fopen(config_paths[i], "r");
+        if (f) {
+            fclose(f);
+            path = config_paths[i];
+            break;
+        }
+    }
+
+    // Otherwise use the first path
+    if (!path) {
+        path = config_paths[0];
+    }
+
+    // Ensure directory exists
+    char dir[256];
+    strncpy(dir, path, sizeof(dir) - 1);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        ensure_directory(dir);
+    }
+
+    f = fopen(path, "w");
+    if (!f) return false;
+
+    fprintf(f, "# NDS/3DS Save Sync Configuration\n");
+    fprintf(f, "server_url=%s\n", state->server_url);
+    fprintf(f, "api_key=%s\n", state->api_key);
+    if (state->custom_save_dir[0])
+        fprintf(f, "save_dir=%s\n", state->custom_save_dir);
+    fprintf(f, "wifi_ssid=%s\n", state->wifi_ssid);
+    fprintf(f, "wifi_wep_key=%s\n", state->wifi_wep_key);
+
+    fclose(f);
+    return true;
+}
+
+// Characters available in the D-pad text editor
+static const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789.:/-_ABCDEFGHIJKLMNOPQRSTUVWXYZ@?=&#%+!";
+static const int charset_len = sizeof(charset) - 1;
+
+// Find character index in charset, or 0 if not found
+static int charset_index(char c) {
+    for (int i = 0; i < charset_len; i++) {
+        if (charset[i] == c) return i;
+    }
+    return 0;
+}
+
+bool config_edit_field(const char *hint, char *buffer, int max_len) {
+    char temp[256];
+    strncpy(temp, buffer, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    int cursor = strlen(temp);
+    int len = cursor;
+    bool running = true;
+    bool confirmed = false;
+
+    while (running && pmMainLoop()) {
+        // Draw editor screen
+        consoleClear();
+        iprintf("--- Edit Field ---\n\n");
+        iprintf("%s\n\n", hint);
+
+        iprintf(" ");
+        for (int i = 0; i < len; i++) {
+            if (i == cursor)
+                iprintf("\x1b[7m%c\x1b[0m", temp[i]);
+            else
+                iprintf("%c", temp[i]);
+        }
+        if (cursor == len)
+            iprintf("\x1b[7m \x1b[0m");
+        iprintf("\n\n");
+
+        iprintf("D-Pad L/R: move cursor\n");
+        iprintf("D-Pad U/D: change character\n");
+        iprintf("A: insert | B: delete\n");
+        iprintf("Y: confirm | X: cancel\n");
+
+        // Wait for input
+        while (pmMainLoop()) {
+            swiWaitForVBlank();
+            scanKeys();
+            int kDown = keysDown();
+            
+            if (!kDown) continue;
+
+            if (kDown & KEY_LEFT) {
+                if (cursor > 0) cursor--;
+                break;
+            }
+            if (kDown & KEY_RIGHT) {
+                if (cursor < len) cursor++;
+                break;
+            }
+            if (kDown & KEY_UP) {
+                if (cursor < len) {
+                    int idx = (charset_index(temp[cursor]) + 1) % charset_len;
+                    temp[cursor] = charset[idx];
+                } else if (len < max_len - 1) {
+                    temp[len] = 'a';
+                    len++;
+                    temp[len] = '\0';
+                }
+                break;
+            }
+            if (kDown & KEY_DOWN) {
+                if (cursor < len) {
+                    int idx = (charset_index(temp[cursor]) - 1 + charset_len) % charset_len;
+                    temp[cursor] = charset[idx];
+                } else if (len < max_len - 1) {
+                    temp[len] = 'a';
+                    len++;
+                    temp[len] = '\0';
+                }
+                break;
+            }
+            if (kDown & KEY_A) {
+                if (len < max_len - 1) {
+                    memmove(&temp[cursor + 1], &temp[cursor], len - cursor + 1);
+                    temp[cursor] = 'a';
+                    len++;
+                    cursor++;
+                }
+                break;
+            }
+            if (kDown & KEY_B) {
+                if (cursor > 0) {
+                    memmove(&temp[cursor - 1], &temp[cursor], len - cursor + 1);
+                    cursor--;
+                    len--;
+                }
+                break;
+            }
+            if (kDown & KEY_Y) {
+                confirmed = true;
+                running = false;
+                break;
+            }
+            if (kDown & KEY_X) {
+                running = false;
+                break;
+            }
+        }
+    }
+
+    if (confirmed) {
+        strncpy(buffer, temp, max_len - 1);
+        buffer[max_len - 1] = '\0';
+        return true;
+    }
+    return false;
 }

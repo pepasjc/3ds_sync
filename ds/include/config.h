@@ -6,4 +6,11 @@
 // Load config from file
 bool config_load(SyncState *state, char *error, size_t error_size);
 
+// Save config to file
+bool config_save(const SyncState *state);
+
+// Edit a text field using D-pad editor
+// Returns true if user confirms changes
+bool config_edit_field(const char *hint, char *buffer, int max_len);
+
 #endif

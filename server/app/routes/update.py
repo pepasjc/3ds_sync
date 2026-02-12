@@ -1,4 +1,4 @@
-"""Update checking endpoint - proxies GitHub releases for 3DS client."""
+"""Update checking endpoint - proxies GitHub releases for 3DS/NDS clients."""
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -7,10 +7,16 @@ import httpx
 router = APIRouter()
 
 # GitHub repository info
-# The server proxies GitHub releases API because 3DS has issues with GitHub's HTTPS
+# The server proxies GitHub releases API because 3DS/NDS can't do HTTPS
 GITHUB_OWNER = "pepasjc"
 GITHUB_REPO = "3ds_sync"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+# Map platform to expected asset file extension
+PLATFORM_EXTENSIONS = {
+    "3ds": ".cia",
+    "nds": ".nds",
+}
 
 
 class UpdateInfo(BaseModel):
@@ -23,15 +29,18 @@ class UpdateInfo(BaseModel):
 
 
 @router.get("/update/check")
-async def check_update(current: str = "0.0.0") -> UpdateInfo:
+async def check_update(current: str = "0.0.0", platform: str = "3ds") -> UpdateInfo:
     """Check if a newer version is available.
 
     Args:
-        current: The client's current version (e.g., "0.1.0")
+        current: The client's current version (e.g., "0.4.3")
+        platform: The client platform ("3ds" or "nds")
 
     Returns:
         Update info with download URL if available.
     """
+    extension = PLATFORM_EXTENSIONS.get(platform, ".cia")
+
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -46,16 +55,16 @@ async def check_update(current: str = "0.0.0") -> UpdateInfo:
             data = resp.json()
             latest_version = data.get("tag_name", "").lstrip("v")
 
-            # Find .cia asset
+            # Find asset matching the platform extension
             download_url = None
             file_size = None
             for asset in data.get("assets", []):
-                if asset["name"].endswith(".cia"):
+                if asset["name"].endswith(extension):
                     download_url = asset["browser_download_url"]
                     file_size = asset["size"]
                     break
 
-            # Compare versions (simple string comparison works for semver)
+            # Compare versions
             is_newer = _compare_versions(latest_version, current) > 0
 
             return UpdateInfo(
@@ -74,11 +83,14 @@ async def check_update(current: str = "0.0.0") -> UpdateInfo:
 
 @router.get("/update/download")
 async def proxy_download(url: str):
-    """Proxy download from GitHub (3DS has HTTPS issues with GitHub).
+    """Proxy download from GitHub (3DS/NDS can't do HTTPS with GitHub).
 
     This streams the file to avoid loading it all into memory.
     """
     from fastapi.responses import StreamingResponse
+
+    # Determine filename from URL
+    filename = url.rsplit("/", 1)[-1] if "/" in url else "update"
 
     async def stream_download():
         async with httpx.AsyncClient() as client:
@@ -89,7 +101,7 @@ async def proxy_download(url: str):
     return StreamingResponse(
         stream_download(),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": "attachment; filename=3dssync.cia"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 

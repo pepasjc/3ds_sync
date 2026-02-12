@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "saves.h"
+#include "config.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -101,4 +102,69 @@ bool ui_confirm_sync(Title *title, const char *server_hash, size_t server_size, 
     }
     
     return false;
+}
+
+// Draw config menu on current console
+void ui_draw_config(const SyncState *state, int selected, bool focused, bool has_wifi) {
+    const char *focus_indicator = focused ? "[ACTIVE]" : "[Press L]";
+    iprintf("=== Configuration %s ===\n\n", focus_indicator);
+
+    const char *items[] = {
+        "Server URL",
+        "API Key",
+        "WiFi SSID",
+        "WiFi WEP Key",
+        "Rescan Saves",
+        "Connect WiFi",
+        "Check Updates"
+    };
+    const int item_count = 7;
+
+    for (int i = 0; i < item_count; i++) {
+        char cursor = (focused && i == selected) ? '>' : ' ';
+        iprintf("%c %s\n", cursor, items[i]);
+
+        if (i == 0) {
+            char val[30];
+            if (state->server_url[0]) {
+                snprintf(val, sizeof(val), "%.28s", state->server_url);
+            } else {
+                snprintf(val, sizeof(val), "(not set)");
+            }
+            iprintf("   %s\n", val);
+        } else if (i == 1) {
+            int len = strlen(state->api_key);
+            if (len > 4) {
+                iprintf("   %.4s****\n", state->api_key);
+            } else {
+                iprintf("   (not set)\n");
+            }
+        } else if (i == 2) {
+            char val[30];
+            if (state->wifi_ssid[0]) {
+                snprintf(val, sizeof(val), "%.28s", state->wifi_ssid);
+            } else {
+                snprintf(val, sizeof(val), "(not set)");
+            }
+            iprintf("   %s\n", val);
+        } else if (i == 3) {
+            int len = strlen(state->wifi_wep_key);
+            if (len > 0) {
+                iprintf("   (%d chars)\n", len);
+            } else {
+                iprintf("   (not set)\n");
+            }
+        }
+    }
+
+    // Draw button hints at bottom
+    iprintf("\n");
+    if (focused) {
+        iprintf("A:Edit/Action L:Back START:Exit\n");
+    } else if (has_wifi) {
+        iprintf("A:Upload B:Download Y:Info\n");
+        iprintf("L:Config START:Exit\n");
+    } else {
+        iprintf("Y:Info L:Config START:Exit\n");
+    }
 }

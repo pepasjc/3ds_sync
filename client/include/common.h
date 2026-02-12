@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define APP_VERSION "0.4.3"
+// APP_VERSION is defined by the Makefile from the root VERSION file
 
 // Max values
 #define MAX_TITLES        256

@@ -12,4 +12,7 @@ void ui_show_save_details(Title *title);
 // Returns: true if user confirms (A), false if cancelled (B)
 bool ui_confirm_sync(Title *title, const char *server_hash, size_t server_size, bool is_upload);
 
+// Draw config menu on current console
+void ui_draw_config(const SyncState *state, int selected, bool focused, bool has_wifi);
+
 #endif

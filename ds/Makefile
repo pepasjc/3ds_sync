@@ -10,12 +10,27 @@ include $(DEVKITARM)/ds_rules
 
 #---------------------------------------------------------------------------------
 OUTPUT := $(CURDIR)/$(TARGET)
-TARGET := ndssyncd
-TARGET_DSI := ndssyncd_dsi
+TARGET := ndssync
+TARGET_DSI := ndssync_dsi
 BUILD := build
 BUILD_DSI := build_dsi
 SOURCES := source
 INCLUDES := include
+
+# NDS banner settings (used by ds_rules built-in ndstool rule)
+GAME_TITLE := NDS Save Sync
+GAME_SUBTITLE1 := Save synchronization
+GAME_SUBTITLE2 := for Nintendo DS
+GAME_ICON := $(CURDIR)/icon.bmp
+
+#---------------------------------------------------------------------------------
+# Version handling (from root VERSION file)
+#---------------------------------------------------------------------------------
+APP_VERSION_STR := $(shell cat $(CURDIR)/../VERSION | tr -d '[:space:]')
+
+ifeq ($(APP_VERSION_STR),)
+$(error Failed to read version from VERSION file)
+endif
 
 #---------------------------------------------------------------------------------
 # Options for code generation
@@ -29,7 +44,7 @@ LIBDIRS := $(LIBNDS)
 
 CFLAGS += $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 	$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-	-D__NDS__ -DARM9 -I$(CALICO)/include
+	-D__NDS__ -DARM9 -DAPP_VERSION=\"$(APP_VERSION_STR)\" -I$(CALICO)/include
 
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 

@@ -21,18 +21,21 @@ APP_DESCRIPTION	:=	Sync save files between consoles
 APP_AUTHOR		:=	3dssync
 
 #---------------------------------------------------------------------------------
-# Version handling (from common.h)
+# Version handling (from root VERSION file)
 #---------------------------------------------------------------------------------
 
-APP_VERSION_STR := $(shell \
-	sed -n 's/^#define APP_VERSION "\(.*\)"/\1/p' $(TOPDIR)/include/common.h)
+APP_VERSION_STR := $(shell cat $(TOPDIR)/../VERSION | tr -d '[:space:]')
 
 APP_VERSION_CIA := $(shell \
 	echo $(APP_VERSION_STR) | \
 	awk -F. '{ printf "%d", ($$1 * 1024) + ($$2 * 16) + $$3 }')
 
-ifeq ($(APP_VERSION_CIA),)
-$(error Failed to parse APP_VERSION from common.h)
+APP_VERSION_MAJOR := $(shell echo $(APP_VERSION_STR) | awk -F. '{ print $$1 }')
+APP_VERSION_MINOR := $(shell echo $(APP_VERSION_STR) | awk -F. '{ print $$2 }')
+APP_VERSION_MICRO := $(shell echo $(APP_VERSION_STR) | awk -F. '{ print $$3 }')
+
+ifeq ($(APP_VERSION_STR),)
+$(error Failed to read version from VERSION file)
 endif
 
 GEN_RSF := $(BUILD)/cia.gen.rsf
@@ -46,7 +49,7 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
-CFLAGS	+=	$(INCLUDE) -D__3DS__
+CFLAGS	+=	$(INCLUDE) -D__3DS__ -DAPP_VERSION=\"$(APP_VERSION_STR)\"
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
@@ -149,7 +152,24 @@ cia: $(BUILD) $(DEPSDIR) $(GEN_RSF)
 		-elf $(TARGET).elf \
 		-rsf $(GEN_RSF) \
 		-icon $(TARGET).smdh \
-		-banner banner.bnr
+		-banner banner.bnr \
+		-major $(APP_VERSION_MAJOR) \
+		-minor $(APP_VERSION_MINOR) \
+		-micro $(APP_VERSION_MICRO)
+	@echo "Patching TMD version (makerom minor version bug workaround)..."
+	@cia_patch_ver() { \
+		local cia="$$1" ver_hi="$$2" ver_lo="$$3"; \
+		local hs=$$(od -A n -t u4 -N 4 -j 0 "$$cia" | tr -d ' '); \
+		local cs=$$(od -A n -t u4 -N 4 -j 8 "$$cia" | tr -d ' '); \
+		local ts=$$(od -A n -t u4 -N 4 -j 12 "$$cia" | tr -d ' '); \
+		local off=$$(( ((hs+63)&~63) + ((cs+63)&~63) + ((ts+63)&~63) + 320 + 156 )); \
+		printf "\x$$(printf '%02x' $$ver_hi)\x$$(printf '%02x' $$ver_lo)" | \
+			dd of="$$cia" bs=1 seek=$$off count=2 conv=notrunc 2>/dev/null; \
+	}; \
+	cia_patch_ver "$(TARGET).cia" \
+		$$(( ($(APP_VERSION_CIA) >> 8) & 0xFF )) \
+		$$(( $(APP_VERSION_CIA) & 0xFF )); \
+	echo "  TMD version set to $(APP_VERSION_STR) ($(APP_VERSION_CIA))"
 	@echo "Built $(TARGET).cia"
 
 #---------------------------------------------------------------------------------
