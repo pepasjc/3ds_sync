@@ -150,7 +150,7 @@ bool update_download(SyncState *state, const char *url, void (*progress_cb)(int 
     }
 
     // Create directory if needed
-    mkdir("sd:/dssync", 0777);
+    mkdir("/dssync", 0777);
 
     // Write to temporary file
     FILE *f = fopen(UPDATE_NDS_PATH, "wb");
@@ -160,22 +160,32 @@ bool update_download(SyncState *state, const char *url, void (*progress_cb)(int 
         return false;
     }
 
-    size_t written = fwrite(resp.body, 1, resp.body_size, f);
+    // Write in chunks (some flashcard FAT implementations need this)
+    iprintf("Writing %zu bytes...\n", resp.body_size);
+    size_t written = 0;
+    while (written < resp.body_size) {
+        size_t chunk = resp.body_size - written;
+        if (chunk > 4096) chunk = 4096;
+
+        size_t w = fwrite(resp.body + written, 1, chunk, f);
+        if (w != chunk) {
+            iprintf("Write failed at %zu\n", written);
+            fclose(f);
+            remove(UPDATE_NDS_PATH);
+            http_response_free(&resp);
+            return false;
+        }
+        written += w;
+
+        if (progress_cb) {
+            progress_cb((int)(written * 100 / resp.body_size));
+        }
+    }
+
     fclose(f);
-
-    if (written != resp.body_size) {
-        iprintf("Write incomplete\n");
-        remove(UPDATE_NDS_PATH);
-        http_response_free(&resp);
-        return false;
-    }
-
-    if (progress_cb) {
-        progress_cb(100);
-    }
-
-    iprintf("Downloaded %zu bytes\n", written);
     http_response_free(&resp);
+
+    iprintf("Saved %zu bytes\n", written);
     return true;
 }
 
@@ -208,10 +218,12 @@ bool update_apply_pending(const char *self_path) {
     if (!target_path) {
         // Fallback: search common locations
         const char *possible_paths[] = {
-            "sd:/ndssync.nds",
+            "/ndssync.nds",
             "fat:/ndssync.nds",
-            "sd:/apps/ndssync/ndssync.nds",
+            "sd:/ndssync.nds",
+            "/apps/ndssync/ndssync.nds",
             "fat:/apps/ndssync/ndssync.nds",
+            "sd:/apps/ndssync/ndssync.nds",
             NULL
         };
 
@@ -225,7 +237,7 @@ bool update_apply_pending(const char *self_path) {
         }
 
         if (!target_path) {
-            target_path = "sd:/ndssync.nds";
+            target_path = "/ndssync.nds";
             iprintf("Using default path:\n%s\n\n", target_path);
         } else {
             iprintf("Found existing:\n%s\n\n", target_path);

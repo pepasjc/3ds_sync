@@ -5,7 +5,9 @@
 #include <stdbool.h>
 
 // APP_VERSION is defined by the Makefile from the root VERSION file
-#define UPDATE_NDS_PATH "sd:/dssync/ndssync_update.nds"
+// No device prefix — libfat routes to the default device
+// (fat:/ on flashcard, sd:/ on DSi)
+#define UPDATE_NDS_PATH "/dssync/ndssync_update.nds"
 
 typedef struct {
     bool available;
