@@ -76,9 +76,9 @@ bool update_check(SyncState *state, UpdateInfo *info) {
         server_url[len - 1] = '\0';
     }
 
-    // Build URL: GET /update/check?current=VERSION&platform=nds
+    // Build URL: GET /api/v1/update/check?current=VERSION&platform=nds
     char url[512];
-    snprintf(url, sizeof(url), "%s/update/check?current=%s&platform=nds",
+    snprintf(url, sizeof(url), "%s/api/v1/update/check?current=%s&platform=nds",
         server_url, APP_VERSION);
 
     iprintf("Checking for updates...\n");
@@ -130,7 +130,7 @@ bool update_download(SyncState *state, const char *url, void (*progress_cb)(int 
 
     // Build proxy download URL
     char proxy_url[768];
-    snprintf(proxy_url, sizeof(proxy_url), "%s/update/download?url=%s",
+    snprintf(proxy_url, sizeof(proxy_url), "%s/api/v1/update/download?url=%s",
         server_url, url);
 
     iprintf("Downloading update...\n");

@@ -85,23 +85,24 @@ async def check_update(current: str = "0.0.0", platform: str = "3ds") -> UpdateI
 async def proxy_download(url: str):
     """Proxy download from GitHub (3DS/NDS can't do HTTPS with GitHub).
 
-    This streams the file to avoid loading it all into memory.
+    Downloads the full file then returns it with Content-Length,
+    which is required by the DS client's HTTP/1.0 implementation.
+    Homebrew binaries are small (a few MB) so this is fine.
     """
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import Response
 
-    # Determine filename from URL
     filename = url.rsplit("/", 1)[-1] if "/" in url else "update"
 
-    async def stream_download():
-        async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url, follow_redirects=True, timeout=300.0) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=8192):
-                    yield chunk
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, follow_redirects=True, timeout=300.0)
 
-    return StreamingResponse(
-        stream_download(),
+    return Response(
+        content=resp.content,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Length": str(len(resp.content)),
+        },
     )
 
 
