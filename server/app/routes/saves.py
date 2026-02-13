@@ -217,7 +217,8 @@ async def download_save_history(title_id: str, timestamp: str):
     """Download a specific history version as a bundle."""
     title_id = _validate_title_id(title_id)
 
-    # Normalize timestamp (colons -> underscores, like storage does)
+    # timestamp comes URL-decoded from FastAPI (e.g., "2026-02-05T21:53:47.380207:00:00")
+    # but storage uses underscores (e.g., "2026-02-05T21_53_47.380207_00_00")
     timestamp_normalized = timestamp.replace(":", "_").replace("+", "_")
 
     if not storage.title_exists(title_id):
