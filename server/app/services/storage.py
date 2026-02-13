@@ -162,11 +162,16 @@ def list_history(title_id: str) -> list[dict]:
 
         # Parse the directory name to get Unix timestamp
         # Format: "2026-02-05T21_53_47.380207_00_00"
-        ts_str = ts_dir.name.replace("_", ":").replace("+", "+")
+        # Convert to ISO format: "2026-02-05T21:53:47.380207+00:00"
+        ts_str = ts_dir.name.replace("_", ":")
+        # Fix timezone: ":00:00" -> "+00:00"
+        if ts_str.endswith(":00:00"):
+            ts_str = ts_str[:-6] + "+00:00"
         try:
             dt = datetime.fromisoformat(ts_str)
             unix_ts = int(dt.timestamp())
-        except:
+        except Exception as e:
+            print(f"Failed to parse timestamp '{ts_str}': {e}")
             unix_ts = 0
 
         # Get file count and size for this version
