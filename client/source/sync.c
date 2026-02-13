@@ -608,3 +608,184 @@ bool sync_get_save_details(const AppConfig *config, const TitleInfo *title,
 
     return true;
 }
+
+SyncAction sync_decide(const SaveDetails *details) {
+    // No local and no server -> up to date (nothing to sync)
+    if (!details->local_exists && !details->server_exists) {
+        return SYNC_ACTION_UP_TO_DATE;
+    }
+
+    // Only local exists -> upload
+    if (details->local_exists && !details->server_exists) {
+        return SYNC_ACTION_UPLOAD;
+    }
+
+    // Only server exists -> download
+    if (!details->local_exists && details->server_exists) {
+        return SYNC_ACTION_DOWNLOAD;
+    }
+
+    // Both exist - compare hashes
+    if (details->is_synced) {
+        return SYNC_ACTION_UP_TO_DATE;
+    }
+
+    // Hashes differ - three-way comparison
+    if (details->has_last_synced) {
+        // last_synced == server -> only client changed -> upload
+        if (strcmp(details->last_synced_hash, details->server_hash) == 0) {
+            return SYNC_ACTION_UPLOAD;
+        }
+        // last_synced == local -> only server changed -> download
+        if (strcmp(details->last_synced_hash, details->local_hash) == 0) {
+            return SYNC_ACTION_DOWNLOAD;
+        }
+        // All three differ -> conflict
+        return SYNC_ACTION_CONFLICT;
+    }
+
+    // No sync history - server will decide based on console_id
+    // For now, treat as conflict (user needs to decide)
+    return SYNC_ACTION_CONFLICT;
+}
+
+int sync_get_history(const AppConfig *config, const char *title_id_hex,
+                     HistoryVersion *versions, int max_versions) {
+    char path[64];
+    snprintf(path, sizeof(path), "/saves/%s/history", title_id_hex);
+
+    u32 resp_size, status;
+    u8 *resp = network_get(config, path, &resp_size, &status);
+
+    if (!resp || status != 200) {
+        if (resp) free(resp);
+        return -1;
+    }
+
+    // Null-terminate for string parsing
+    u8 *resp_str = (u8 *)realloc(resp, resp_size + 1);
+    if (!resp_str) {
+        free(resp);
+        return -1;
+    }
+    resp_str[resp_size] = '\0';
+    char *json = (char *)resp_str;
+
+    // Find versions array
+    const char *arr = json_find_key(json, "versions");
+    if (!arr || *arr != '[') {
+        free(resp_str);
+        return 0;
+    }
+    arr++; // skip '['
+
+    int count = 0;
+    while (*arr && *arr != ']' && count < max_versions) {
+        // Find next object
+        const char *obj = strchr(arr, '{');
+        if (!obj) break;
+        obj++;
+        const char *obj_end = strchr(obj, '}');
+        if (!obj_end) break;
+
+        // Extract timestamp and size from this object
+        char timestamp[32] = "";
+        int size = 0, file_count = 0;
+
+        // Quick parse: find "timestamp":"value"
+        const char *ts_start = strstr(obj, "\"timestamp\":\"");
+        if (ts_start && ts_start < obj_end) {
+            ts_start += 12; // skip "timestamp":"
+            const char *ts_end = strchr(ts_start, '"');
+            if (ts_end && ts_end < obj_end) {
+                int len = (int)(ts_end - ts_start);
+                if (len < (int)sizeof(timestamp)) {
+                    memcpy(timestamp, ts_start, len);
+                    timestamp[len] = '\0';
+                }
+            }
+        }
+
+        // Find "size":value
+        const char *sz_start = strstr(obj, "\"size\":");
+        if (sz_start && sz_start < obj_end) {
+            sz_start += 7;
+            size = atoi(sz_start);
+        }
+
+        // Find "file_count":value
+        const char *fc_start = strstr(obj, "\"file_count\":");
+        if (fc_start && fc_start < obj_end) {
+            fc_start += 12;
+            file_count = atoi(fc_start);
+        }
+
+        if (timestamp[0]) {
+            strncpy(versions[count].timestamp, timestamp, sizeof(versions[count].timestamp) - 1);
+            versions[count].timestamp[sizeof(versions[count].timestamp) - 1] = '\0';
+            versions[count].size = (u32)size;
+            versions[count].file_count = file_count;
+            count++;
+        }
+
+        arr = obj_end + 1;
+    }
+
+    free(resp_str);
+    return count;
+}
+
+SyncResult sync_download_history(const AppConfig *config, const TitleInfo *title,
+                                 const char *timestamp, SyncProgressCb progress) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Downloading history version...");
+    if (progress) progress(msg);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/saves/%s/history/%s", title->title_id_hex, timestamp);
+
+    u32 resp_size, status;
+    u8 *resp = network_get(config, path, &resp_size, &status);
+    if (!resp) return SYNC_ERR_NETWORK;
+    if (status != 200) { free(resp); return SYNC_ERR_SERVER; }
+
+    // Parse bundle
+    ArchiveFile *files = (ArchiveFile *)malloc(MAX_SAVE_FILES * sizeof(ArchiveFile));
+    if (!files) { free(resp); return SYNC_ERR_BUNDLE; }
+
+    u64 tid;
+    u32 ts;
+    u8 *decompressed = NULL;
+    int file_count = bundle_parse(resp, resp_size, &tid, &ts, files, MAX_SAVE_FILES, &decompressed);
+    if (file_count < 0) {
+        free(files);
+        if (decompressed) free(decompressed);
+        free(resp);
+        return SYNC_ERR_BUNDLE;
+    }
+
+    snprintf(msg, sizeof(msg), "Writing save: %s (%d files)", title->title_id_hex, file_count);
+    if (progress) progress(msg);
+
+    // Write save data
+    bool ok;
+    if (title->is_nds && title->media_type == MEDIATYPE_GAME_CARD)
+        ok = nds_cart_write_save(files, file_count);
+    else if (title->is_nds)
+        ok = nds_write_save(title->sav_path, files, file_count);
+    else
+        ok = archive_write(title->title_id, title->media_type, files, file_count);
+
+    free(files);
+    if (decompressed) free(decompressed);
+    free(resp);
+
+    if (!ok) return SYNC_ERR_ARCHIVE;
+
+    // Update last synced hash with the downloaded version
+    char hash[65];
+    bundle_compute_save_hash(files, file_count, hash);
+    save_last_synced_hash(title->title_id_hex, hash);
+
+    return SYNC_OK;
+}

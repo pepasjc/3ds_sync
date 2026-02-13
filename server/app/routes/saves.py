@@ -152,32 +152,33 @@ async def upload_save_raw(
 ):
     """Upload raw save file - wraps into bundle format for compatibility with 3DS client."""
     title_id = _validate_title_id(title_id)
-    
+
     # Get console ID from header
     console_id = request.headers.get("X-Console-ID", "")
-    
+
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body")
-    
+
     # Wrap raw save data into a bundle with a single file
     # Use standard save.bin filename for compatibility
     import time
+
     timestamp = int(time.time())
-    
+
     bundle_file = BundleFile(
         path="save.bin",
         size=len(body),
         sha256=hashlib.sha256(body).digest(),
         data=body,
     )
-    
+
     bundle = SaveBundle(
         title_id=int(title_id, 16),
         timestamp=timestamp,
         files=[bundle_file],
     )
-    
+
     # Conflict check
     if not force:
         existing = storage.get_metadata(title_id)
@@ -190,10 +191,62 @@ async def upload_save_raw(
                     "X-Server-Hash": existing.save_hash,
                 },
             )
-    
+
     meta = storage.store_save(bundle, source="nds", console_id=console_id)
     return {
         "status": "ok",
         "timestamp": meta.last_sync,
         "sha256": meta.save_hash,
     }
+
+
+@router.get("/saves/{title_id}/history")
+async def list_save_history(title_id: str):
+    """List all available history versions for a title."""
+    title_id = _validate_title_id(title_id)
+
+    if not storage.title_exists(title_id):
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    history = storage.list_history(title_id)
+    return {"title_id": title_id, "versions": history}
+
+
+@router.get("/saves/{title_id}/history/{timestamp}")
+async def download_save_history(title_id: str, timestamp: str):
+    """Download a specific history version as a bundle."""
+    title_id = _validate_title_id(title_id)
+
+    if not storage.title_exists(title_id):
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    files = storage.load_history_version(title_id, timestamp)
+    if files is None or len(files) == 0:
+        raise HTTPException(status_code=404, detail="History version not found")
+
+    # Build a bundle from history files
+    bundle_files = []
+    for path, data in files:
+        bundle_files.append(
+            BundleFile(
+                path=path,
+                size=len(data),
+                sha256=hashlib.sha256(data).digest(),
+                data=data,
+            )
+        )
+
+    bundle = SaveBundle(
+        title_id=int(title_id, 16),
+        timestamp=0,  # Unknown timestamp for history
+        files=bundle_files,
+    )
+
+    bundle_data = create_bundle(bundle)
+    return Response(
+        content=bundle_data,
+        media_type="application/octet-stream",
+        headers={
+            "X-Version-Timestamp": timestamp,
+        },
+    )

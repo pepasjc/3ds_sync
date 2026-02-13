@@ -66,7 +66,9 @@ def get_metadata(title_id: str) -> SaveMetadata | None:
     return SaveMetadata(**data)
 
 
-def store_save(bundle: SaveBundle, source: str = "3ds", console_id: str = "") -> SaveMetadata:
+def store_save(
+    bundle: SaveBundle, source: str = "3ds", console_id: str = ""
+) -> SaveMetadata:
     """Store a save bundle to disk, archiving any existing save to history."""
     title_id = bundle.title_id_hex
     current = _current_dir(title_id)
@@ -145,3 +147,52 @@ def _prune_history(title_id: str) -> None:
     while len(versions) > settings.max_history_versions:
         oldest = versions.pop(0)
         shutil.rmtree(oldest)
+
+
+def list_history(title_id: str) -> list[dict]:
+    """List all history versions for a title."""
+    history = _history_dir(title_id)
+    if not history.exists():
+        return []
+
+    versions = []
+    for ts_dir in sorted(history.iterdir(), reverse=True):
+        if not ts_dir.is_dir():
+            continue
+
+        # Get file count and size for this version
+        total_size = 0
+        file_count = 0
+        for f in ts_dir.rglob("*"):
+            if f.is_file():
+                total_size += f.stat().st_size
+                file_count += 1
+
+        versions.append(
+            {
+                "timestamp": ts_dir.name.replace("_", ":").replace("+", "+"),
+                "size": total_size,
+                "file_count": file_count,
+            }
+        )
+
+    return versions
+
+
+def load_history_version(
+    title_id: str, timestamp: str
+) -> list[tuple[str, bytes]] | None:
+    """Load save files from a specific history version."""
+    # Normalize timestamp for path lookup
+    ts_normalized = timestamp.replace(":", "_").replace("+", "_")
+    history = _history_dir(title_id) / ts_normalized
+
+    if not history.exists():
+        return None
+
+    files = []
+    for file_path in sorted(history.rglob("*")):
+        if file_path.is_file():
+            rel_path = file_path.relative_to(history).as_posix()
+            files.append((rel_path, file_path.read_bytes()))
+    return files

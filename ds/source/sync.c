@@ -1,6 +1,7 @@
 #include "sync.h"
 #include "saves.h"
 #include "network.h"
+#include "http.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -357,4 +358,109 @@ int sync_all(SyncState *state, SyncSummary *summary) {
     }
 
     return 0;
+}
+
+int sync_get_history(SyncState *state, const char *title_id_hex,
+                     HistoryVersion *versions, int max_versions) {
+    char url[128];
+    snprintf(url, sizeof(url), "%s/saves/%s/history", state->server_url, title_id_hex);
+
+    HttpResponse resp = http_request(url, HTTP_GET, state->api_key, NULL, 0);
+    if (!resp.success || resp.status_code != 200) {
+        http_response_free(&resp);
+        return -1;
+    }
+
+    // Null-terminate body for string parsing
+    char *body = (char *)malloc(resp.body_size + 1);
+    if (!body) {
+        http_response_free(&resp);
+        return -1;
+    }
+    memcpy(body, resp.body, resp.body_size);
+    body[resp.body_size] = '\0';
+    http_response_free(&resp);
+
+    // Parse JSON - find versions array
+    char *arr = strstr(body, "\"versions\":[");
+    if (!arr) {
+        free(body);
+        return 0;
+    }
+    arr += 11;
+
+    int count = 0;
+    while (*arr && *arr != ']' && count < max_versions) {
+        char *obj = strchr(arr, '{');
+        if (!obj) break;
+        obj++;
+        char *obj_end = strchr(obj, '}');
+        if (!obj_end) break;
+
+        char timestamp[32] = "";
+        char *ts_start = strstr(obj, "\"timestamp\":\"");
+        if (ts_start && ts_start < obj_end) {
+            ts_start += 12;
+            char *ts_end = strchr(ts_start, '"');
+            if (ts_end && ts_end < obj_end) {
+                int len = ts_end - ts_start;
+                if (len < 31) {
+                    memcpy(timestamp, ts_start, len);
+                    timestamp[len] = '\0';
+                }
+            }
+        }
+
+        uint32_t size = 0;
+        char *sz_start = strstr(obj, "\"size\":");
+        if (sz_start && sz_start < obj_end) {
+            sz_start += 7;
+            size = atoi(sz_start);
+        }
+
+        int file_count = 0;
+        char *fc_start = strstr(obj, "\"file_count\":");
+        if (fc_start && fc_start < obj_end) {
+            fc_start += 12;
+            file_count = atoi(fc_start);
+        }
+
+        if (timestamp[0]) {
+            strncpy(versions[count].timestamp, timestamp, 31);
+            versions[count].timestamp[31] = '\0';
+            versions[count].size = size;
+            versions[count].file_count = file_count;
+            count++;
+        }
+
+        arr = obj_end + 1;
+    }
+
+    free(body);
+    return count;
+}
+
+int sync_download_history(SyncState *state, int title_idx, const char *timestamp) {
+    Title *title = &state->titles[title_idx];
+
+    char title_id_hex[17];
+    snprintf(title_id_hex, sizeof(title_id_hex), "%02X%02X%02X%02X%02X%02X%02X%02X",
+        title->title_id[0], title->title_id[1], title->title_id[2], title->title_id[3],
+        title->title_id[4], title->title_id[5], title->title_id[6], title->title_id[7]);
+
+    char url[128];
+    snprintf(url, sizeof(url), "%s/saves/%s/history/%s",
+        state->server_url, title_id_hex, timestamp);
+
+    HttpResponse resp = http_request(url, HTTP_GET, state->api_key, NULL, 0);
+    if (!resp.success || resp.status_code != 200) {
+        iprintf("Failed to download history\n");
+        http_response_free(&resp);
+        return -1;
+    }
+
+    iprintf("Got %d bytes\n", (int)resp.body_size);
+    http_response_free(&resp);
+    iprintf("History restore not implemented on DS.\n");
+    return -1;
 }
