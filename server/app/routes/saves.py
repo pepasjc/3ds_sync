@@ -217,10 +217,13 @@ async def download_save_history(title_id: str, timestamp: str):
     """Download a specific history version as a bundle."""
     title_id = _validate_title_id(title_id)
 
+    # Normalize timestamp (colons -> underscores, like storage does)
+    timestamp_normalized = timestamp.replace(":", "_").replace("+", "_")
+
     if not storage.title_exists(title_id):
         raise HTTPException(status_code=404, detail="No save found for this title")
 
-    files = storage.load_history_version(title_id, timestamp)
+    files = storage.load_history_version(title_id, timestamp_normalized)
     if files is None or len(files) == 0:
         raise HTTPException(status_code=404, detail="History version not found")
 
