@@ -160,6 +160,15 @@ def list_history(title_id: str) -> list[dict]:
         if not ts_dir.is_dir():
             continue
 
+        # Parse the directory name to get Unix timestamp
+        # Format: "2026-02-05T21_53_47.380207_00_00"
+        ts_str = ts_dir.name.replace("_", ":").replace("+", "+")
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            unix_ts = int(dt.timestamp())
+        except:
+            unix_ts = 0
+
         # Get file count and size for this version
         total_size = 0
         file_count = 0
@@ -170,13 +179,42 @@ def list_history(title_id: str) -> list[dict]:
 
         versions.append(
             {
-                "timestamp": ts_dir.name.replace("_", ":").replace("+", "+"),
+                "timestamp": unix_ts,
+                "display": ts_str[:19].replace(":", " "),  # "2026-02-05 21:53:47"
                 "size": total_size,
                 "file_count": file_count,
             }
         )
 
     return versions
+
+
+def load_history_version_by_unix_ts(
+    title_id: str, unix_timestamp: int
+) -> list[tuple[str, bytes]] | None:
+    """Load save files from a specific history version by Unix timestamp."""
+
+    history = _history_dir(title_id)
+    if not history.exists():
+        return None
+
+    # Convert Unix timestamp to ISO format for directory lookup
+    dt = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+    iso_ts = dt.isoformat()
+    # Convert to directory name format (replace : with _)
+    ts_dir_name = iso_ts.replace(":", "_").replace("+", "_")
+
+    history_path = history / ts_dir_name
+    if not history_path.exists():
+        return None
+
+    files = []
+    for file_path in sorted(history_path.rglob("*")):
+        if file_path.is_file():
+            rel_path = file_path.relative_to(history_path).as_posix()
+            files.append((rel_path, file_path.read_bytes()))
+
+    return files
 
 
 def load_history_version(

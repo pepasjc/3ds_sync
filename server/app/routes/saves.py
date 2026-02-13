@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from app.models.save import BundleFile, SaveBundle
 from app.services import storage
 from app.services.bundle import BundleError, create_bundle, parse_bundle
-
+import time 
 router = APIRouter()
 
 _TITLE_ID_RE = re.compile(r"^[0-9A-Fa-f]{16}$")
@@ -162,8 +162,6 @@ async def upload_save_raw(
 
     # Wrap raw save data into a bundle with a single file
     # Use standard save.bin filename for compatibility
-    import time
-
     timestamp = int(time.time())
 
     bundle_file = BundleFile(
@@ -213,18 +211,14 @@ async def list_save_history(title_id: str):
 
 
 @router.get("/saves/{title_id}/history/{timestamp}")
-async def download_save_history(title_id: str, timestamp: str):
+async def download_save_history(title_id: str, timestamp: int):
     """Download a specific history version as a bundle."""
     title_id = _validate_title_id(title_id)
-
-    # timestamp comes URL-decoded from FastAPI (e.g., "2026-02-05T21:53:47.380207:00:00")
-    # but storage uses underscores (e.g., "2026-02-05T21_53_47.380207_00_00")
-    timestamp_normalized = timestamp.replace(":", "_").replace("+", "_")
 
     if not storage.title_exists(title_id):
         raise HTTPException(status_code=404, detail="No save found for this title")
 
-    files = storage.load_history_version(title_id, timestamp_normalized)
+    files = storage.load_history_version_by_unix_ts(title_id, timestamp)
     if files is None or len(files) == 0:
         raise HTTPException(status_code=404, detail="History version not found")
 
@@ -251,6 +245,6 @@ async def download_save_history(title_id: str, timestamp: str):
         content=bundle_data,
         media_type="application/octet-stream",
         headers={
-            "X-Version-Timestamp": timestamp,
+            "X-Version-Timestamp": str(timestamp),
         },
     )
