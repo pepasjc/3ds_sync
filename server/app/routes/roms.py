@@ -3,6 +3,7 @@
 GET  /api/v1/roms              — List all ROMs in catalog (with optional filters)
 GET  /api/v1/roms/{title_id}   — Download a ROM file (with HTTP Range support)
                                   ?extract=cue  — CHD → CUE/BIN ZIP (PS1, Saturn, etc.)
+                                  ?extract=psio — PS1 CHD/CUE → PSIO BIN/CU2 ZIP
                                   ?extract=gdi  — CHD → GDI ZIP (Dreamcast)
                                   ?extract=iso  — CHD → ISO (PSP)
                                   ?extract=cso  — CHD → CSO compressed image (PSP)
@@ -819,6 +820,7 @@ async def download_rom(
         None,
         description=(
             "Extract format: 'cue' (CUE/BIN zip), 'gdi' (GDI zip), "
+            "'psio' (PS1 BIN/CU2 zip), "
             "'iso' (PSP ISO), 'cso' (PSP compressed ISO), "
             "'cia' (3DS decrypted CIA, also installable on CFW hardware), "
             "'decrypted_cci' (3DS decrypted CCI for emulators), "
@@ -868,23 +870,29 @@ async def download_rom(
             if sys_up in _XBOX_SYSTEMS and fmt in _XBOX_EXTRACT_SPECS:
                 if fmt == 'cci':
                     return await _serve_bundle_zip(entry, bundle_dir)
-                # Try CCI first (needs conversion to ISO).
+                # Try CCI first (needs conversion to ISO or folder extraction).
                 cci_path = _xbox_bundle_cci_path(entry, bundle_dir)
                 if cci_path is not None:
                     return await _extract_xbox(
                         cci_path, sys_up, fmt, display_stem=entry.name
                     )
-                # Fallback: bundle may contain a raw .iso alongside a
-                # default.xbe launcher.  Stream the ISO directly — no
-                # conversion needed, xemu loads it as-is.
+                # No CCI found — bundle contains raw files (default.xbe + .iso).
                 if fmt == 'iso':
+                    # Emulator clients (xemu) just need the disc image.
                     iso_path = _xbox_bundle_iso_path(entry, bundle_dir)
                     if iso_path is not None:
                         return _stream_file_response(iso_path, 'application/octet-stream')
+                if fmt == 'folder':
+                    # Xbox hardware client wants extracted game files.
+                    # The bundle already IS an extracted folder (default.xbe
+                    # + .iso), so serve as ZIP directly — no conversion.
+                    return await _serve_bundle_zip(entry, bundle_dir)
                 return Response(
                     status_code=404,
                     content="Xbox bundle has no .cci or .iso disc image",
                 )
+            if sys_up in _PS1_EBOOT_SYSTEMS and fmt == 'psio':
+                return await _extract_ps1_psio(sys_up, entry)
         return await _serve_bundle_zip(entry, bundle_dir)
 
     file_path = rom_dir / entry.path
@@ -907,6 +915,8 @@ async def download_rom(
             # so the handler can look up sibling discs (multi-disc
             # games) by shared ``title_id``.
             return await _extract_ps1_eboot(file_path, sys_up, entry)
+        elif fmt == 'psio' and sys_up in _PS1_EBOOT_SYSTEMS:
+            return await _extract_ps1_psio(sys_up, entry)
         elif fmt == 'rvz' or (fmt == 'iso' and file_path.suffix.lower() == '.rvz'):
             return await _extract_rvz(file_path, file_path.stem)
         elif fmt == 'iso' and sys_up in _PS2_SYSTEMS:
@@ -1536,6 +1546,300 @@ async def _extract_ps1_eboot(source_path: Path, system: str, entry) -> Response:
     return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
 
 
+# ── PS1 CHD / CUE → PSIO BIN/CU2 ZIP ────────────────────────────────────────
+
+_CUE_SECTOR_SIZE_BY_MODE = {
+    'AUDIO': 2352,
+    'CDG': 2448,
+    'MODE1/2048': 2048,
+    'MODE1/2352': 2352,
+    'MODE2/2336': 2336,
+    'MODE2/2352': 2352,
+    'CDI/2336': 2336,
+    'CDI/2352': 2352,
+}
+
+
+def _psio_cache_key(sources: list[Path]) -> str:
+    """Cache PSIO output by all source files in all selected discs."""
+    parts: list[str] = []
+    for source in sources:
+        if source.is_dir():
+            files = sorted(p for p in source.rglob('*') if p.is_file())
+        else:
+            files = [source]
+        for p in files:
+            st = p.stat()
+            parts.append(f"{p.absolute()}|{st.st_mtime_ns}|{st.st_size}")
+    payload = '\n'.join(parts) + '|psio'
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def _cue_time_to_frames(value: str) -> int:
+    parts = value.strip().split(':')
+    if len(parts) != 3:
+        raise ValueError(f"Invalid CUE timestamp: {value}")
+    minutes, seconds, frames = (int(p) for p in parts)
+    if seconds < 0 or seconds >= 60 or frames < 0 or frames >= 75:
+        raise ValueError(f"Invalid CUE timestamp: {value}")
+    return (minutes * 60 + seconds) * 75 + frames
+
+
+def _frames_to_cu2_time(frames: int) -> str:
+    frames = max(0, int(frames))
+    minutes, rem = divmod(frames, 60 * 75)
+    seconds, frame = divmod(rem, 75)
+    return f"{minutes:02d}:{seconds:02d}:{frame:02d}"
+
+
+def _cue_line_tokens(line: str) -> list[str]:
+    try:
+        return shlex.split(line, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Invalid CUE line: {line.strip()}") from exc
+
+
+def _resolve_cue_file_ref(cue_path: Path, ref: str) -> Path:
+    root = cue_path.parent.resolve()
+    resolved = (cue_path.parent / ref).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"CUE file reference escapes disc folder: {ref}") from exc
+    if not resolved.is_file():
+        raise ValueError(f"CUE references missing file: {ref}")
+    return resolved
+
+
+def _parse_cue_for_psio(cue_path: Path) -> tuple[list[dict], list[Path]]:
+    """Parse enough CUE metadata to emit PSIO CU2 lines.
+
+    PSIO's CU2 format expects offsets into a monolithic disc image.  chdman
+    ``extractcd`` produces that shape, and raw CUE/BIN folders often do too.
+    Multi-file CUEs are rejected so we do not emit subtly wrong offsets.
+    """
+    files: list[str] = []
+    tracks: list[dict] = []
+    current_file: str | None = None
+    current_track: dict | None = None
+
+    for raw in cue_path.read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        tokens = _cue_line_tokens(line)
+        if not tokens:
+            continue
+        command = tokens[0].upper()
+        if command == 'FILE':
+            if len(tokens) < 2:
+                raise ValueError(f"Invalid FILE line in {cue_path.name}")
+            current_file = tokens[1]
+            if current_file not in files:
+                files.append(current_file)
+        elif command == 'TRACK':
+            if len(tokens) < 3:
+                raise ValueError(f"Invalid TRACK line in {cue_path.name}")
+            try:
+                track_no = int(tokens[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid TRACK number in {cue_path.name}") from exc
+            current_track = {
+                'number': track_no,
+                'mode': tokens[2].upper(),
+                'file': current_file,
+                'indexes': [],
+            }
+            tracks.append(current_track)
+        elif command == 'INDEX':
+            if current_track is None or len(tokens) < 3:
+                raise ValueError(f"INDEX appears before TRACK in {cue_path.name}")
+            try:
+                index_no = int(tokens[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid INDEX number in {cue_path.name}") from exc
+            current_track['indexes'].append(
+                {'number': index_no, 'frame': _cue_time_to_frames(tokens[2])}
+            )
+
+    if not tracks:
+        raise ValueError(f"No tracks found in {cue_path.name}")
+    if not files:
+        raise ValueError(f"No FILE entry found in {cue_path.name}")
+    if len(files) != 1:
+        raise ValueError(
+            "PSIO CU2 conversion requires a monolithic CUE/BIN image; "
+            f"{cue_path.name} references {len(files)} files"
+        )
+
+    resolved = [_resolve_cue_file_ref(cue_path, files[0])]
+    return tracks, resolved
+
+
+def _cue_track_control_adr(mode: str) -> str:
+    return '01' if mode.upper() == 'AUDIO' else '41'
+
+
+def _cu2_adjusted_frame(track_no: int, frame: int, revision: int = 2) -> int:
+    # Cue2cu2's default revision is v2, where PSIO expects track 1 times
+    # shifted back by the standard 2-second lead-in.
+    if track_no == 1 and revision == 2:
+        return max(0, frame - 150)
+    return max(0, frame)
+
+
+def _cue_to_cu2_text(cue_path: Path) -> tuple[str, list[Path]]:
+    tracks, refs = _parse_cue_for_psio(cue_path)
+    sector_size = _CUE_SECTOR_SIZE_BY_MODE.get(str(tracks[0]['mode']).upper(), 2352)
+    total_frames = refs[0].stat().st_size // sector_size
+
+    events: list[dict] = []
+    for track in tracks:
+        for index in track['indexes']:
+            events.append(
+                {
+                    'track': track,
+                    'index': index['number'],
+                    'frame': index['frame'],
+                }
+            )
+    if not events:
+        raise ValueError(f"No INDEX entries found in {cue_path.name}")
+    events.sort(key=lambda e: (e['frame'], e['track']['number'], e['index']))
+
+    pregaps = {
+        track['number']: next(
+            (idx['frame'] for idx in track['indexes'] if idx['number'] == 0),
+            0,
+        )
+        for track in tracks
+    }
+
+    lines: list[str] = []
+    for i, event in enumerate(events):
+        track = event['track']
+        track_no = int(track['number'])
+        index_no = int(event['index'])
+        frame = int(event['frame'])
+        next_frame = (
+            int(events[i + 1]['frame']) if i + 1 < len(events) else total_frames
+        )
+        length = max(0, next_frame - frame)
+        offset = _cu2_adjusted_frame(track_no, frame)
+        pregap = _cu2_adjusted_frame(track_no, pregaps.get(track_no, 0))
+        lines.append(
+            f"{track_no:02d}_{index_no:02d} "
+            f"{_cue_track_control_adr(str(track['mode']))} "
+            f"{_frames_to_cu2_time(offset)} "
+            f"{_frames_to_cu2_time(pregap)} "
+            f"{_frames_to_cu2_time(length)}"
+        )
+    return '\n'.join(lines) + '\n', refs
+
+
+def _psio_find_cue(source_dir: Path) -> Path:
+    cues = sorted(p for p in source_dir.rglob('*') if p.is_file() and p.suffix.lower() == '.cue')
+    if not cues:
+        raise ValueError(f"No CUE file found in bundle: {source_dir.name}")
+    if len(cues) > 1:
+        raise ValueError(
+            f"PSIO bundle conversion expects one CUE per disc; {source_dir.name} has {len(cues)}"
+        )
+    return cues[0]
+
+
+def _psio_archive_prefix(entry, index: int, total: int) -> str:
+    if total <= 1:
+        return ''
+    name = _safe_archive_stem(getattr(entry, 'name', '') or getattr(entry, 'filename', '') or f"Disc {index}")
+    return f"Disc {index:02d} - {name}"
+
+
+async def _extract_ps1_psio(system: str, entry) -> Response:
+    """Convert PS1 source discs into PSIO-ready BIN/CU2 ZIP output.
+
+    Loose multi-disc catalog rows are grouped by shared PS1 serial/title_id,
+    matching the EBOOT path.  PS1 bundle rows are supported too: each bundle
+    directory must contain exactly one CUE for the disc.
+    """
+    if system not in _PS1_EBOOT_SYSTEMS:
+        return Response(status_code=400, content=f"PSIO extraction is only for PS1 (got {system})")
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return Response(status_code=503, content="ROM directory not configured")
+
+    siblings = _ps1_disc_siblings(entry)
+    source_pairs = [(s, rom_dir / s.path) for s in siblings]
+    source_pairs = [(s, p) for s, p in source_pairs if p.exists()]
+    if not source_pairs:
+        return Response(status_code=404, content="No disc files found on disk")
+    sources = [p for _s, p in source_pairs]
+
+    if any(p.is_file() and p.suffix.lower() == '.chd' for p in sources) and not shutil.which('chdman'):
+        return Response(status_code=503, content="chdman not installed. Run: sudo apt install mame-tools")
+
+    cache_key = _psio_cache_key(sources)
+    cached = _lookup_cached_by_key('ps1_psio', cache_key, '.zip')
+    if cached is not None:
+        return _stream_file_response(cached, 'application/zip')
+
+    tmpdir = tempfile.mkdtemp(prefix='psio_extract_', dir=_conversion_tmp_dir())
+    tmp = Path(tmpdir)
+    zip_path = tmp / f"{_safe_archive_stem(entry.name or entry.filename or 'psio')}.zip"
+
+    def _run() -> Path:
+        extract_root = tmp / 'extract'
+        extract_root.mkdir()
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for index, (sibling, source) in enumerate(source_pairs, start=1):
+                if source.is_dir():
+                    cue_path = _psio_find_cue(source)
+                elif source.suffix.lower() == '.chd':
+                    disc_dir = extract_root / f"disc_{index:02d}"
+                    disc_dir.mkdir()
+                    cue_path = disc_dir / f"{source.stem}.cue"
+                    result = subprocess.run(
+                        ['chdman', 'extractcd', '-i', str(source), '-o', str(cue_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            result.stderr.strip() or result.stdout.strip() or 'chdman failed'
+                        )
+                elif source.suffix.lower() == '.cue':
+                    cue_path = source
+                else:
+                    raise ValueError(
+                        "PSIO extraction requires CHD or monolithic CUE/BIN sources "
+                        f"(got {source.name})"
+                    )
+
+                cu2_text, referenced_files = _cue_to_cu2_text(cue_path)
+                prefix = _psio_archive_prefix(sibling, index, len(source_pairs))
+                arc_prefix = f"{prefix}/" if prefix else ''
+                zf.writestr(f"{arc_prefix}{cue_path.stem}.cu2", cu2_text)
+                for ref in referenced_files:
+                    zf.write(ref, f"{arc_prefix}{ref.name}")
+        return zip_path
+
+    try:
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except ValueError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=400, content=str(exc))
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>10 min)")
+
+    cached_path = _save_to_cache_by_key(out_path, 'ps1_psio', cache_key, '.zip')
+    return _stream_file_response(cached_path, 'application/zip', cleanup_dir=tmpdir)
+
+
 # ── PSP CHD → ISO / CSO ──────────────────────────────────────────────────────
 
 async def _extract_psp(chd_path: Path, system: str, stem: str, fmt: str) -> Response:
@@ -1850,6 +2154,14 @@ def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
 
     if sys_up in _XBOX_SYSTEMS and getattr(entry, 'is_bundle', False):
         return 'xbox', list(_XBOX_EXTRACT_FORMATS)
+    if sys_up in _PS1_EBOOT_SYSTEMS and getattr(entry, 'is_bundle', False):
+        names = [
+            str(f.get('name', ''))
+            for f in (getattr(entry, 'bundle_files', None) or [])
+            if isinstance(f, dict)
+        ]
+        if any(Path(name).suffix.lower() in {'.cue', '.chd'} for name in names):
+            return None, ['psio']
 
     if suffix == '.chd':
         if sys_up in _PSP_SYSTEMS:
@@ -1874,16 +2186,19 @@ def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
             return 'gdi', ['gdi']
         if sys_up in _PS1_EBOOT_SYSTEMS:
             # PS1 CHD: PS3 client wants CUE/BIN, PSP client wants
-            # EBOOT.PBP.  Advertise both so each client picks its
+            # EBOOT.PBP, and PSIO wants BIN/CU2. Advertise all so each client picks its
             # native format from extract_formats[].
-            return 'cue', ['cue', 'eboot']
+            return 'cue', ['cue', 'eboot', 'psio']
         if sys_up in _CUE_SYSTEMS:
             return 'cue', ['cue']
     elif sys_up in _PS1_EBOOT_SYSTEMS and suffix in {'.cue', '.bin', '.iso', '.img'}:
         # PS1 native disc images (no CHD) — no extract needed for the
         # PS3 client (raw CUE/BIN is fine), but the PSP client needs
         # an EBOOT, so advertise that as the only option.
-        return None, ['eboot']
+        formats = ['eboot']
+        if suffix == '.cue':
+            formats.append('psio')
+        return None, formats
     elif suffix == '.rvz' and sys_up in _GC_SYSTEMS:
         return 'rvz', ['iso']
     elif sys_up in _3DS_SYSTEMS and suffix in _3DS_CART_EXTENSIONS.union({'.zip'}):

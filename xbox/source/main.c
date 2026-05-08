@@ -32,6 +32,8 @@
 
 static XboxSaveList g_list;
 static XboxRomList  g_roms;
+static XboxInstalledGameList g_installed;
+static XboxDriveSpace g_f_space;
 static XboxConfig   g_cfg;
 static SyncPlan     g_plan;
 static int          g_plan_loaded = 0;
@@ -49,10 +51,13 @@ static char         g_server_text[64] = "";
 typedef enum {
     TAB_SAVES = 0,
     TAB_GAMES = 1,
-    TAB_CONFIG = 2,
+    TAB_INSTALLED = 2,
+    TAB_CONFIG = 3,
 } UiTab;
 static UiTab g_tab = TAB_SAVES;
 static int   g_roms_loaded = 0;
+static int   g_installed_loaded = 0;
+static int   g_f_space_loaded = 0;
 
 static void set_status_kind(StatusKind kind, const char *fmt, ...)
 {
@@ -66,6 +71,23 @@ static void set_status_kind(StatusKind kind, const char *fmt, ...)
 static const char *fmt_kb(uint64_t bytes, char *buf, size_t buflen)
 {
     snprintf(buf, buflen, "%llu KB", (unsigned long long)(bytes / 1024));
+    return buf;
+}
+
+static const char *fmt_size(uint64_t bytes, char *buf, size_t buflen)
+{
+    const uint64_t mb = 1024ULL * 1024ULL;
+    const uint64_t gb = 1024ULL * mb;
+    if (bytes >= gb) {
+        uint64_t whole = bytes / gb;
+        uint64_t tenths = ((bytes % gb) * 10ULL) / gb;
+        snprintf(buf, buflen, "%llu.%llu GB",
+                 (unsigned long long)whole,
+                 (unsigned long long)tenths);
+    } else {
+        uint64_t whole = bytes / mb;
+        snprintf(buf, buflen, "%llu MB", (unsigned long long)whole);
+    }
     return buf;
 }
 
@@ -186,18 +208,31 @@ static void draw_header(void)
     int w = ui_text_width(info, UI_FONT_SMALL);
     ui_text(UI_W - UI_SAFE_X - w, 14, info, UI_TEXT_DIM, UI_FONT_SMALL);
 
-    char tabs[96];
-    snprintf(tabs, sizeof(tabs), "%s  %s  %s",
+    char tabs[128];
+    snprintf(tabs, sizeof(tabs), "%s  %s  %s  %s",
              g_tab == TAB_SAVES ? "[Saves]" : "Saves",
              g_tab == TAB_GAMES ? "[Games]" : "Games",
+             g_tab == TAB_INSTALLED ? "[Installed]" : "Installed",
              g_tab == TAB_CONFIG ? "[Config]" : "Config");
 
     // Summary line.
-    char plan[160];
+    char plan[180];
     if (g_tab == TAB_GAMES) {
         snprintf(plan, sizeof(plan), "%s   ROMs: %d   format: %s",
                  tabs, g_roms_loaded ? g_roms.count : 0,
                  games_format_name(games_config_format(&g_cfg)));
+    } else if (g_tab == TAB_INSTALLED) {
+        if (g_f_space_loaded) {
+            char free_sz[24], total_sz[24];
+            snprintf(plan, sizeof(plan), "%s   F: %s free / %s   Installed: %d",
+                     tabs,
+                     fmt_size(g_f_space.free_bytes, free_sz, sizeof(free_sz)),
+                     fmt_size(g_f_space.total_bytes, total_sz, sizeof(total_sz)),
+                     g_installed_loaded ? g_installed.count : 0);
+        } else {
+            snprintf(plan, sizeof(plan), "%s   F: space unknown   Installed: %d",
+                     tabs, g_installed_loaded ? g_installed.count : 0);
+        }
     } else if (g_tab == TAB_CONFIG) {
         snprintf(plan, sizeof(plan), "%s   A toggles values, X saves", tabs);
     } else if (g_plan_loaded) {
@@ -213,6 +248,12 @@ static void draw_header(void)
         snprintf(plan, sizeof(plan),
                  "%s   Plan: not fetched yet - press LB", tabs);
     }
+    int max_chars = (int)strlen(plan);
+    int budget = UI_W - 2 * UI_SAFE_X;
+    while (max_chars > 4) {
+        if (ui_text_width(plan, UI_FONT_BODY) <= budget) break;
+        plan[--max_chars] = '\0';
+    }
     ui_text(UI_SAFE_X, 38, plan, UI_TEXT, UI_FONT_BODY);
 }
 
@@ -224,6 +265,13 @@ static void draw_footer(void)
     if (g_tab == TAB_GAMES) {
         ui_text(UI_SAFE_X, y0 + 6,
                 "A download game  LB refresh catalog  BACK tab",
+                UI_TEXT, UI_FONT_BODY);
+        ui_text(UI_SAFE_X, y0 + 28,
+                "D-pad/Stick L/R page  START exit",
+                UI_TEXT_DIM, UI_FONT_SMALL);
+    } else if (g_tab == TAB_INSTALLED) {
+        ui_text(UI_SAFE_X, y0 + 6,
+                "Y uninstall game  LB refresh installed  BACK tab",
                 UI_TEXT, UI_FONT_BODY);
         ui_text(UI_SAFE_X, y0 + 28,
                 "D-pad/Stick L/R page  START exit",
@@ -324,6 +372,9 @@ static void draw_save_row(int row_idx, int local_count, int cursor, int y)
 static int total_rows(void)
 {
     if (g_tab == TAB_GAMES) return g_roms_loaded ? g_roms.count : 0;
+    if (g_tab == TAB_INSTALLED) {
+        return g_installed_loaded ? g_installed.count : 0;
+    }
     if (g_tab == TAB_CONFIG) return 11;
     int n = g_list.title_count;
     if (g_plan_loaded) n += g_plan.server_only_count;
@@ -351,6 +402,32 @@ static void draw_game_row(int row_idx, int cursor, int y)
     ui_text(COL_TID_X, y + 4, name_short, UI_TEXT, UI_FONT_BODY);
     char sz[24];
     fmt_kb(r->size, sz, sizeof(sz));
+    int sw = ui_text_width(sz, UI_FONT_BODY);
+    ui_text(UI_W - UI_SAFE_X - sw, y + 4, sz, UI_TEXT_DIM, UI_FONT_BODY);
+}
+
+static void draw_installed_row(int row_idx, int cursor, int y)
+{
+    int selected = (row_idx == cursor);
+    if (selected) {
+        ui_rect(UI_SAFE_X - 4, y - 2, UI_W - 2 * UI_SAFE_X + 8, ROW_H,
+                UI_ROW_BG_SEL);
+    }
+    if (row_idx < 0 || row_idx >= g_installed.count) return;
+
+    const XboxInstalledGame *game = &g_installed.games[row_idx];
+    ui_rect(COL_BADGE_X, y + 2, COL_BADGE_W, ROW_H - 6, UI_STATUS_OK);
+    {
+        UiColor dark = { 0x10, 0x20, 0x18, 0xFF };
+        ui_text(COL_BADGE_X + 6, y + 5, "HDD ", dark, UI_FONT_SMALL);
+    }
+
+    char name_short[72];
+    short_str(game->name, name_short, 56);
+    ui_text(COL_TID_X, y + 4, name_short, UI_TEXT, UI_FONT_BODY);
+
+    char sz[24];
+    fmt_size(game->size, sz, sizeof(sz));
     int sw = ui_text_width(sz, UI_FONT_BODY);
     ui_text(UI_W - UI_SAFE_X - sw, y + 4, sz, UI_TEXT_DIM, UI_FONT_BODY);
 }
@@ -406,6 +483,8 @@ static void draw_row(int row_idx, int local_count, int cursor, int y)
 {
     if (g_tab == TAB_GAMES) {
         draw_game_row(row_idx, cursor, y);
+    } else if (g_tab == TAB_INSTALLED) {
+        draw_installed_row(row_idx, cursor, y);
     } else if (g_tab == TAB_CONFIG) {
         draw_config_row(row_idx, cursor, y);
     } else {
@@ -430,6 +509,9 @@ static void redraw(int cursor, int scroll)
         if (g_tab == TAB_GAMES) {
             msg = g_roms_loaded ? "No Xbox ROMs in server catalog."
                                 : "Press LB to load Xbox ROM catalog.";
+        } else if (g_tab == TAB_INSTALLED) {
+            msg = g_installed_loaded ? "No installed games in F:\\Games."
+                                     : "Press LB to scan installed games.";
         }
         ui_text(UI_SAFE_X, y + 24, msg, UI_TEXT_DIM, UI_FONT_BODY);
     } else {
@@ -815,6 +897,35 @@ static void load_rom_catalog(void)
     set_status_kind(UI_STATUS_SUCCESS_KIND, "Loaded %d Xbox ROM(s)", g_roms.count);
 }
 
+static void load_installed_games(void)
+{
+    char err[180] = "";
+    set_status_kind(UI_STATUS_BUSY_KIND, "Scanning F:\\Games...");
+
+    if (games_scan_installed(&g_cfg, &g_installed, err, sizeof(err)) != 0) {
+        g_installed_loaded = 0;
+        if (games_get_f_drive_space(&g_f_space, err, sizeof(err)) == 0) {
+            g_f_space_loaded = 1;
+        }
+        set_status_kind(UI_STATUS_ERROR_KIND, "%s",
+                        err[0] ? err : "Installed game scan failed");
+        return;
+    }
+
+    g_installed_loaded = 1;
+    if (games_get_f_drive_space(&g_f_space, err, sizeof(err)) == 0) {
+        g_f_space_loaded = 1;
+    } else {
+        g_f_space_loaded = 0;
+    }
+
+    char used[24];
+    set_status_kind(UI_STATUS_SUCCESS_KIND,
+                    "Installed: %d game(s), %s used",
+                    g_installed.count,
+                    fmt_size(g_installed.total_size, used, sizeof(used)));
+}
+
 typedef struct {
     int cursor;
     int scroll;
@@ -900,11 +1011,103 @@ static void run_game_download(int cursor, int scroll)
     int rc = games_download_rom(&g_cfg, rom, fmt, game_progress_cb, &ctx,
                                 err, sizeof(err));
     if (rc == 0) {
+        g_installed_loaded = 0;
+        g_f_space_loaded =
+            games_get_f_drive_space(&g_f_space, NULL, 0) == 0;
         set_status_kind(UI_STATUS_SUCCESS_KIND, "Game installed: %s", rom->name);
     } else {
         set_status_kind(UI_STATUS_ERROR_KIND, "%s",
                         err[0] ? err : "Game download failed");
     }
+}
+
+static int confirm_game_uninstall(int cursor, int scroll,
+                                  const XboxInstalledGame *game)
+{
+    redraw(cursor, scroll);
+    UiColor border = UI_STATUS_CONFLICT;
+    UiColor panel  = { 0x08, 0x1A, 0x13, 0xFF };
+    UiColor head   = { 0x36, 0x18, 0x18, 0xFF };
+    UiColor dark   = { 0x0B, 0x18, 0x10, 0xFF };
+
+    const int x = 54, y = 132, w = 532, h = 198;
+    ui_rect(x - 2, y - 2, w + 4, h + 4, border);
+    ui_rect(x, y, w, h, panel);
+    ui_rect(x, y, w, 34, head);
+    ui_text(x + 14, y + 7, "Confirm uninstall", UI_STATUS_CONFLICT,
+            UI_FONT_BODY);
+
+    char line[180];
+    char short_name[80];
+    char short_path[88];
+    short_str(game->name, short_name, 64);
+    short_str(game->path, short_path, 72);
+    snprintf(line, sizeof(line), "%s", short_name);
+    ui_text(x + 14, y + 50, line, UI_TEXT, UI_FONT_BODY);
+
+    char size_buf[24];
+    snprintf(line, sizeof(line), "%s   %u file(s)",
+             fmt_size(game->size, size_buf, sizeof(size_buf)),
+             (unsigned)game->file_count);
+    ui_text(x + 14, y + 80, line, UI_TEXT_DIM, UI_FONT_SMALL);
+
+    snprintf(line, sizeof(line), "Folder: %s", short_path);
+    ui_text(x + 14, y + 106, line, UI_TEXT_DIM, UI_FONT_SMALL);
+    ui_text(x + 14, y + 132,
+            "This permanently deletes the installed game folder.",
+            UI_TEXT_DIM, UI_FONT_SMALL);
+
+    ui_rect(x + 14, y + h - 44, 150, 28, UI_STATUS_OK);
+    ui_text(x + 36, y + h - 39, "A confirm", dark, UI_FONT_SMALL);
+    ui_rect(x + 184, y + h - 44, 130, 28, UI_STATUS_CONFLICT);
+    ui_text(x + 210, y + h - 39, "B cancel", dark, UI_FONT_SMALL);
+    ui_present();
+
+    while (1) {
+        ui_pump();
+        UiKey k = ui_poll_key();
+        if (k == UI_KEY_A) return 1;
+        if (k == UI_KEY_B || k == UI_KEY_BACK || k == UI_KEY_START) {
+            set_status_kind(UI_STATUS_INFO_KIND, "Uninstall cancelled");
+            return 0;
+        }
+        ui_sleep(20);
+    }
+}
+
+static void run_game_uninstall(int cursor, int scroll)
+{
+    if (!g_installed_loaded || g_installed.count <= 0) {
+        set_status_kind(UI_STATUS_ERROR_KIND, "Scan installed games first (LB)");
+        return;
+    }
+    if (cursor < 0 || cursor >= g_installed.count) return;
+
+    XboxInstalledGame game = g_installed.games[cursor];
+    if (!confirm_game_uninstall(cursor, scroll, &game)) return;
+
+    char err[180] = "";
+    set_status_kind(UI_STATUS_BUSY_KIND, "Uninstalling %s...", game.name);
+    redraw(cursor, scroll);
+
+    if (games_uninstall_installed(&g_cfg, &game, err, sizeof(err)) != 0) {
+        set_status_kind(UI_STATUS_ERROR_KIND, "%s",
+                        err[0] ? err : "Uninstall failed");
+        return;
+    }
+
+    if (games_scan_installed(&g_cfg, &g_installed, err, sizeof(err)) == 0) {
+        g_installed_loaded = 1;
+    } else {
+        g_installed_loaded = 0;
+    }
+    if (games_get_f_drive_space(&g_f_space, err, sizeof(err)) == 0) {
+        g_f_space_loaded = 1;
+    } else {
+        g_f_space_loaded = 0;
+    }
+
+    set_status_kind(UI_STATUS_SUCCESS_KIND, "Uninstalled: %s", game.name);
 }
 
 static void config_cycle_selected(int row)
@@ -1186,6 +1389,8 @@ int main(void)
         case UI_KEY_LB:
             if (g_tab == TAB_GAMES) {
                 load_rom_catalog();
+            } else if (g_tab == TAB_INSTALLED) {
+                load_installed_games();
             } else if (g_tab == TAB_CONFIG) {
                 config_reload();
             } else {
@@ -1208,12 +1413,15 @@ int main(void)
             if (g_tab == TAB_SAVES) clear_hash_cache();
             redraw_needed = 1; break;
         case UI_KEY_BACK:
-            g_tab = (UiTab)(((int)g_tab + 1) % 3);
+            g_tab = (UiTab)(((int)g_tab + 1) % 4);
             cursor = 0;
             scroll = 0;
             if (g_tab == TAB_GAMES && !g_roms_loaded) {
                 redraw(cursor, scroll);
                 load_rom_catalog();
+            } else if (g_tab == TAB_INSTALLED && !g_installed_loaded) {
+                redraw(cursor, scroll);
+                load_installed_games();
             }
             redraw_needed = 1; break;
         case UI_KEY_A:
@@ -1221,6 +1429,7 @@ int main(void)
                 run_game_download(cursor, scroll);
                 redraw_needed = 1; break;
             }
+            if (g_tab == TAB_INSTALLED) { redraw_needed = 1; break; }
             if (g_tab == TAB_CONFIG) {
                 config_cycle_selected(cursor);
                 redraw_needed = 1; break;
@@ -1238,6 +1447,11 @@ int main(void)
             clamp_cursor_scroll(&cursor, &scroll);
             redraw_needed = 1; break;
         case UI_KEY_Y:
+            if (g_tab == TAB_INSTALLED) {
+                run_game_uninstall(cursor, scroll);
+                clamp_cursor_scroll(&cursor, &scroll);
+                redraw_needed = 1; break;
+            }
             if (g_tab != TAB_SAVES) { redraw_needed = 1; break; }
             run_sync_one(cursor, scroll, k);
             clamp_cursor_scroll(&cursor, &scroll);

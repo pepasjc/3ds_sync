@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 dist/
 .venv/
 venv/
@@ -58,6 +63,8 @@ config.txt
 
 # uv
 *.lock
+.uv-cache/
+.uv-cache-local/
 
 # OS
 .DS_Store
@@ -69,27 +76,90 @@ Thumbs.db
 # tools
 tools/roms
 tools/logs
+tools/__pycache__/
 
 # desktop
 desktop/dats
 desktop/logs
 desktop/ps3saves
+desktop/__pycache__/
+desktop/**/__pycache__/
+desktop/*.log
 
 # others
 *.json
 *.exe
 *.bak
 *.lst
+*.zip
+*.tmp
+*.temp
 build_output/
+nul
+
+# Local game/save dumps and conversion scratch files
+*.3ds
+*.cia
+*.nds
+*.srl
+*.gba
+*.gb
+*.gbc
+*.nes
+*.sfc
+*.smc
+*.n64
+*.z64
+*.v64
+*.iso
+*.cso
+*.chd
+*.cue
+*.gdi
+*.pbp
+*.PBP
+*.sav
+*.srm
+*.mcd
+*.MCD
+*.vmp
+*.VMP
+*.bkr
+*.BKR
+*.psv
+*.PSV
+*.bin
+*.BIN
+
+# Scratch notes, debug captures, and extracted save folders
+*_debug.txt
+*_debug.log
+3ds/*_after_scan.txt
+scan_debug.log
+session-*.md
+session_*.txt
+tmp_*/
+SLUS*/
 
 # ps3
 ps3/debug/
 ps3/build/
 ps3/tools/
+ps3/apollo-ps3/
 *.pkg
 *.self
 *.elf
-android/.gradle-user/caches/*
+
+# PS2 build artifacts
+ps2/build/
+ps2/*.elf
+ps2/*.irx
+ps2/*.iso
+ps2/*.map
+ps2/source/*.o
+
+# External/reference checkouts
+external/
 
 # server build artifacts
 # mcr2vmp is auto-compiled from the adjacent .c sources by

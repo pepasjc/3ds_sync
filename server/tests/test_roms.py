@@ -829,6 +829,87 @@ class TestRomCatalog:
         assert r2.headers["content-type"] == "application/octet-stream"
         assert r2.content == b"PBP:DISC"
 
+    def test_ps1_cue_bundle_advertises_and_downloads_psio(
+        self, tmp_path, client, auth_headers
+    ):
+        """PSIO profiles need BIN/CU2 output, including PS1 bundle rows."""
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+        import io
+        import zipfile as zf_mod
+
+        original = settings.rom_dir
+        try:
+            rom_db.init_db(tmp_path)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+
+            bundle = rom_dir / "psx" / "Ridge Racer"
+            bundle.mkdir(parents=True)
+            (bundle / "Ridge Racer.bin").write_bytes(b"\0" * 2352 * 300)
+            (bundle / "Ridge Racer.cue").write_text(
+                "\n".join(
+                    [
+                        'FILE "Ridge Racer.bin" BINARY',
+                        "  TRACK 01 MODE2/2352",
+                        "    INDEX 01 00:02:00",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rom_scanner.init(rom_dir)
+            rom = rom_scanner.get().list_by_system("PS1")[0]
+
+            catalog_resp = client.get("/api/v1/roms?system=PS1", headers=auth_headers)
+            assert catalog_resp.status_code == 200
+            assert "psio" in catalog_resp.json()["roms"][0]["extract_formats"]
+
+            resp = client.get(
+                f"/api/v1/roms/{rom.rom_id}?extract=psio", headers=auth_headers
+            )
+            assert resp.status_code == 200
+            assert resp.headers["content-type"] == "application/zip"
+            with zf_mod.ZipFile(io.BytesIO(resp.content)) as zf:
+                assert sorted(zf.namelist()) == ["Ridge Racer.bin", "Ridge Racer.cu2"]
+                assert zf.read("Ridge Racer.bin") == b"\0" * 2352 * 300
+                assert "01_01 41 00:00:00 00:00:00 00:02:00" in zf.read(
+                    "Ridge Racer.cu2"
+                ).decode("utf-8")
+        finally:
+            settings.rom_dir = original
+            rom_scanner._catalog = None
+
+    def test_cue_to_cu2_writer_handles_track_offsets(self, tmp_path):
+        from app.routes.roms import _cue_to_cu2_text
+
+        (tmp_path / "game.bin").write_bytes(b"\0" * 2352 * 600)
+        cue = tmp_path / "game.cue"
+        cue.write_text(
+            "\n".join(
+                [
+                    'FILE "game.bin" BINARY',
+                    "  TRACK 01 MODE2/2352",
+                    "    INDEX 01 00:02:00",
+                    "  TRACK 02 AUDIO",
+                    "    INDEX 00 00:04:00",
+                    "    INDEX 01 00:06:00",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        text, refs = _cue_to_cu2_text(cue)
+
+        assert refs == [tmp_path / "game.bin"]
+        assert text.splitlines() == [
+            "01_01 41 00:00:00 00:00:00 00:02:00",
+            "02_00 01 00:04:00 00:04:00 00:02:00",
+            "02_01 01 00:06:00 00:04:00 00:02:00",
+        ]
+
     def test_ps1_eboot_unconfigured_returns_503(
         self, rom_dir, client, auth_headers
     ):

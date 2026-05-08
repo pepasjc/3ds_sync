@@ -55,6 +55,13 @@ const char *games_format_name(XboxGameFormat fmt)
     return fmt == XBOX_GAME_FORMAT_FOLDER ? "folder" : "cci";
 }
 
+static const char *install_dir_for(const XboxConfig *cfg)
+{
+    return (cfg && cfg->game_install_dir[0])
+        ? cfg->game_install_dir
+        : "F:\\Games";
+}
+
 static void join_url(const char *base, const char *path,
                      char *buf, int buf_len)
 {
@@ -97,9 +104,7 @@ static int ensure_dir(const char *path)
 
 int games_mount_target(const XboxConfig *cfg, char *err, int err_len)
 {
-    const char *dir = (cfg && cfg->game_install_dir[0])
-        ? cfg->game_install_dir
-        : "F:\\Games";
+    const char *dir = install_dir_for(cfg);
     char drive = toupper((unsigned char)dir[0]);
     if (drive == 'F' && !nxIsDriveMounted('F')) {
         nxMountDrive('F', "\\Device\\Harddisk0\\Partition6\\");
@@ -138,9 +143,7 @@ static void make_target_dir(const XboxConfig *cfg, const XboxRomEntry *rom,
     char folder[64];
     sanitize_folder_name(rom->name[0] ? rom->name : rom->rom_id,
                          folder, sizeof(folder));
-    const char *base = (cfg && cfg->game_install_dir[0])
-        ? cfg->game_install_dir
-        : "F:\\Games";
+    const char *base = install_dir_for(cfg);
     int blen = (int)strlen(base);
     while (blen > 0 && (base[blen - 1] == '\\' || base[blen - 1] == '/')) {
         blen--;
@@ -534,5 +537,265 @@ int games_download_rom(const XboxConfig *cfg,
     if (progress) {
         progress("Game download complete", z.http_done, z.http_total, progress_user);
     }
+    return 0;
+}
+
+static void clean_install_dir(const XboxConfig *cfg, char *out, int out_len)
+{
+    const char *base = install_dir_for(cfg);
+    snprintf(out, out_len, "%s", base);
+    int len = (int)strlen(out);
+    while (len > 3 && (out[len - 1] == '\\' || out[len - 1] == '/')) {
+        out[--len] = '\0';
+    }
+}
+
+static int cmp_ci(const char *a, const char *b)
+{
+    if (!a) a = "";
+    if (!b) b = "";
+    while (*a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static int installed_cmp(const void *va, const void *vb)
+{
+    const XboxInstalledGame *a = (const XboxInstalledGame *)va;
+    const XboxInstalledGame *b = (const XboxInstalledGame *)vb;
+    return cmp_ci(a->name, b->name);
+}
+
+static void scan_installed_tree(const char *root, XboxInstalledGame *game)
+{
+    char search[XBOX_INSTALLED_PATH_MAX * 2];
+    int n = snprintf(search, sizeof(search), "%s\\*", root);
+    if (n <= 0 || n >= (int)sizeof(search)) return;
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 ||
+            strcmp(fd.cFileName, "..") == 0) {
+            continue;
+        }
+
+        char child[XBOX_INSTALLED_PATH_MAX * 2];
+        n = snprintf(child, sizeof(child), "%s\\%s", root, fd.cFileName);
+        if (n <= 0 || n >= (int)sizeof(child)) continue;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            game->dir_count++;
+            scan_installed_tree(child, game);
+        } else {
+            uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32)
+                          | (uint64_t)fd.nFileSizeLow;
+            game->size += size;
+            game->file_count++;
+        }
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+}
+
+int games_scan_installed(const XboxConfig *cfg,
+                         XboxInstalledGameList *out,
+                         char *err,
+                         int err_len)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    if (games_mount_target(cfg, err, err_len) != 0) return -1;
+
+    char base[XBOX_INSTALLED_PATH_MAX];
+    clean_install_dir(cfg, base, sizeof(base));
+
+    char search[XBOX_INSTALLED_PATH_MAX * 2];
+    int n = snprintf(search, sizeof(search), "%s\\*", base);
+    if (n <= 0 || n >= (int)sizeof(search)) {
+        if (err) snprintf(err, err_len, "Install path too long");
+        return -1;
+    }
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_NO_MORE_FILES) {
+            return 0;
+        }
+        if (err) snprintf(err, err_len, "Could not read %s", base);
+        return -1;
+    }
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, ".") == 0 ||
+            strcmp(fd.cFileName, "..") == 0) {
+            continue;
+        }
+        if (out->count >= XBOX_MAX_INSTALLED_GAMES) break;
+
+        XboxInstalledGame *game = &out->games[out->count++];
+        snprintf(game->name, sizeof(game->name), "%s", fd.cFileName);
+        n = snprintf(game->path, sizeof(game->path),
+                     "%s\\%s", base, fd.cFileName);
+        if (n <= 0 || n >= (int)sizeof(game->path)) {
+            out->count--;
+            continue;
+        }
+        game->dir_count = 1;
+        scan_installed_tree(game->path, game);
+        out->total_size += game->size;
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+
+    if (out->count > 1) {
+        qsort(out->games, out->count, sizeof(out->games[0]), installed_cmp);
+    }
+    return 0;
+}
+
+static int path_has_parent_ref(const char *path)
+{
+    if (!path) return 1;
+    if (strstr(path, "..")) return 1;
+    return 0;
+}
+
+static int path_is_child_of_base(const char *path, const char *base)
+{
+    if (!path || !base || !path[0] || !base[0]) return 0;
+
+    int blen = (int)strlen(base);
+    for (int i = 0; i < blen; i++) {
+        if (!path[i]) return 0;
+        if (tolower((unsigned char)path[i]) !=
+            tolower((unsigned char)base[i])) {
+            return 0;
+        }
+    }
+
+    char next = path[blen];
+    if (next != '\\' && next != '/') return 0;
+    if (path[blen + 1] == '\0') return 0;
+    return !path_has_parent_ref(path + blen + 1);
+}
+
+static int delete_tree(const char *path, char *err, int err_len)
+{
+    char search[XBOX_INSTALLED_PATH_MAX * 2];
+    int n = snprintf(search, sizeof(search), "%s\\*", path);
+    if (n <= 0 || n >= (int)sizeof(search)) {
+        if (err) snprintf(err, err_len, "Path too long");
+        return -1;
+    }
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 ||
+                strcmp(fd.cFileName, "..") == 0) {
+                continue;
+            }
+
+            char child[XBOX_INSTALLED_PATH_MAX * 2];
+            n = snprintf(child, sizeof(child), "%s\\%s", path, fd.cFileName);
+            if (n <= 0 || n >= (int)sizeof(child)) {
+                FindClose(h);
+                if (err) snprintf(err, err_len, "Path too long");
+                return -1;
+            }
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (delete_tree(child, err, err_len) != 0) {
+                    FindClose(h);
+                    return -1;
+                }
+            } else {
+                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
+                if (!DeleteFileA(child)) {
+                    DWORD code = GetLastError();
+                    FindClose(h);
+                    if (err) snprintf(err, err_len,
+                                      "Delete failed %s (%lu)",
+                                      fd.cFileName,
+                                      (unsigned long)code);
+                    return -1;
+                }
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    if (!RemoveDirectoryA(path)) {
+        DWORD code = GetLastError();
+        if (err) snprintf(err, err_len,
+                          "Remove failed %s (%lu)",
+                          path,
+                          (unsigned long)code);
+        return -1;
+    }
+    return 0;
+}
+
+int games_uninstall_installed(const XboxConfig *cfg,
+                              const XboxInstalledGame *game,
+                              char *err,
+                              int err_len)
+{
+    if (!game || !game->path[0]) {
+        if (err) snprintf(err, err_len, "No installed game selected");
+        return -1;
+    }
+
+    char base[XBOX_INSTALLED_PATH_MAX];
+    clean_install_dir(cfg, base, sizeof(base));
+    if (!path_is_child_of_base(game->path, base)) {
+        if (err) snprintf(err, err_len,
+                          "Refusing to delete outside %s", base);
+        return -1;
+    }
+
+    return delete_tree(game->path, err, err_len);
+}
+
+int games_get_f_drive_space(XboxDriveSpace *out, char *err, int err_len)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    if (!nxIsDriveMounted('F')) {
+        nxMountDrive('F', "\\Device\\Harddisk0\\Partition6\\");
+    }
+
+    DWORD sectors_per_cluster = 0;
+    DWORD bytes_per_sector = 0;
+    DWORD free_clusters = 0;
+    DWORD total_clusters = 0;
+    if (!GetDiskFreeSpaceA("F:\\",
+                           &sectors_per_cluster,
+                           &bytes_per_sector,
+                           &free_clusters,
+                           &total_clusters)) {
+        if (err) snprintf(err, err_len, "Could not read F: disk space");
+        return -1;
+    }
+
+    uint64_t cluster_size = (uint64_t)sectors_per_cluster
+                          * (uint64_t)bytes_per_sector;
+    out->free_bytes = cluster_size * (uint64_t)free_clusters;
+    out->total_bytes = cluster_size * (uint64_t)total_clusters;
     return 0;
 }

@@ -457,6 +457,7 @@ All endpoints except `GET /` and `GET /api/v1/status` require `X-API-Key` header
 | `GET` | `/api/v1/roms/scan` | Trigger ROM directory rescan (admin only) |
 | `GET` | `/api/v1/roms/{title_id}` | Download ROM file (supports HTTP Range) |
 | `GET` | `/api/v1/roms/{title_id}?extract=cue` | CHD → CUE/BIN ZIP |
+| `GET` | `/api/v1/roms/{title_id}?extract=psio` | PS1 CHD/CUE → PSIO BIN/CU2 ZIP |
 | `GET` | `/api/v1/roms/{title_id}?extract=gdi` | CHD → GDI ZIP (Dreamcast) |
 | `GET` | `/api/v1/roms/{title_id}?extract=iso` | CHD → ISO (PSP) |
 | `GET` | `/api/v1/roms/{title_id}?extract=cso` | CHD → CSO (PSP, requires `ciso`) |

@@ -21,6 +21,8 @@ DEVICE_TYPES = [
     "SAROO",
     "EmuDeck",
     "MemCard Pro",
+    "MemCard Pro FTP",
+    "PSIO",
     "CD Folder",
 ]
 
