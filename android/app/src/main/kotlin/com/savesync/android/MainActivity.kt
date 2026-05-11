@@ -65,9 +65,9 @@ class MainActivity : ComponentActivity() {
     val hasStoragePermission: StateFlow<Boolean> = _hasStoragePermission
 
     // ── Gamepad plumbing ─────────────────────────────────────────────────────
-    // L1/R1 (digital shoulders) cycle the top-level tabs globally; MainApp
-    // observes this flow to drive navController.  L2/R2 (digital OR analog
-    // trigger) cycle the system filter on whichever list is focused; each
+    // L2/R2 (digital OR analog trigger) cycle the top-level tabs globally;
+    // MainApp observes this flow to drive navController.  L1/R1 (digital
+    // shoulders) cycle the system filter on whichever list is focused; each
     // screen subscribes to systemCycleEvents and runs its own filter step.
     private val _tabCycleEvents = MutableSharedFlow<Int>(extraBufferCapacity = 8)
     val tabCycleEvents: SharedFlow<Int> = _tabCycleEvents
@@ -127,17 +127,17 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Intercept L1/R1 and L2/R2 globally BEFORE any Compose handler sees them.
-     *   * L1/R1 → cycle the top-level tab (saves / catalog / installed / downloads)
-     *   * L2/R2 → cycle the system filter on the focused list
+     *   * L1/R1 → cycle the system filter on the focused list
+     *   * L2/R2 → cycle the top-level tab (saves / catalog / installed / downloads)
      * Analog-only triggers are handled in [dispatchGenericMotionEvent] below.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_BUTTON_L1 -> { _tabCycleEvents.tryEmit(-1); return true }
-                KeyEvent.KEYCODE_BUTTON_R1 -> { _tabCycleEvents.tryEmit(1); return true }
-                KeyEvent.KEYCODE_BUTTON_L2 -> { _systemCycleEvents.tryEmit(-1); return true }
-                KeyEvent.KEYCODE_BUTTON_R2 -> { _systemCycleEvents.tryEmit(1); return true }
+                KeyEvent.KEYCODE_BUTTON_L1 -> { _systemCycleEvents.tryEmit(-1); return true }
+                KeyEvent.KEYCODE_BUTTON_R1 -> { _systemCycleEvents.tryEmit(1); return true }
+                KeyEvent.KEYCODE_BUTTON_L2 -> { _tabCycleEvents.tryEmit(-1); return true }
+                KeyEvent.KEYCODE_BUTTON_R2 -> { _tabCycleEvents.tryEmit(1); return true }
             }
         }
         return super.dispatchKeyEvent(event)
@@ -163,11 +163,11 @@ class MainActivity : ComponentActivity() {
             return super.dispatchGenericMotionEvent(event)
         }
 
-        // ── L2/R2 analog trigger fallback → system cycle ─────────────────
+        // ── L2/R2 analog trigger fallback → tab cycle ────────────────────
         // Some controllers (PS4/PS5 over Bluetooth, certain Xbox pads) only
         // emit analog AXIS_LTRIGGER/RTRIGGER values, never the digital
-        // KEYCODE_BUTTON_L2/R2. Mirror the digital path here so the system
-        // filter cycles either way.
+        // KEYCODE_BUTTON_L2/R2. Mirror the digital path here so the tab
+        // cycles either way.
         val lt = maxOf(
             event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
             event.getAxisValue(MotionEvent.AXIS_BRAKE),
@@ -178,8 +178,8 @@ class MainActivity : ComponentActivity() {
         )
         val ltDown = lt > TRIGGER_THRESHOLD
         val rtDown = rt > TRIGGER_THRESHOLD
-        if (ltDown && !lastLeftTrigger) _systemCycleEvents.tryEmit(-1)
-        if (rtDown && !lastRightTrigger) _systemCycleEvents.tryEmit(1)
+        if (ltDown && !lastLeftTrigger) _tabCycleEvents.tryEmit(-1)
+        if (rtDown && !lastRightTrigger) _tabCycleEvents.tryEmit(1)
         lastLeftTrigger = ltDown
         lastRightTrigger = rtDown
 
@@ -303,9 +303,9 @@ private fun MainApp() {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
-    // Wire L1/R1 → cycle tabs. The Activity emits on a SharedFlow and we
+    // Wire L2/R2 → cycle tabs. The Activity emits on a SharedFlow and we
     // translate it into a navController.navigate() here so the NavHost is
-    // the single source of truth for which tab is visible. L2/R2 emits on
+    // the single source of truth for which tab is visible. L1/R1 emits on
     // a separate systemCycleEvents flow that each screen subscribes to.
     val activity = LocalContext.current.findComponentActivity() as? MainActivity
     LaunchedEffect(activity, navController) {

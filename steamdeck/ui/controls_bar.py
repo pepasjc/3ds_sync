@@ -71,8 +71,8 @@ class ControlsBar(QWidget):
         ("B", "BTN_B", "Exit"),
         ("X", "BTN_X", "Sync"),
         ("Y", "BTN_Y", "Refresh"),
-        ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "System"),
+        ("L1/R1", "BTN_L", "System"),
+        ("L2/R2", "BTN_L", "Tab"),
         ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
@@ -81,8 +81,8 @@ class ControlsBar(QWidget):
         ("A", "BTN_A", "Download"),
         ("B", "BTN_B", "Exit"),
         ("Y", "BTN_Y", "Search"),
-        ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "System"),
+        ("L1/R1", "BTN_L", "System"),
+        ("L2/R2", "BTN_L", "Tab"),
         ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
@@ -91,8 +91,8 @@ class ControlsBar(QWidget):
         ("A", "BTN_B", "Delete"),
         ("B", "BTN_B", "Exit"),
         ("Y", "BTN_Y", "Search"),
-        ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "System"),
+        ("L1/R1", "BTN_L", "System"),
+        ("L2/R2", "BTN_L", "Tab"),
         ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
@@ -103,7 +103,7 @@ class ControlsBar(QWidget):
     _HINTS_DOWNLOADS: list[tuple[str, str, str]] = [
         ("B", "BTN_B", "Exit"),
         ("Y", "BTN_Y", "Clear finished"),
-        ("L1/R1", "BTN_L", "Tab"),
+        ("L2/R2", "BTN_L", "Tab"),
         ("☰", "BTN_S", "Settings"),
     ]
 

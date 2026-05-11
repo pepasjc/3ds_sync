@@ -65,6 +65,9 @@ import com.savesync.android.ui.MainViewModel
 import com.savesync.android.ui.SaveDetailState
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
+import com.savesync.android.ui.components.firstLetter
+import com.savesync.android.ui.components.onPress
+import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 
 /**
@@ -104,6 +107,8 @@ fun InstalledGamesScreen(
     // ── Gamepad navigation state ────────────────────────────────────────
     var selectedIndex by remember { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
+    // Hold-to-accelerate state for d-pad left/right (page → alphabet jump).
+    val holdNav = rememberHoldNavState()
     val listFocusRequester = remember { FocusRequester() }
     val searchFocusRequester = remember { FocusRequester() }
 
@@ -251,25 +256,42 @@ fun InstalledGamesScreen(
                             }
                             true
                         }
-                        // D-pad / stick left/right → page-scroll the list.
-                        // System filter cycle moved to L2/R2 (Activity level).
-                        Key.DirectionLeft -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
-                            true
-                        }
-                        Key.DirectionRight -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex + page)
-                                    .coerceAtMost(filtered.size - 1)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
+                        // D-pad / stick left/right → page scroll, ramping
+                        // into alphabet jump on long hold (see HoldNav).
+                        // System filter cycle is on L1/R1 (Activity level).
+                        Key.DirectionLeft, Key.DirectionRight -> {
+                            val dir = if (event.key == Key.DirectionLeft) -1 else 1
+                            holdNav.onPress(
+                                dir,
+                                onPage = { d ->
+                                    if (filtered.isNotEmpty()) {
+                                        val page = listState.layoutInfo.visibleItemsInfo.size
+                                            .coerceAtLeast(1)
+                                        selectedIndex = (selectedIndex + d * page)
+                                            .coerceIn(0, filtered.size - 1)
+                                        scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                    }
+                                },
+                                onAlphabet = { d ->
+                                    if (filtered.isNotEmpty()) {
+                                        val cur = selectedIndex.coerceIn(0, filtered.size - 1)
+                                        val curLetter = firstLetter(filtered[cur].displayName)
+                                        val step = if (d > 0) 1 else -1
+                                        var row = cur + step
+                                        var found = -1
+                                        while (row in filtered.indices) {
+                                            val ltr = firstLetter(filtered[row].displayName)
+                                            if (ltr.isNotEmpty() && ltr != curLetter) {
+                                                found = row; break
+                                            }
+                                            row += step
+                                        }
+                                        selectedIndex = if (found >= 0) found
+                                            else if (d > 0) filtered.size - 1 else 0
+                                        scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                    }
+                                },
+                            )
                             true
                         }
                         Key.ButtonA, Key.Enter -> {

@@ -72,6 +72,18 @@ logger = logging.getLogger(__name__)
 SKIP_NAMES = frozenset({"metadata.txt", "systeminfo.txt"})
 _ARCHIVE_EXTENSIONS = frozenset({".zip", ".7z", ".rar"})
 
+# Directory names that should never be walked as part of a rom catalog,
+# regardless of where they appear under ``rom_dir``.  The conversion cache
+# (``_conversion_cache``) is the practical case: when an operator sets
+# ``tmp_dir`` to a path nested inside ``rom_dir`` the scanner would otherwise
+# index hashed cache outputs (e.g. ``Foo_fda7066b29d259e8.cso``) as legit
+# catalog entries, which then leak the cache hash into client-side filenames.
+SKIP_DIR_NAMES = frozenset({"_conversion_cache"})
+
+
+def _is_inside_skipped_dir(file_path: Path) -> bool:
+    return any(part in SKIP_DIR_NAMES for part in file_path.parts)
+
 # Extensions that join a PS3 bundle even though they aren't ROM_EXTENSIONS
 # in their own right — .rap files are PSN activation tickets the PS3 needs
 # alongside the .pkg, and they always travel together.
@@ -466,6 +478,8 @@ class RomCatalog:
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
                 continue
+            if _is_inside_skipped_dir(file_path):
+                continue
             if file_path.name.lower() in SKIP_NAMES:
                 continue
             if file_path.suffix.lower() not in ROM_EXTENSIONS:
@@ -523,6 +537,8 @@ class RomCatalog:
 
         for sub in sorted(folder.iterdir()):
             if not sub.is_dir():
+                continue
+            if sub.name in SKIP_DIR_NAMES:
                 continue
             has_cci = any(
                 f.is_file() and f.suffix.lower() in _XBOX_BUNDLE_TRIGGER_EXTS
@@ -587,6 +603,8 @@ class RomCatalog:
         # ── Pass 2: ISO files outside CCI bundles ─────────────────────
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
                 continue
             if file_path.resolve() in bundled_paths:
                 continue
@@ -666,6 +684,8 @@ class RomCatalog:
         for sub in sorted(folder.iterdir()):
             if not sub.is_dir():
                 continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
             # Walk the subfolder; if any descendant is a .pkg the whole
             # subfolder graduates to bundle status.
             has_pkg = any(
@@ -742,6 +762,8 @@ class RomCatalog:
         # ── Pass 2: top-level files (loose ISOs, etc.) ────────────────
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
                 continue
             if file_path.resolve() in bundled_paths:
                 continue
@@ -820,6 +842,8 @@ class RomCatalog:
         for sub in sorted(folder.iterdir()):
             if not sub.is_dir():
                 continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
             has_trigger = any(
                 f.is_file() and f.suffix.lower() in _PS1_BUNDLE_TRIGGER_EXTS
                 for f in sub.rglob("*")
@@ -881,6 +905,8 @@ class RomCatalog:
         # ── Pass 2: top-level files ───────────────────────────────────
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
                 continue
             if file_path.resolve() in bundled_paths:
                 continue

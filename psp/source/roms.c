@@ -295,6 +295,26 @@ static const char *file_extension(const char *filename) {
     return dot ? dot : "";
 }
 
+/* Server's conversion cache writes its outputs as
+ * ``<source_stem>_<16-char-hex>.<ext>`` so multiple cached variants of
+ * the same source can coexist on disk.  When that cache dir leaks into
+ * the rom catalog (tmp_dir nested under rom_dir, etc.) the hash suffix
+ * rides along into the filename the client receives.  Strip it on the
+ * way to target_path so saves land at the expected human-readable name. */
+static void strip_cache_hash_suffix(char *stem) {
+    if (!stem) return;
+    size_t len = strlen(stem);
+    if (len < 17 || stem[len - 17] != '_') return;
+    for (size_t i = len - 16; i < len; i++) {
+        char c = stem[i];
+        bool is_hex = (c >= '0' && c <= '9') ||
+                      (c >= 'a' && c <= 'f') ||
+                      (c >= 'A' && c <= 'F');
+        if (!is_hex) return;
+    }
+    stem[len - 17] = '\0';
+}
+
 /* Strip filesystem-unsafe chars + collapse whitespace.  Used for the
  * per-game subfolder name when routing PS1 EBOOTs. */
 static void sanitize_name(const char *in, char *out, size_t out_size) {
@@ -420,9 +440,18 @@ bool roms_resolve_target_path(const RomEntry *rom,
             if (stem_len >= sizeof(stem)) stem_len = sizeof(stem) - 1;
             memcpy(stem, rom->filename, stem_len);
             stem[stem_len] = '\0';
+            strip_cache_hash_suffix(stem);
             snprintf(rebuilt, sizeof(rebuilt), "%s.cso", stem);
         } else {
-            snprintf(rebuilt, sizeof(rebuilt), "%s", rom->filename);
+            char stem[160];
+            const char *dot = strrchr(rom->filename, '.');
+            size_t stem_len = dot ? (size_t)(dot - rom->filename)
+                                  : strlen(rom->filename);
+            if (stem_len >= sizeof(stem)) stem_len = sizeof(stem) - 1;
+            memcpy(stem, rom->filename, stem_len);
+            stem[stem_len] = '\0';
+            strip_cache_hash_suffix(stem);
+            snprintf(rebuilt, sizeof(rebuilt), "%s%s", stem, ext);
         }
         int n = snprintf(out_path, out_size,
                          "%s/%s", ROM_TARGET_ISO_DIR, rebuilt);

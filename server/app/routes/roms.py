@@ -961,14 +961,23 @@ def _stream_file_response(
     file_path: Path,
     media_type: str,
     cleanup_dir: str | None = None,
+    download_name: str | None = None,
 ) -> FileResponse:
-    """Return a streaming FileResponse, with optional tempdir cleanup."""
+    """Return a streaming FileResponse, with optional tempdir cleanup.
+
+    ``download_name`` overrides the filename advertised via Content-Disposition.
+    Cached conversion outputs live on disk as ``<stem>_<sha-prefix>.<ext>`` so
+    multiple variants can coexist, but that cache-key suffix should never leak
+    to clients — pass the human-readable filename here when serving a cached
+    artifact.
+    """
+    name = download_name or file_path.name
     background = BackgroundTask(_cleanup_dir, cleanup_dir) if cleanup_dir else None
     return FileResponse(
         path=file_path,
         media_type=media_type,
-        filename=file_path.name,
-        headers={'Content-Disposition': f'attachment; filename="{file_path.name}"'},
+        filename=name,
+        headers={'Content-Disposition': f'attachment; filename="{name}"'},
         background=background,
     )
 
@@ -1044,9 +1053,19 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
     # Cache fast-path: an identical conversion completed before for this
     # exact source ROM (matched on path + mtime + size + format) — stream
     # the cached output directly without re-running the slow converter.
+    # Zip wrappers (Foo.3ds.zip) leave a trailing cart suffix on
+    # ``source_path.stem``; strip it so the advertised filename matches what
+    # the user uploaded rather than the intermediate cart extension.
+    base_stem = source_path.stem
+    inner_suffix = Path(base_stem).suffix.lower()
+    if inner_suffix in _3DS_CART_EXTENSIONS:
+        base_stem = Path(base_stem).stem
+    download_name = f"{base_stem}{spec['output_ext']}"
     cached = _lookup_cached_output(source_path, fmt, spec['output_ext'])
     if cached is not None:
-        return _stream_file_response(cached, 'application/x-3ds-rom')
+        return _stream_file_response(
+            cached, 'application/x-3ds-rom', download_name=download_name
+        )
 
     command_template = getattr(settings, spec['setting'])
     if not command_template:
@@ -1118,7 +1137,12 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
     # On the same filesystem, ``shutil.move`` is just a rename — zero
     # extra I/O cost on top of the conversion we already did.
     cached_path = _save_to_cache(final_path, source_path, fmt, spec['output_ext'])
-    return _stream_file_response(cached_path, 'application/x-3ds-rom', cleanup_dir=tmpdir)
+    return _stream_file_response(
+        cached_path,
+        'application/x-3ds-rom',
+        cleanup_dir=tmpdir,
+        download_name=download_name,
+    )
 
 
 # ── Xbox CCI / ISO conversion ────────────────────────────────────────────────
@@ -1180,9 +1204,10 @@ async def _extract_xbox(
     if fmt == 'cci' and source_ext != '.iso':
         return Response(status_code=400, content="Xbox CCI output expects a .iso or .cci source")
 
+    download_name = f"{stem}{spec['output_ext']}"
     cached = _lookup_cached_output(source_path, f'xbox_{fmt}', spec['output_ext'])
     if cached is not None:
-        return _stream_file_response(cached, spec['mime'])
+        return _stream_file_response(cached, spec['mime'], download_name=download_name)
 
     command_template = getattr(settings, spec['setting'])
     if not command_template:
@@ -1294,7 +1319,9 @@ async def _extract_xbox(
         return Response(status_code=504, content="Conversion timed out (>60 min)")
 
     cached_path = _save_to_cache(final_path, source_path, f'xbox_{fmt}', spec['output_ext'])
-    return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
+    return _stream_file_response(
+        cached_path, spec['mime'], cleanup_dir=tmpdir, download_name=download_name
+    )
 
 
 # ── PS1 → PSP EBOOT.PBP ──────────────────────────────────────────────────────
@@ -1865,10 +1892,11 @@ async def _extract_psp(chd_path: Path, system: str, stem: str, fmt: str) -> Resp
 
     # Cache fast-path
     output_ext = '.iso' if fmt == 'iso' else '.cso'
+    download_name = f"{chd_path.stem}{output_ext}"
     cached = _lookup_cached_output(chd_path, fmt, output_ext)
     if cached is not None:
         mime = 'application/x-iso9660-image' if fmt == 'iso' else 'application/x-cso'
-        return _stream_file_response(cached, mime)
+        return _stream_file_response(cached, mime, download_name=download_name)
 
     tmpdir = tempfile.mkdtemp(prefix='psp_extract_', dir=_conversion_tmp_dir())
     tmp = Path(tmpdir)
@@ -1917,7 +1945,9 @@ async def _extract_psp(chd_path: Path, system: str, stem: str, fmt: str) -> Resp
 
     mime = 'application/x-iso9660-image' if fmt == 'iso' else 'application/x-cso'
     cached_path = _save_to_cache(out_path, chd_path, fmt, output_ext)
-    return _stream_file_response(cached_path, mime, cleanup_dir=tmpdir)
+    return _stream_file_response(
+        cached_path, mime, cleanup_dir=tmpdir, download_name=download_name
+    )
 
 
 # ── PS2 CHD → ISO (DVD images) ──────────────────────────────────────────────

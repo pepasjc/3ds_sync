@@ -16,6 +16,7 @@ PSP_FW_VERSION   := 600
 
 EXTRA_TARGETS := EBOOT.PBP
 PSP_EBOOT_TITLE := PSP Save Sync
+PSP_EBOOT_ICON := ICON0.PNG
 
 # Version from root VERSION file
 APP_VERSION_STR := $(shell cat $(CURDIR)/../VERSION | tr -d '[:space:]')

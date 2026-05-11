@@ -263,6 +263,36 @@ class RomListView(QListView):
         step = self._viewport_rows()
         self.move_selection(step, QAbstractItemView.ScrollHint.PositionAtBottom)
 
+    def alphabet_jump(self, direction: int) -> None:
+        rows = self._model.rowCount()
+        if rows == 0:
+            return
+        cur = self.currentIndex()
+        cur_row = cur.row() if cur.isValid() else 0
+        cur_rom = self._model.rom_at(cur_row) or {}
+        cur_letter = _first_letter(
+            str(cur_rom.get("name") or cur_rom.get("filename") or "")
+        )
+        step = 1 if direction > 0 else -1
+        target = None
+        row = cur_row + step
+        while 0 <= row < rows:
+            rom = self._model.rom_at(row) or {}
+            name = str(rom.get("name") or rom.get("filename") or "")
+            letter = _first_letter(name)
+            if letter and letter != cur_letter:
+                target = row
+                break
+            row += step
+        if target is None:
+            target = rows - 1 if direction > 0 else 0
+        new_idx = self._model.index(target, 0)
+        self.setCurrentIndex(new_idx)
+        hint = (QAbstractItemView.ScrollHint.PositionAtTop
+                if direction > 0 else
+                QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.scrollTo(new_idx, hint)
+
     def row_count(self) -> int:
         return self._model.rowCount()
 
@@ -378,6 +408,9 @@ class CatalogView(QWidget):
     def page_down(self) -> None:
         self._list.page_down()
 
+    def alphabet_jump(self, direction: int) -> None:
+        self._list.alphabet_jump(direction)
+
     def visible_count(self) -> int:
         return self._list.row_count()
 
@@ -446,3 +479,11 @@ def _fmt_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.1f} MB"
     return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _first_letter(name: str) -> str:
+    """Uppercase first alphabetic character of *name*, '' if none."""
+    for ch in name:
+        if ch.isalpha():
+            return ch.upper()
+    return ""

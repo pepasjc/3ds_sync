@@ -1543,6 +1543,16 @@ class MainWindow(QMainWindow):
         else:
             view.page_up()
 
+    def _active_view_alphabet_jump(self, direction: int) -> None:
+        # Last stage of the d-pad hold ramp-up: jump to the next
+        # display-name initial so a held LEFT/RIGHT sweeps A → B → C …
+        if self._active_tab == 3:
+            return
+        view = self._current_list_view()
+        jump = getattr(view, "alphabet_jump", None)
+        if callable(jump):
+            jump(direction)
+
     def _current_list_view(self):
         if self._active_tab == 1:
             return self._catalog_view
@@ -1560,6 +1570,14 @@ class MainWindow(QMainWindow):
             pygame.joystick.init()
             self._btn_state: dict[int | str, bool] = {}
             self._axis_nav_time = 0.0
+            # Hold-to-accelerate state for d-pad left/right: ``_nav_x_dir``
+            # is the active direction (-1 / 0 / 1), ``_nav_x_held_since``
+            # is when that direction started, and ``_nav_x_last_action``
+            # is the timestamp of the most recent page-scroll or alphabet
+            # jump.  Both timestamps are pygame.time-derived seconds.
+            self._nav_x_dir = 0
+            self._nav_x_held_since = 0.0
+            self._nav_x_last_action = 0.0
             self._try_grab_joystick()
 
             self._gamepad_timer = QTimer(self)
@@ -1720,10 +1738,10 @@ class MainWindow(QMainWindow):
             self._action_y()  # Y — saves rescan / catalog search
         if btn_pressed(4):
             if dialog_target is None:
-                self._cycle_tab(-1)  # L1 — previous tab
+                self._cycle_system(-1)  # L1 — previous system
         if btn_pressed(5):
             if dialog_target is None:
-                self._cycle_tab(1)  # R1 — next tab
+                self._cycle_system(1)  # R1 — next system
         if btn_pressed(6):
             if dialog_target is None:
                 self._toggle_search()  # Select/View
@@ -1738,13 +1756,13 @@ class MainWindow(QMainWindow):
         except Exception:
             axis_y = 0.0
 
-        # ── L2 / R2 for system filter ─────────────────────────────
+        # ── L2 / R2 for tab cycle ─────────────────────────────────
         if btn_pressed(8):
             pass  # Steam button — ignore
         # L2/R2 pressed detection via axis crossing threshold.  Triggers
-        # cycle the system filter (PS1 → PS2 → SAT → …).  D-pad left/right
-        # handles page-wise list scrolling instead, since most users reach
-        # the d-pad faster than the back triggers when scanning a long list.
+        # cycle the top-level tab (Saves → Catalog → Installed → Downloads).
+        # L1/R1 (shoulders) cycle the system filter instead; d-pad left/right
+        # drives accelerating page-scroll.
         l2_prev = self._btn_state.get("l2", False)
         r2_prev = self._btn_state.get("r2", False)
         l2_cur = l2 > 0.5
@@ -1752,13 +1770,23 @@ class MainWindow(QMainWindow):
         self._btn_state["l2"] = l2_cur
         self._btn_state["r2"] = r2_cur
         if dialog_target is None and l2_cur and not l2_prev:
-            self._cycle_system(-1)
+            self._cycle_tab(-1)
         if dialog_target is None and r2_cur and not r2_prev:
-            self._cycle_system(1)
+            self._cycle_tab(1)
 
         # ── Navigation with repeat ────────────────────────────────
         DEADZONE = 0.4
         REPEAT_DELAY = 0.15
+        # Hold-to-accelerate thresholds for d-pad left/right.  First press
+        # fires one page scroll immediately.  After ``HOLD_FAST_AFTER`` of
+        # continuous holding we start auto-paging at ``FAST_CADENCE``.
+        # After ``HOLD_ALPHA_AFTER`` we escalate to alphabet jumps at
+        # ``ALPHA_CADENCE`` so the user can sweep a long catalog in
+        # seconds without breaking their thumb off the d-pad.
+        HOLD_FAST_AFTER = 0.5
+        HOLD_ALPHA_AFTER = 1.5
+        FAST_CADENCE = 0.10
+        ALPHA_CADENCE = 0.25
 
         nav_y = 0
         if hat_y == 1 or axis_y < -DEADZONE:
@@ -1775,15 +1803,41 @@ class MainWindow(QMainWindow):
         if dialog_target is not None:
             return
 
-        if nav_y != 0 or nav_x != 0:
+        # ── Y axis — single-row move at fixed repeat ──────────────
+        if nav_y != 0:
             if now - self._axis_nav_time >= REPEAT_DELAY:
                 self._axis_nav_time = now
-                if nav_y != 0:
-                    self._active_view_move(nav_y)
-                if nav_x != 0:
-                    self._active_view_page(nav_x)
-        elif nav_y == 0 and nav_x == 0:
-            self._axis_nav_time = 0.0  # reset so next press fires immediately
+                self._active_view_move(nav_y)
+        else:
+            self._axis_nav_time = 0.0
+
+        # ── X axis — page scroll ramping into alphabet jump ───────
+        if nav_x != 0:
+            if self._nav_x_dir != nav_x:
+                # Fresh press (or direction reversal): fire once
+                # immediately and start the hold clock.
+                self._nav_x_dir = nav_x
+                self._nav_x_held_since = now
+                self._nav_x_last_action = now
+                self._active_view_page(nav_x)
+            else:
+                held = now - self._nav_x_held_since
+                since_last = now - self._nav_x_last_action
+                if held >= HOLD_ALPHA_AFTER:
+                    if since_last >= ALPHA_CADENCE:
+                        self._nav_x_last_action = now
+                        self._active_view_alphabet_jump(nav_x)
+                elif held >= HOLD_FAST_AFTER:
+                    if since_last >= FAST_CADENCE:
+                        self._nav_x_last_action = now
+                        self._active_view_page(nav_x)
+                # held < HOLD_FAST_AFTER: do nothing (initial press
+                # already fired; user hasn't held long enough for
+                # auto-repeat yet)
+        else:
+            self._nav_x_dir = 0
+            self._nav_x_held_since = 0.0
+            self._nav_x_last_action = 0.0
 
     def closeEvent(self, event):
         # Flag any active downloads as "paused" before tearing down
