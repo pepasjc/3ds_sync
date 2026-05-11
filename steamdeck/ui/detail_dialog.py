@@ -462,6 +462,13 @@ QLabel#detailLabel {{
         # extraction.  ``is_bundle`` flips the worker into the bundle
         # path; ``target_path`` is the directory, not a file.
         is_bundle = bool(rom.get("is_bundle"))
+        # Xbox bundles with extract=iso return a single ISO file (not a
+        # ZIP), because the server runs CCI→ISO conversion on the bundled
+        # CCI and streams the result directly. xemu only loads ISO, so
+        # skipping the bundle path here keeps the download as a single
+        # file the emulator can open.
+        if is_bundle and extract_format == "iso" and (entry.system or "").upper() in ("XBOX", "X360", "XBOX360"):
+            is_bundle = False
         if is_bundle:
             bundle_dir_name = (rom.get("name") or
                                Path(target_filename).stem) or rom_id

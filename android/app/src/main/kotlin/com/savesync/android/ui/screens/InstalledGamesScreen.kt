@@ -56,6 +56,9 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.savesync.android.MainActivity
+import com.savesync.android.findComponentActivity
 import com.savesync.android.installed.InstalledRom
 import com.savesync.android.installed.InstalledRomsScanner
 import com.savesync.android.ui.MainViewModel
@@ -181,6 +184,14 @@ fun InstalledGamesScreen(
         systemFilter = all[next]
     }
 
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the toolbar chip
+    // stays in sync.
+    val activity = LocalContext.current.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, systems, systemFilter) {
+        activity?.systemCycleEvents?.collect { delta -> cycleSystem(delta) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -240,11 +251,9 @@ fun InstalledGamesScreen(
                             }
                             true
                         }
-                        // D-pad / stick left/right → cycle system filter
-                        Key.DirectionLeft -> { cycleSystem(-1); true }
-                        Key.DirectionRight -> { cycleSystem(1); true }
-                        // L1 / R1 → page-scroll the list (Steam Deck parity).
-                        Key.ButtonL1 -> {
+                        // D-pad / stick left/right → page-scroll the list.
+                        // System filter cycle moved to L2/R2 (Activity level).
+                        Key.DirectionLeft -> {
                             if (filtered.isNotEmpty()) {
                                 val page = listState.layoutInfo.visibleItemsInfo.size
                                     .coerceAtLeast(1)
@@ -253,7 +262,7 @@ fun InstalledGamesScreen(
                             }
                             true
                         }
-                        Key.ButtonR1 -> {
+                        Key.DirectionRight -> {
                             if (filtered.isNotEmpty()) {
                                 val page = listState.layoutInfo.visibleItemsInfo.size
                                     .coerceAtLeast(1)
@@ -288,7 +297,8 @@ fun InstalledGamesScreen(
                             viewModel.scanInstalledRoms(force = true)
                             true
                         }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (tab cycle) and L2/R2 (system cycle) are
+                        // intercepted at the Activity level — never reach here.
                         else -> false
                     }
                 }

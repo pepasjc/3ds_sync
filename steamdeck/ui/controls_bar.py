@@ -72,7 +72,8 @@ class ControlsBar(QWidget):
         ("X", "BTN_X", "Sync"),
         ("Y", "BTN_Y", "Refresh"),
         ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "Page"),
+        ("L2/R2", "BTN_L", "System"),
+        ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
 
@@ -81,7 +82,8 @@ class ControlsBar(QWidget):
         ("B", "BTN_B", "Exit"),
         ("Y", "BTN_Y", "Search"),
         ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "Page"),
+        ("L2/R2", "BTN_L", "System"),
+        ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
 
@@ -90,7 +92,8 @@ class ControlsBar(QWidget):
         ("B", "BTN_B", "Exit"),
         ("Y", "BTN_Y", "Search"),
         ("L1/R1", "BTN_L", "Tab"),
-        ("L2/R2", "BTN_L", "Page"),
+        ("L2/R2", "BTN_L", "System"),
+        ("←/→", "BTN_L", "Page"),
         ("☰", "BTN_S", "Settings"),
     ]
 

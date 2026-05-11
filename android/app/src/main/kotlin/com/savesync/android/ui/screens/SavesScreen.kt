@@ -74,7 +74,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.swiperefresh.SwipeRefresh
 import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
+import com.savesync.android.MainActivity
 import com.savesync.android.emulators.SaveEntry
+import com.savesync.android.findComponentActivity
 import com.savesync.android.storage.SyncStateEntity
 import com.savesync.android.ui.MainViewModel
 import com.savesync.android.ui.SaveSyncStatus
@@ -143,6 +145,19 @@ fun SavesScreen(
     // the search" behaviour.
     LaunchedEffect(Unit) {
         runCatching { listFocusRequester.requestFocus() }
+    }
+
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the binding stays in
+    // sync with the SystemFilterChip in the toolbar.
+    val activity = context.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, availableFilters, selectedFilter) {
+        activity?.systemCycleEvents?.collect { delta ->
+            if (availableFilters.isEmpty()) return@collect
+            val idx = availableFilters.indexOf(selectedFilter).let { if (it < 0) 0 else it }
+            val next = (idx + delta + availableFilters.size) % availableFilters.size
+            viewModel.setFilter(availableFilters[next])
+        }
     }
 
     // Show sync result in snackbar
@@ -334,23 +349,30 @@ fun SavesScreen(
                             }
                             true
                         }
-                        // D-pad / stick left/right → cycle system filter
-                        // (unified behaviour across all three tabs)
+                        // D-pad / stick left/right → page-scroll the list.
+                        // Page size = currently-visible items count, so each
+                        // tap jumps roughly one viewport. System filter cycle
+                        // moved to L2/R2 (handled at Activity level).
                         Key.DirectionLeft -> {
-                            if (availableFilters.isNotEmpty()) {
-                                val idx = availableFilters.indexOf(selectedFilter)
-                                    .let { if (it < 0) 0 else it }
-                                val next = (idx - 1 + availableFilters.size) % availableFilters.size
-                                viewModel.setFilter(availableFilters[next])
+                            if (saves.isNotEmpty()) {
+                                val page = listState.layoutInfo.visibleItemsInfo.size
+                                    .coerceAtLeast(1)
+                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
+                                coroutineScope.launch {
+                                    listState.animateScrollToItem(selectedIndex)
+                                }
                             }
                             true
                         }
                         Key.DirectionRight -> {
-                            if (availableFilters.isNotEmpty()) {
-                                val idx = availableFilters.indexOf(selectedFilter)
-                                    .let { if (it < 0) 0 else it }
-                                val next = (idx + 1) % availableFilters.size
-                                viewModel.setFilter(availableFilters[next])
+                            if (saves.isNotEmpty()) {
+                                val page = listState.layoutInfo.visibleItemsInfo.size
+                                    .coerceAtLeast(1)
+                                selectedIndex = (selectedIndex + page)
+                                    .coerceAtMost(saves.size - 1)
+                                coroutineScope.launch {
+                                    listState.animateScrollToItem(selectedIndex)
+                                }
                             }
                             true
                         }
@@ -385,33 +407,9 @@ fun SavesScreen(
                             onNavigateToSettings()
                             true
                         }
-                        // L1 / R1 → page scroll (Steam Deck parity).
-                        // Page size = currently-visible items count, so
-                        // each tap jumps roughly one viewport.
-                        Key.ButtonL1 -> {
-                            if (saves.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
-                                coroutineScope.launch {
-                                    listState.animateScrollToItem(selectedIndex)
-                                }
-                            }
-                            true
-                        }
-                        Key.ButtonR1 -> {
-                            if (saves.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex + page)
-                                    .coerceAtMost(saves.size - 1)
-                                coroutineScope.launch {
-                                    listState.animateScrollToItem(selectedIndex)
-                                }
-                            }
-                            true
-                        }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (tab cycle) and L2/R2 (system cycle) are
+                        // intercepted at the Activity level — never reach
+                        // Compose here.
                         else -> false
                     }
                 }

@@ -60,10 +60,13 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.savesync.android.MainActivity
 import com.savesync.android.api.RomEntry
 import com.savesync.android.api.preferredDownloadExtractFormat
 import com.savesync.android.api.preferredDownloadFilename
 import com.savesync.android.catalog.RomCatalogFilter
+import com.savesync.android.findComponentActivity
 import com.savesync.android.ui.MainViewModel
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
@@ -254,14 +257,22 @@ fun RomCatalogScreen(
         lastRestoredKey = systemKey
     }
 
-    // Helper that cycles the system filter (null = all systems), used by
-    // both L1/R1 and D-pad left/right.
+    // Helper that cycles the system filter (null = all systems), driven by
+    // L2/R2 (activity-level systemCycleEvents flow).
     fun cycleSystem(delta: Int) {
         if (systems.isEmpty()) return
         val all = listOf<String?>(null) + systems
         val idx = all.indexOf(systemFilter).let { if (it < 0) 0 else it }
         val next = (idx + delta + all.size) % all.size
         systemFilter = all[next]
+    }
+
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the toolbar chip
+    // stays in sync.
+    val activity = LocalContext.current.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, systems, systemFilter) {
+        activity?.systemCycleEvents?.collect { delta -> cycleSystem(delta) }
     }
 
     Scaffold(
@@ -323,11 +334,9 @@ fun RomCatalogScreen(
                             }
                             true
                         }
-                        // D-pad / stick left/right → cycle system filter
-                        Key.DirectionLeft -> { cycleSystem(-1); true }
-                        Key.DirectionRight -> { cycleSystem(1); true }
-                        // L1 / R1 → page-scroll the list (Steam Deck parity).
-                        Key.ButtonL1 -> {
+                        // D-pad / stick left/right → page-scroll the list.
+                        // System filter cycle moved to L2/R2 (Activity level).
+                        Key.DirectionLeft -> {
                             if (filtered.isNotEmpty()) {
                                 val page = listState.layoutInfo.visibleItemsInfo.size
                                     .coerceAtLeast(1)
@@ -336,7 +345,7 @@ fun RomCatalogScreen(
                             }
                             true
                         }
-                        Key.ButtonR1 -> {
+                        Key.DirectionRight -> {
                             if (filtered.isNotEmpty()) {
                                 val page = listState.layoutInfo.visibleItemsInfo.size
                                     .coerceAtLeast(1)
@@ -375,7 +384,8 @@ fun RomCatalogScreen(
                             viewModel.fetchRomCatalog(force = true)
                             true
                         }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (tab cycle) and L2/R2 (system cycle) are
+                        // intercepted at the Activity level — never reach here.
                         else -> false
                     }
                 }

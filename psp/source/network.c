@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 
 #include <pspkernel.h>
@@ -276,6 +277,28 @@ static int tcp_send_all(int sock, const uint8_t *data, int len) {
     return 0;
 }
 
+/* Case-insensitive search for an HTTP header value within a header block.
+ * Starlette/Uvicorn emit lowercase header names ("content-length: ..."),
+ * other servers use Title-Case — RFC 7230 says names are case-insensitive,
+ * so a strict strstr("Content-Length: ") miss would silently wreck the
+ * download progress / total-bytes accounting. Returns a pointer just past
+ * the ": " separator (start of the value), or NULL when not present. */
+static const char *find_header_value(const char *headers, const char *name) {
+    size_t nlen = strlen(name);
+    const char *p = headers;
+    while (*p) {
+        if (strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            const char *v = p + nlen + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            return v;
+        }
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return NULL;
+}
+
 /* Receive HTTP response. Returns response body length, or negative on error.
  * out receives the body; headers are parsed internally. */
 static int http_receive_response(int sock, int *status_out,
@@ -300,9 +323,9 @@ static int http_receive_response(int sock, int *status_out,
     if (sscanf(header_buf, "HTTP/1.%*d %d", status_out) != 1)
         *status_out = 200;
 
-    /* Parse Content-Length */
-    char *cl = strstr(header_buf, "Content-Length: ");
-    if (cl) content_length = atoi(cl + 16);
+    /* Parse Content-Length (case-insensitive — see find_header_value note). */
+    const char *cl = find_header_value(header_buf, "Content-Length");
+    if (cl) content_length = atoi(cl);
 
     /* Body starts after \r\n\r\n */
     uint8_t *body_start = (uint8_t *)(hdr_end + 4);
@@ -936,8 +959,8 @@ static int http_open_get_stream(const SyncState *state,
     if (status_out) *status_out = status;
 
     int64_t content_length = -1;
-    char *cl = strstr(header_buf, "Content-Length: ");
-    if (cl) content_length = strtoll(cl + 16, NULL, 10);
+    const char *cl = find_header_value(header_buf, "Content-Length");
+    if (cl) content_length = strtoll(cl, NULL, 10);
     if (content_len_out) *content_len_out = content_length;
 
     if (status != 200 && status != 206) {

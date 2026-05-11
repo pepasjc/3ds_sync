@@ -1065,6 +1065,13 @@ class MainWindow(QMainWindow):
         # whole subfolder.  Target becomes the per-game directory; the
         # download worker extracts on completion.
         is_bundle = bool(rom.get("is_bundle"))
+        # Xbox bundles with extract=iso return a single ISO file (not a
+        # ZIP), because the server runs CCI→ISO conversion on the bundled
+        # CCI and streams the result directly. xemu only loads ISO, so
+        # skipping the bundle path here keeps the download as a single
+        # file the emulator can open.
+        if is_bundle and extract_format == "iso" and (system or "").upper() in ("XBOX", "X360", "XBOX360"):
+            is_bundle = False
         if is_bundle:
             bundle_dir_name = (rom.get("name") or
                                Path(target_filename).stem) or rom_id
@@ -1731,13 +1738,13 @@ class MainWindow(QMainWindow):
         except Exception:
             axis_y = 0.0
 
-        # ── L2 / R2 for status filter ─────────────────────────────
+        # ── L2 / R2 for system filter ─────────────────────────────
         if btn_pressed(8):
             pass  # Steam button — ignore
-        # L2/R2 pressed detection via axis crossing threshold.  Both
-        # triggers drive page-wise list scrolling so navigating the
-        # catalog (and large synced-save lists) doesn't require holding
-        # the d-pad for minutes.
+        # L2/R2 pressed detection via axis crossing threshold.  Triggers
+        # cycle the system filter (PS1 → PS2 → SAT → …).  D-pad left/right
+        # handles page-wise list scrolling instead, since most users reach
+        # the d-pad faster than the back triggers when scanning a long list.
         l2_prev = self._btn_state.get("l2", False)
         r2_prev = self._btn_state.get("r2", False)
         l2_cur = l2 > 0.5
@@ -1745,9 +1752,9 @@ class MainWindow(QMainWindow):
         self._btn_state["l2"] = l2_cur
         self._btn_state["r2"] = r2_cur
         if dialog_target is None and l2_cur and not l2_prev:
-            self._active_view_page(-1)
+            self._cycle_system(-1)
         if dialog_target is None and r2_cur and not r2_prev:
-            self._active_view_page(1)
+            self._cycle_system(1)
 
         # ── Navigation with repeat ────────────────────────────────
         DEADZONE = 0.4
@@ -1774,7 +1781,7 @@ class MainWindow(QMainWindow):
                 if nav_y != 0:
                     self._active_view_move(nav_y)
                 if nav_x != 0:
-                    self._cycle_system(nav_x)
+                    self._active_view_page(nav_x)
         elif nav_y == 0 and nav_x == 0:
             self._axis_nav_time = 0.0  # reset so next press fires immediately
 
