@@ -29,19 +29,32 @@ def test_builder_emits_entry_per_uncovered_server_save(tmp_path):
             "console_type": "SNES",
         },
     }
-    entries = server_only.build_server_only_entries(server, set(), tmp_path)
+    canonical = {
+        "GBA_pokemon_emerald_usa": "Pokemon - Emerald Version (USA, Europe)",
+        "SNES_super_metroid": "Super Metroid (Japan, USA) (En,Ja)",
+    }
+    entries = server_only.build_server_only_entries(
+        server, set(), tmp_path, canonical_names=canonical
+    )
 
     tids = {e.title_id for e in entries}
     assert tids == {"GBA_pokemon_emerald_usa", "SNES_super_metroid"}
     assert all(e.status == SyncStatus.SERVER_ONLY for e in entries)
     # RetroArch-backed systems get a predicted .srm path so Download Save
-    # is immediately usable even without a local ROM.
+    # is immediately usable.  The stem comes from the canonical No-Intro
+    # name (parentheses preserved) so it matches what RetroArch writes.
     by_id = {e.title_id: e for e in entries}
     assert by_id["GBA_pokemon_emerald_usa"].save_path == (
-        tmp_path / "saves" / "retroarch" / "saves" / "Pokemon Emerald.srm"
+        tmp_path / "saves" / "retroarch" / "saves"
+        / "Pokemon - Emerald Version (USA, Europe).srm"
     )
     assert by_id["SNES_super_metroid"].save_path == (
-        tmp_path / "saves" / "retroarch" / "saves" / "Super Metroid.srm"
+        tmp_path / "saves" / "retroarch" / "saves"
+        / "Super Metroid (Japan, USA) (En,Ja).srm"
+    )
+    # Canonical name also wins for display so the UI label matches the file.
+    assert by_id["GBA_pokemon_emerald_usa"].display_name == (
+        "Pokemon - Emerald Version (USA, Europe)"
     )
 
 
@@ -170,30 +183,16 @@ def test_ps1_server_only_predicts_duckstation_memcard_path(tmp_path):
             "save_hash": "h",
         }
     }
-    entry = server_only.build_server_only_entries(server, set(), tmp_path)[0]
+    entry = server_only.build_server_only_entries(
+        server, set(), tmp_path,
+        canonical_names={"SLUS01324": "Breath of Fire IV (USA)"},
+    )[0]
     assert entry.save_path == (
         tmp_path / "saves" / "duckstation" / "memcards"
         / "Breath of Fire IV (USA)_1.mcd"
     )
     assert entry.is_multi_file is False
     assert entry.is_psp_slot is False
-
-
-def test_ps1_server_only_strips_disc_tags_from_stem(tmp_path):
-    server = {
-        "SCUS94163": {
-            "console_type": "PS1",
-            "name": "Final Fantasy VII (USA) (Disc 1)",
-            "save_hash": "h",
-        }
-    }
-    entry = server_only.build_server_only_entries(server, set(), tmp_path)[0]
-    # Disc tag stripped so multi-disc saves share one card, matching
-    # DuckStation's _clean_card_label convention.
-    assert entry.save_path == (
-        tmp_path / "saves" / "duckstation" / "memcards"
-        / "Final Fantasy VII (USA)_1.mcd"
-    )
 
 
 def test_ps2_server_only_predicts_pcsx2_memcard_path(tmp_path):
@@ -204,9 +203,12 @@ def test_ps2_server_only_predicts_pcsx2_memcard_path(tmp_path):
             "save_hash": "h",
         }
     }
-    entry = server_only.build_server_only_entries(server, set(), tmp_path)[0]
+    entry = server_only.build_server_only_entries(
+        server, set(), tmp_path,
+        canonical_names={"SLUS20002": "Final Fantasy X (USA)"},
+    )[0]
     assert entry.save_path == (
-        tmp_path / "saves" / "pcsx2" / "memcards" / "Final Fantasy X.ps2"
+        tmp_path / "saves" / "pcsx2" / "memcards" / "Final Fantasy X (USA).ps2"
     )
 
 
@@ -251,7 +253,10 @@ def test_nds_server_only_predicts_sav_next_to_rom(tmp_path):
             "save_hash": "h",
         }
     }
-    entry = server_only.build_server_only_entries(server, set(), tmp_path)[0]
+    entry = server_only.build_server_only_entries(
+        server, set(), tmp_path,
+        canonical_names={"NDS_chrono_trigger_usa": "Chrono Trigger (USA)"},
+    )[0]
     assert entry.save_path == (
         tmp_path / "roms" / "nds" / "Chrono Trigger (USA).sav"
     )
@@ -265,9 +270,55 @@ def test_saturn_server_only_predicts_srm_at_retroarch_saves_root(tmp_path):
             "save_hash": "h",
         }
     }
-    entry = server_only.build_server_only_entries(server, set(), tmp_path)[0]
+    entry = server_only.build_server_only_entries(
+        server, set(), tmp_path,
+        canonical_names={"SAT_T-4507G": "Grandia (USA)"},
+    )[0]
     assert entry.save_path == (
         tmp_path / "saves" / "retroarch" / "saves" / "Grandia (USA).srm"
+    )
+
+
+def test_filename_systems_refuse_to_sync_without_canonical_name(tmp_path):
+    """Without a server-provided canonical name for systems whose save
+    filename is derived from the ROM name, the builder must NOT guess a
+    slug-derived stem — the emulator would never find the resulting save.
+    Surface save_path=None so the UI prompts the user to install the ROM.
+    """
+    server = {
+        "SNES_ganbare_goemon_2_kiteretsu_shougun_mcguiness_japan": {
+            "console_type": "SNES",
+            "name": "Ganbare Goemon 2 Kiteretsu Shougun Mcguiness Japan",
+            "save_hash": "h",
+        },
+        "PS1_some_obscure_jp_game": {
+            "console_type": "PS1",
+            "name": "Some Obscure JP Game",
+            "save_hash": "h",
+        },
+    }
+    entries = server_only.build_server_only_entries(
+        server, set(), tmp_path, canonical_names={}
+    )
+    assert all(e.save_path is None for e in entries)
+    assert all(e.status == SyncStatus.SERVER_ONLY for e in entries)
+
+
+def test_psp_server_only_works_without_canonical_name(tmp_path):
+    """PSP uses the title_id as the SAVEDATA slot directory, not a ROM
+    filename, so it remains syncable even when the catalog has no entry."""
+    server = {
+        "ULUS10567DATA": {
+            "console_type": "PSP",
+            "name": "Final Fantasy Tactics: The War of the Lions",
+            "save_hash": "h",
+        }
+    }
+    entry = server_only.build_server_only_entries(
+        server, set(), tmp_path, canonical_names={}
+    )[0]
+    assert entry.save_path == (
+        tmp_path / "saves" / "ppsspp" / "SAVEDATA" / "ULUS10567DATA"
     )
 
 

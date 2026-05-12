@@ -5,15 +5,16 @@
  *   1. SifInitRpc, kernel + IOP setup
  *   2. Reset IOP and load embedded IRX modules:
  *        sio2man, mcman, mcserv, padman   — controllers + memcards
+ *        ata_bd                           — internal HDD as BDM mass storage
  *        usbd, usbhdfsd                   — USB mass storage (mass:/)
- *        ps2dev9, netman, smap            — network adapter
+ *        ps2dev9, netman, smap            — network adapter / ATA bridge
  *   3. Initialise libdebug screen
  *   4. Load config from mc0:/3DSSYNC/CONFIG.TXT
  *   5. Bring up networking via ps2ip (static IP by default, DHCP optional)
- *   6. Probe mass:/ (USB is required for downloads, not catalog browse)
+ *   6. Probe mass:/ (storage is required for downloads, not catalog browse)
  *   7. Run the menu loop (ROMs / Downloads / Config views)
  *
- * Phase 1 only: ROM browser + USB installer.  Save sync (MCP2) is
+ * Phase 1 only: ROM browser + mass-storage installer.  Save sync (MCP2) is
  * stubbed in the menu - the next phase wires it up.
  */
 
@@ -40,6 +41,7 @@
 #include <iopheap.h>
 #include <libpad.h>
 #include <libmc.h>
+#include <libhdd.h>
 #include <debug.h>
 #include <delaythread.h>
 #include <netman.h>
@@ -56,6 +58,12 @@
 #include <fileXio_rpc.h>
 
 /* ---- IRX loading helpers ---- */
+
+static bool g_ps2dev9_loaded = false;
+static bool g_ps2atad_loaded = false;
+static bool g_poweroff_loaded = false;
+static bool g_ps2hdd_loaded = false;
+static bool g_ps2fs_loaded = false;
 
 /* Returns 0 on success, negative on failure.
  *
@@ -106,9 +114,8 @@ static void boot_iop_modules(void) {
 
     scr_printf("Loading IOP modules...\n");
 
-    /* iomanX + fileXio first — every block-device IRX (bdm, usbmass_bd,
-     * bdmfs_fatfs) registers its mountpoint with iomanX, and newlib's
-     * stdio routes through fileXio. */
+    /* iomanX + fileXio first. Storage modules are loaded after config
+     * so storage=usb/hdd/auto can decide which bridges come up. */
     load_irx(iomanX_irx,      iomanX_irx_size,      "iomanX",      0, NULL);
     load_irx(fileXio_irx,     fileXio_irx_size,     "fileXio",     0, NULL);
 
@@ -126,28 +133,54 @@ static void boot_iop_modules(void) {
     ret = SifLoadModule("rom0:PADMAN",  0, NULL);
     scr_printf("  rom0:PADMAN  -> %d\n", ret);
 
-    /* USB mass storage stack.  Two competing options:
+}
+
+static void boot_device_modules(const SyncState *state) {
+    bool want_usb = !state || state->storage_pref != STORAGE_PREF_HDD;
+    bool want_hdd = !state || state->storage_pref != STORAGE_PREF_USB;
+
+    scr_printf("Loading device modules (storage=%s)...\n",
+               state ? config_storage_pref_to_str(state->storage_pref) : "auto");
+
+    /* DEV9 backs both the PS2 fat network adapter and internal ATA HDD. */
+    if (load_irx(ps2dev9_irx, ps2dev9_irx_size, "ps2dev9", 0, NULL) == 0) {
+        g_ps2dev9_loaded = true;
+    }
+
+    /* BDM mass storage stack.  Two competing USB options:
      *   (a) Modern split: bdm + usbmass_bd + bdmfs_fatfs
-     *       bdmfs_fatfs registers mass: once a USB device with a FAT
-     *       partition attaches.
+     *       bdmfs_fatfs registers mass: once a USB or ATA device with a
+     *       FAT/exFAT partition attaches.
      *   (b) Legacy: usbhdfsd — single module, no bdm dependency.
      *
      * Some launchers (and PCSX2) preload an old bdm.irx that's binary
      * incompatible with our newer usbmass_bd.irx, causing usbmass_bd to
      * fail with id=-200 (unresolved symbol).  When that happens we fall
      * back to usbhdfsd, which has no external dependencies. */
-    load_irx(usbd_irx,        usbd_irx_size,        "usbd",        0, NULL);
-
     int bdm_rc        = load_irx(bdm_irx,         bdm_irx_size,         "bdm",         0, NULL);
-    int usbmass_rc    = load_irx(usbmass_bd_irx,  usbmass_bd_irx_size,  "usbmass_bd",  0, NULL);
+    int ata_rc        = 0;
+    int usbmass_rc    = 0;
+
+    if (want_hdd) {
+        ata_rc = load_irx(ata_bd_irx, ata_bd_irx_size, "ata_bd", 0, NULL);
+    }
+
+    if (want_usb) {
+        load_irx(usbd_irx, usbd_irx_size, "usbd", 0, NULL);
+        usbmass_rc = load_irx(usbmass_bd_irx, usbmass_bd_irx_size,
+                              "usbmass_bd", 0, NULL);
+    }
+
     int bdmfs_rc      = load_irx(bdmfs_fatfs_irx, bdmfs_fatfs_irx_size, "bdmfs_fatfs", 0, NULL);
 
-    if (bdm_rc != 0 || usbmass_rc != 0 || bdmfs_rc != 0) {
+    if (want_usb && (bdm_rc != 0 || usbmass_rc != 0 || bdmfs_rc != 0)) {
         scr_printf("  bdm stack failed - falling back to usbhdfsd\n");
         load_irx(usbhdfsd_irx, usbhdfsd_irx_size, "usbhdfsd", 0, NULL);
     }
+    if (want_hdd && ata_rc != 0) {
+        scr_printf("  internal HDD BDM bridge unavailable (rc=%d)\n", ata_rc);
+    }
 
-    load_irx(ps2dev9_irx,     ps2dev9_irx_size,     "ps2dev9",     0, NULL);
     load_irx(netman_irx,      netman_irx_size,      "netman",      0, NULL);
     load_irx(smap_irx,        smap_irx_size,        "smap",        0, NULL);
 
@@ -161,21 +194,32 @@ static void boot_iop_modules(void) {
 /* ---- mass:/ wait ---- */
 
 static bool wait_for_mass(SyncState *state, int timeout_seconds) {
-    /* USB enumeration is asynchronous — wait until a ``mass:`` root is
+    /* BDM enumeration is asynchronous — wait until a ``mass:`` root is
      * usable. Some PS2 USB stacks reject fopen() on a directory, so we
      * probe by creating the app data directory on each possible root.
      *
-     * Both usbhdfsd and bdmfs_fatfs register the iomanX driver name
-     * "mass"; iomanX accepts "mass:" or "massN:" (with N = unit id), so
-     * we try a handful of variants before giving up. */
-    static const char *roots[] = {
+     * bdmfs_fatfs registers both internal ATA HDD and USB FAT/exFAT
+     * partitions as massN:. Because ata_bd loads before usbmass_bd, HDD
+     * is normally mass:/mass0: and USB normally starts at mass1: when
+     * both are connected. */
+    static const char *auto_roots[] = {
         "mass:", "mass0:", "mass1:", "mass2:", "mass3:", NULL
     };
+    static const char *hdd_roots[] = {
+        "mass:", "mass0:", "mass1:", "mass2:", "mass3:", NULL
+    };
+    static const char *usb_roots[] = {
+        "mass1:", "mass2:", "mass3:", "mass:", "mass0:", NULL
+    };
+
+    const char **roots = auto_roots;
+    if (state->storage_pref == STORAGE_PREF_USB) roots = usb_roots;
+    else if (state->storage_pref == STORAGE_PREF_HDD) roots = hdd_roots;
 
     state->usb_ready = false;
-    strncpy(state->usb_root, USB_DEFAULT_ROOT, sizeof(state->usb_root) - 1);
+    strncpy(state->usb_root, STORAGE_DEFAULT_ROOT, sizeof(state->usb_root) - 1);
     state->usb_root[sizeof(state->usb_root) - 1] = '\0';
-    roms_set_usb_root(state->usb_root);
+    roms_set_storage_root(state->usb_root);
 
     int last_errno[8] = {0};
 
@@ -184,7 +228,7 @@ static bool wait_for_mass(SyncState *state, int timeout_seconds) {
             char data_dir[96];
             char root_dir[32];
             snprintf(data_dir, sizeof(data_dir), "%s%s",
-                     roots[r], USB_DATA_SUBDIR);
+                     roots[r], STORAGE_DATA_SUBDIR);
             snprintf(root_dir, sizeof(root_dir), "%s/", roots[r]);
 
             errno = 0;
@@ -193,11 +237,11 @@ static bool wait_for_mass(SyncState *state, int timeout_seconds) {
             int stat_errno = errno;
 
             if (stat_rc == 0) {
-                scr_printf("  USB: stat ok at %s\n", data_dir);
+                scr_printf("  storage: stat ok at %s\n", data_dir);
                 strncpy(state->usb_root, roots[r], sizeof(state->usb_root) - 1);
                 state->usb_root[sizeof(state->usb_root) - 1] = '\0';
                 state->usb_ready = true;
-                roms_set_usb_root(state->usb_root);
+                roms_set_storage_root(state->usb_root);
                 return true;
             }
 
@@ -205,22 +249,22 @@ static bool wait_for_mass(SyncState *state, int timeout_seconds) {
             int mkdir_rc = mkdir(data_dir, 0777);
             int mkdir_errno = errno;
             if (mkdir_rc == 0 || mkdir_errno == EEXIST) {
-                scr_printf("  USB: mkdir ok at %s\n", data_dir);
+                scr_printf("  storage: mkdir ok at %s\n", data_dir);
                 strncpy(state->usb_root, roots[r], sizeof(state->usb_root) - 1);
                 state->usb_root[sizeof(state->usb_root) - 1] = '\0';
                 state->usb_ready = true;
-                roms_set_usb_root(state->usb_root);
+                roms_set_storage_root(state->usb_root);
                 return true;
             }
 
             errno = 0;
             if (stat(root_dir, &st) == 0) {
-                scr_printf("  USB: root stat ok at %s — using anyway\n", root_dir);
+                scr_printf("  storage: root stat ok at %s - using anyway\n", root_dir);
                 mkdir(data_dir, 0777);
                 strncpy(state->usb_root, roots[r], sizeof(state->usb_root) - 1);
                 state->usb_root[sizeof(state->usb_root) - 1] = '\0';
                 state->usb_ready = true;
-                roms_set_usb_root(state->usb_root);
+                roms_set_storage_root(state->usb_root);
                 return true;
             }
 
@@ -230,7 +274,7 @@ static bool wait_for_mass(SyncState *state, int timeout_seconds) {
     }
 
     /* Show why we gave up — last errno from each candidate root. */
-    scr_printf("  USB: wait_for_mass timed out after %ds\n", timeout_seconds);
+    scr_printf("  storage: wait_for_mass timed out after %ds\n", timeout_seconds);
     for (int r = 0; roots[r]; r++) {
         scr_printf("    %-7s last errno=%d\n", roots[r], last_errno[r]);
     }
@@ -283,28 +327,141 @@ static AppView       g_view = APP_VIEW_ROMS;
 static int           g_rom_selected   = 0, g_rom_scroll   = 0;
 static int           g_local_selected = 0, g_local_scroll = 0;
 static int           g_dl_selected    = 0, g_dl_scroll    = 0;
+static bool          g_hdd_format_confirm = false;
 
 static char          g_scratch[256 * 1024];      /* JSON page buffer */
 
-static bool require_usb_ready(void) {
+static bool require_storage_ready(void) {
     if (!g_state.usb_ready) {
-        ui_error("USB not ready; catalog browse still works");
+        ui_error("Storage not ready; catalog browse still works");
         return false;
     }
     return true;
 }
 
-static void init_usb_targets(void) {
-    scr_printf("BOOT: probing USB mass storage...\n");
+static void init_storage_targets(void) {
+    scr_printf("BOOT: probing storage (%s)...\n",
+               config_storage_pref_to_str(g_state.storage_pref));
     if (!wait_for_mass(&g_state, 12)) {
-        scr_printf("WARN: no USB mass storage mounted\n");
-        ui_status("USB not ready; downloads disabled");
+        scr_printf("WARN: no storage root mounted\n");
+        ui_status("Storage not ready; downloads disabled");
         return;
     }
 
-    scr_printf("BOOT: USB ready at %s\n", g_state.usb_root);
+    scr_printf("BOOT: storage ready at %s\n", g_state.usb_root);
     roms_ensure_target_dirs();
     downloads_load(&g_downloads);
+}
+
+static bool ensure_hdd_format_modules(void) {
+    int rc;
+    static const char hdd_args[] = "-o\0" "4\0" "-n\0" "20";
+    static const char pfs_args[] = "-m\0" "4\0" "-o\0" "10\0" "-n\0" "40";
+
+    if (!g_ps2dev9_loaded) {
+        rc = load_irx(ps2dev9_irx, ps2dev9_irx_size, "ps2dev9", 0, NULL);
+        if (rc != 0) {
+            ui_error("ps2dev9 failed (%d)", rc);
+            return false;
+        }
+        g_ps2dev9_loaded = true;
+    }
+    if (!g_poweroff_loaded) {
+        rc = load_irx(poweroff_irx, poweroff_irx_size, "poweroff", 0, NULL);
+        if (rc != 0) {
+            ui_error("poweroff.irx failed (%d)", rc);
+            return false;
+        }
+        g_poweroff_loaded = true;
+    }
+    if (!g_ps2atad_loaded) {
+        rc = load_irx(ps2atad_irx, ps2atad_irx_size, "ps2atad", 0, NULL);
+        if (rc != 0) {
+            ui_error("ps2atad.irx failed (%d)", rc);
+            return false;
+        }
+        g_ps2atad_loaded = true;
+    }
+    if (!g_ps2hdd_loaded) {
+        rc = load_irx(ps2hdd_irx, ps2hdd_irx_size, "ps2hdd", 4, hdd_args);
+        if (rc != 0) {
+            ui_error("ps2hdd.irx failed (%d)", rc);
+            return false;
+        }
+        g_ps2hdd_loaded = true;
+    }
+    if (!g_ps2fs_loaded) {
+        rc = load_irx(ps2fs_irx, ps2fs_irx_size, "ps2fs", 6, pfs_args);
+        if (rc != 0) {
+            ui_error("ps2fs.irx failed (%d)", rc);
+            return false;
+        }
+        g_ps2fs_loaded = true;
+    }
+
+    (void)hddPreparePoweroff();
+    rc = fileXioInit();
+    scr_printf("  fileXioInit (hdd formatter) -> %d\n", rc);
+    return true;
+}
+
+static int ensure_opl_partition(void) {
+    t_hddFilesystem filesystems[32];
+    int count = hddGetFilesystemList(filesystems, 32);
+
+    if (count >= 0) {
+        for (int i = 0; i < count && i < 32; i++) {
+            if (filesystems[i].fileSystemGroup == FS_GROUP_COMMON &&
+                strcmp(filesystems[i].name, "OPL") == 0)
+            {
+                return 1;       /* already exists */
+            }
+        }
+    }
+
+    char name[] = "OPL";
+    int rc = hddMakeFilesystem(512, name, FS_GROUP_COMMON);
+    return rc < 0 ? rc : 0;      /* 0 = created */
+}
+
+static void format_internal_hdd(void) {
+    ui_status("Checking internal HDD...");
+    redraw();
+
+    if (!ensure_hdd_format_modules()) return;
+
+    if (hddCheckPresent() != 0) {
+        ui_error("No internal HDD detected");
+        return;
+    }
+
+    if (hddCheckFormatted() == 0) {
+        int opl = ensure_opl_partition();
+        if (opl < 0) {
+            ui_error("HDD is APA; +OPL create failed (%d)", opl);
+        } else {
+            ui_status("HDD already APA-formatted; +OPL %s",
+                      opl ? "ready" : "created");
+        }
+        return;
+    }
+
+    ui_status("Formatting internal HDD as PS2 APA...");
+    redraw();
+
+    int rc = hddFormat();
+    if (rc != 0) {
+        ui_error("HDD format failed (%d)", rc);
+        return;
+    }
+
+    int opl = ensure_opl_partition();
+    if (opl < 0) {
+        ui_error("HDD formatted; +OPL create failed (%d)", opl);
+    } else {
+        ui_status("HDD formatted as PS2 APA; +OPL %s",
+                  opl ? "ready" : "created");
+    }
 }
 
 /* Live progress from network_set_progress64_cb. */
@@ -365,7 +522,7 @@ static void fetch_catalog(void) {
 static void scan_local(void) {
     if (!g_state.usb_ready) {
         snprintf(g_local.last_error, sizeof(g_local.last_error),
-                 "USB not ready");
+                 "Storage not ready");
         g_local.count = 0;
         return;
     }
@@ -379,7 +536,7 @@ static void scan_local(void) {
 }
 
 static void run_active_download(DownloadEntry *e) {
-    if (!e || !require_usb_ready()) return;
+    if (!e || !require_storage_ready()) return;
 
     g_active_done       = e->offset;
     g_active_total      = e->total;
@@ -432,7 +589,23 @@ static void run_active_download(DownloadEntry *e) {
 /* ---- Main loop ---- */
 
 static void cycle_view(void) {
+    g_hdd_format_confirm = false;
     g_view = (AppView)(((int)g_view + 1) % APP_VIEW_COUNT);
+}
+
+static void cycle_storage_pref(int delta) {
+    g_hdd_format_confirm = false;
+    int next = (int)g_state.storage_pref + delta;
+    if (next < (int)STORAGE_PREF_AUTO) next = (int)STORAGE_PREF_HDD;
+    if (next > (int)STORAGE_PREF_HDD) next = (int)STORAGE_PREF_AUTO;
+    g_state.storage_pref = (StoragePreference)next;
+
+    if (config_save(&g_state)) {
+        ui_status("storage=%s saved; relaunch to apply",
+                  config_storage_pref_to_str(g_state.storage_pref));
+    } else {
+        ui_error("Could not save storage setting");
+    }
 }
 
 static void redraw(void) {
@@ -486,12 +659,14 @@ int main(int argc, char *argv[]) {
     scr_printf("BOOT: console_id=%s server=%s\n",
                g_state.console_id, g_state.server_url);
 
+    boot_device_modules(&g_state);
+
     scr_printf("BOOT: bringing up network\n");
     network_init(&g_state);
     scr_printf("BOOT: net ready=%d dhcp=%d ip=%s\n",
                g_state.net_ready, g_state.dhcp_ok, g_state.ip);
 
-    init_usb_targets();
+    init_storage_targets();
 
     scr_printf("BOOT: pad init\n");
     pad_init();
@@ -542,7 +717,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_CROSS)    fetch_catalog();
             else if (pressed & PAD_SQUARE) {
                 /* Queue selected ROM for download. */
-                if (require_usb_ready() &&
+                if (require_storage_ready() &&
                     count > 0 && g_rom_selected < count)
                 {
                     DownloadEntry *e = downloads_upsert_from_catalog(
@@ -556,7 +731,7 @@ int main(int argc, char *argv[]) {
                 }
             } else if (pressed & PAD_TRIANGLE) {
                 /* Trigger active download for the selected entry. */
-                if (require_usb_ready() &&
+                if (require_storage_ready() &&
                     count > 0 && g_rom_selected < count)
                 {
                     DownloadEntry *e = downloads_upsert_from_catalog(
@@ -594,7 +769,7 @@ int main(int argc, char *argv[]) {
                     run_active_download(&g_downloads.items[g_dl_selected]);
                 }
             } else if (pressed & PAD_SQUARE) {
-                if (require_usb_ready() &&
+                if (require_storage_ready() &&
                     count > 0 && g_dl_selected < count)
                 {
                     downloads_remove(&g_downloads,
@@ -604,6 +779,22 @@ int main(int argc, char *argv[]) {
                 }
             }
             clamp_scroll(&g_dl_selected, &g_dl_scroll, count);
+        } else if (g_view == APP_VIEW_CONFIG) {
+            if (pressed & PAD_LEFT) {
+                cycle_storage_pref(-1);
+            } else if (pressed & PAD_RIGHT) {
+                cycle_storage_pref(1);
+            } else if (pressed & PAD_TRIANGLE) {
+                if (!g_hdd_format_confirm) {
+                    g_hdd_format_confirm = true;
+                    ui_error("TRIANGLE again wipes ALL HDD data (APA)");
+                } else {
+                    g_hdd_format_confirm = false;
+                    format_internal_hdd();
+                }
+            } else {
+                g_hdd_format_confirm = false;
+            }
         }
 
         if (dirty) redraw();

@@ -715,6 +715,36 @@ class SyncClient:
             print(f"[LookupNames] batch lookup failed: {exc}")
         return {"names": {}, "types": {}, "retail_serials": {}}
 
+    def lookup_canonical_names(self, title_ids: list[str]) -> dict[str, str]:
+        """Resolve emulator-style title_ids to canonical No-Intro / DAT names.
+
+        Used when constructing save filenames for server-only entries: the
+        canonical name (e.g. ``"Super Mario World (USA)"``) matches what the
+        emulator writes to disk, while a slug-derived stem (``"Super Mario
+        World Usa"``) does not — so syncing to the slug-derived name leaves
+        the emulator unable to find the save.
+
+        Returns a sparse map: title_ids with no catalog hit are omitted so
+        callers can detect "no match" and refuse to sync rather than guess.
+        """
+        if not title_ids:
+            return {}
+        try:
+            r = requests.post(
+                f"{self.base_url}/titles/canonical-names",
+                json={"title_ids": list(title_ids)},
+                headers={**self.headers, "Content-Type": "application/json"},
+                timeout=self._timeout,
+            )
+            if r.status_code == 200:
+                body = r.json()
+                names = body.get("names", {})
+                if isinstance(names, dict):
+                    return {str(k): str(v) for k, v in names.items() if v}
+        except Exception as exc:
+            print(f"[LookupCanonicalNames] batch lookup failed: {exc}")
+        return {}
+
     # ------------------------------------------------------------------
     # Card metadata (for three-way hash on PS1/PS2/GC)
     # ------------------------------------------------------------------

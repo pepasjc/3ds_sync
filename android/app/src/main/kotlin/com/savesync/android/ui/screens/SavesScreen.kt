@@ -84,7 +84,7 @@ import com.savesync.android.ui.SyncState
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
 import com.savesync.android.ui.components.firstLetter
-import com.savesync.android.ui.components.onPress
+import com.savesync.android.ui.components.handleHorizontalHoldKeyEvent
 import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -320,8 +320,8 @@ fun SavesScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { paddingValues ->
         // ── Master gamepad handler ───────────────────────────────────────
-        // D-pad up/down scrolls the list, left/right cycles the status
-        // filter, L1/R1 cycles the system filter, and the face/start
+        // D-pad up/down steps the list, left/right page-scrolls with hold
+        // acceleration, L1/R1 cycles the system filter, and the face/start
         // buttons mirror the TopAppBar actions. L2/R2 tab-switching is
         // handled at the Activity level, not here, so we don't consume
         // them below.
@@ -334,6 +334,43 @@ fun SavesScreen(
                 .focusRequester(listFocusRequester)
                 .focusable()
                 .onPreviewKeyEvent { event ->
+                    if (holdNav.handleHorizontalHoldKeyEvent(
+                            event,
+                            coroutineScope,
+                            onPage = { d ->
+                                if (saves.isNotEmpty()) {
+                                    val page = listState.layoutInfo.visibleItemsInfo.size
+                                        .coerceAtLeast(1)
+                                    selectedIndex = (selectedIndex + d * page)
+                                        .coerceIn(0, saves.size - 1)
+                                    coroutineScope.launch {
+                                        listState.animateScrollToItem(selectedIndex)
+                                    }
+                                }
+                            },
+                            onAlphabet = { d ->
+                                if (saves.isNotEmpty()) {
+                                    val cur = selectedIndex.coerceIn(0, saves.size - 1)
+                                    val curLetter = firstLetter(saves[cur].displayName)
+                                    val step = if (d > 0) 1 else -1
+                                    var row = cur + step
+                                    var found = -1
+                                    while (row in saves.indices) {
+                                        val ltr = firstLetter(saves[row].displayName)
+                                        if (ltr.isNotEmpty() && ltr != curLetter) {
+                                            found = row; break
+                                        }
+                                        row += step
+                                    }
+                                    selectedIndex = if (found >= 0) found
+                                        else if (d > 0) saves.size - 1 else 0
+                                    coroutineScope.launch {
+                                        listState.animateScrollToItem(selectedIndex)
+                                    }
+                                }
+                            },
+                        )
+                    ) return@onPreviewKeyEvent true
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
                         // D-pad / analog stick — vertical: scroll list
@@ -353,48 +390,6 @@ fun SavesScreen(
                                     listState.animateScrollToItem(selectedIndex)
                                 }
                             }
-                            true
-                        }
-                        // D-pad / stick left/right → page scroll, ramping
-                        // into alphabet jump on long hold (see HoldNav).
-                        // System filter cycle is on L1/R1 (Activity level).
-                        Key.DirectionLeft, Key.DirectionRight -> {
-                            val dir = if (event.key == Key.DirectionLeft) -1 else 1
-                            holdNav.onPress(
-                                dir,
-                                onPage = { d ->
-                                    if (saves.isNotEmpty()) {
-                                        val page = listState.layoutInfo.visibleItemsInfo.size
-                                            .coerceAtLeast(1)
-                                        selectedIndex = (selectedIndex + d * page)
-                                            .coerceIn(0, saves.size - 1)
-                                        coroutineScope.launch {
-                                            listState.animateScrollToItem(selectedIndex)
-                                        }
-                                    }
-                                },
-                                onAlphabet = { d ->
-                                    if (saves.isNotEmpty()) {
-                                        val cur = selectedIndex.coerceIn(0, saves.size - 1)
-                                        val curLetter = firstLetter(saves[cur].displayName)
-                                        val step = if (d > 0) 1 else -1
-                                        var row = cur + step
-                                        var found = -1
-                                        while (row in saves.indices) {
-                                            val ltr = firstLetter(saves[row].displayName)
-                                            if (ltr.isNotEmpty() && ltr != curLetter) {
-                                                found = row; break
-                                            }
-                                            row += step
-                                        }
-                                        selectedIndex = if (found >= 0) found
-                                            else if (d > 0) saves.size - 1 else 0
-                                        coroutineScope.launch {
-                                            listState.animateScrollToItem(selectedIndex)
-                                        }
-                                    }
-                                },
-                            )
                             true
                         }
                         // A / Enter → open selected game
@@ -428,7 +423,7 @@ fun SavesScreen(
                             onNavigateToSettings()
                             true
                         }
-                        // L1/R1 (tab cycle) and L2/R2 (system cycle) are
+                        // L1/R1 (system cycle) and L2/R2 (tab cycle) are
                         // intercepted at the Activity level — never reach
                         // Compose here.
                         else -> false

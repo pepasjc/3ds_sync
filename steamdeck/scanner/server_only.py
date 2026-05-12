@@ -209,23 +209,28 @@ def _default_save_path(
     title_id: str,
     display_name: str,
     emulation_path: Path,
+    canonical_name: Optional[str] = None,
 ) -> tuple[Optional[Path], bool, bool]:
     """Predict a save_path for a server-only placeholder.
 
     Returns ``(path, is_multi_file, is_psp_slot)``.  ``path=None`` means
-    this system isn't supported by the generic builder — the UI will keep
-    the Download button hidden and the user must install the ROM first.
+    this system isn't supported by the generic builder, OR the server has
+    no canonical (No-Intro/DAT) name for the title — the UI will keep the
+    Download button hidden and the user must install the ROM so the
+    scanner can pin down the exact save filename the emulator expects.
+
+    ``canonical_name`` (when provided) is the No-Intro name from the
+    server's rom catalog.  It is used verbatim (after filesystem-safe
+    char stripping) as the filename stem — this matches what emulators
+    like RetroArch write to disk based on the ROM filename.  When the
+    canonical name is missing we refuse to guess, because the slug-derived
+    fallback (e.g. ``"Super Mario World Usa.srm"``) never matches the
+    emulator's actual save path (``"Super Mario World (USA).srm"``) and
+    would orphan the downloaded save.
     """
-    stem = _clean_stem(display_name)
-
-    if system == "PS1":
-        # DuckStation per-game card: "<clean label>_1.mcd".
-        return (_ps1_memcards_dir(emulation_path) / f"{stem}_1.mcd", False, False)
-
-    if system == "PS2":
-        # PCSX2 per-game VMP/PS2 card lives alongside the shared memcards.
-        return (_ps2_memcards_dir(emulation_path) / f"{stem}.ps2", False, False)
-
+    # PSP / Vita address savedata by title_id (the slot directory name), not
+    # by ROM filename, so they don't need a canonical-name lookup and remain
+    # syncable even when the catalog has no entry.
     if system == "PSP":
         # Each PSP title owns a SAVEDATA slot directory.  The server's
         # title_id is the slot name (e.g. ULUS10567DATA), so use it
@@ -234,6 +239,20 @@ def _default_save_path(
 
     if system == "VITA":
         return (_vita_savedata_root(emulation_path) / title_id, True, False)
+
+    # Filename-derived save paths require the canonical name to match what
+    # the emulator writes to disk.  Without it we refuse to guess.
+    if not canonical_name:
+        return (None, False, False)
+    stem = _UNSAFE_CHARS_RE.sub("", canonical_name).strip() or canonical_name
+
+    if system == "PS1":
+        # DuckStation per-game card: "<clean label>_1.mcd".
+        return (_ps1_memcards_dir(emulation_path) / f"{stem}_1.mcd", False, False)
+
+    if system == "PS2":
+        # PCSX2 per-game VMP/PS2 card lives alongside the shared memcards.
+        return (_ps2_memcards_dir(emulation_path) / f"{stem}.ps2", False, False)
 
     if system == "NDS":
         return (_nds_roms_dir(emulation_path) / f"{stem}.sav", False, False)
@@ -286,6 +305,7 @@ def build_server_only_entries(
     server_saves: dict[str, dict],
     seen_ids: Iterable[str],
     emulation_path: Path,
+    canonical_names: Optional[dict[str, str]] = None,
 ) -> list[GameEntry]:
     """
     Emit a placeholder ``GameEntry`` for each server save that is not
@@ -294,8 +314,17 @@ def build_server_only_entries(
     a predicted ``save_path`` for supported systems so the user can
     download the save straight away; systems we can't predict for leave
     ``save_path=None`` and still surface so the user can Download ROM.
+
+    ``canonical_names`` maps title_id -> canonical No-Intro/DAT name (as
+    returned by ``SyncClient.lookup_canonical_names``).  When present, it
+    is used as the source of truth for the save filename stem.  When
+    absent for a given title_id, filename-derived systems (PS1/PS2/NDS/
+    Saturn/RetroArch SRM) leave ``save_path=None`` so the user is forced
+    to install the ROM rather than ending up with a save at a path the
+    emulator can't load.
     """
     seen_set = set(seen_ids)
+    canonical_names = canonical_names or {}
     results: list[GameEntry] = []
 
     for title_id, info in server_saves.items():
@@ -310,11 +339,19 @@ def build_server_only_entries(
             continue
 
         emulator = _SYSTEM_EMULATOR.get(system, "Server")
+        canonical = canonical_names.get(title_id)
+        # Prefer the canonical name for display so the UI shows the same
+        # label the emulator uses (parentheses, hyphens, mixed case all
+        # preserved) rather than a slug-cleaned approximation.
         display_name = (
-            info.get("name") or info.get("game_name") or title_id
+            canonical
+            or info.get("name")
+            or info.get("game_name")
+            or title_id
         )
         save_path, is_multi_file, is_psp_slot = _default_save_path(
-            system, title_id, display_name, emulation_path
+            system, title_id, display_name, emulation_path,
+            canonical_name=canonical,
         )
         results.append(
             GameEntry(

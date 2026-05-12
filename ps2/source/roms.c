@@ -8,6 +8,9 @@
  *   PS2 (CD)  → mass:/CD/<SLUS_213.71>.<title>.iso
  *   else      → mass:/3dssync/downloads/<filename>
  *
+ * ``mass:`` can be USB or an internal ATA HDD exposed through the
+ * PS2SDK BDM/FatFs stack.  The caller sets the detected root.
+ *
  * Serial format: OPL expects ``SXXX_NNN.NN`` (8 chars + dot + 2 digits).
  * Server returns either that form or ``SXXX-NNNNN``; we normalise here.
  */
@@ -24,32 +27,44 @@
 #include <strings.h>
 #include <sys/stat.h>
 
-static char g_usb_root[16] = USB_DEFAULT_ROOT;
+static char g_storage_root[16] = STORAGE_DEFAULT_ROOT;
 static char g_downloads_file[96] = DOWNLOADS_FILE;
 
-static void usb_join(char *out, size_t out_size, const char *suffix) {
+static void storage_join(char *out, size_t out_size, const char *suffix) {
     if (!out || out_size == 0) return;
-    snprintf(out, out_size, "%s%s", g_usb_root, suffix ? suffix : "");
+    snprintf(out, out_size, "%s%s", g_storage_root, suffix ? suffix : "");
 }
 
-void roms_set_usb_root(const char *root) {
-    if (!root || !root[0]) root = USB_DEFAULT_ROOT;
-    strncpy(g_usb_root, root, sizeof(g_usb_root) - 1);
-    g_usb_root[sizeof(g_usb_root) - 1] = '\0';
-    usb_join(g_downloads_file, sizeof(g_downloads_file),
-             USB_DATA_SUBDIR "/downloads.dat");
+void roms_set_storage_root(const char *root) {
+    if (!root || !root[0]) root = STORAGE_DEFAULT_ROOT;
+    strncpy(g_storage_root, root, sizeof(g_storage_root) - 1);
+    g_storage_root[sizeof(g_storage_root) - 1] = '\0';
+    storage_join(g_downloads_file, sizeof(g_downloads_file),
+                 STORAGE_DATA_SUBDIR "/downloads.dat");
 }
 
-const char *roms_usb_root(void) {
-    return g_usb_root;
+const char *roms_storage_root(void) {
+    return g_storage_root;
 }
 
 const char *roms_downloads_file(void) {
     return g_downloads_file;
 }
 
+void roms_storage_data_dir(char *out_path, size_t out_size) {
+    storage_join(out_path, out_size, STORAGE_DATA_SUBDIR);
+}
+
+void roms_set_usb_root(const char *root) {
+    roms_set_storage_root(root);
+}
+
+const char *roms_usb_root(void) {
+    return roms_storage_root();
+}
+
 void roms_usb_data_dir(char *out_path, size_t out_size) {
-    usb_join(out_path, out_size, USB_DATA_SUBDIR);
+    roms_storage_data_dir(out_path, out_size);
 }
 
 /* --- Tiny JSON helpers (lifted from the PSP client) --- */
@@ -415,11 +430,11 @@ void roms_mkdir_p(const char *path) {
 
 void roms_ensure_target_dirs(void) {
     char path[128];
-    usb_join(path, sizeof(path), "/DVD");
+    storage_join(path, sizeof(path), "/DVD");
     roms_mkdir_p(path);
-    usb_join(path, sizeof(path), "/CD");
+    storage_join(path, sizeof(path), "/CD");
     roms_mkdir_p(path);
-    usb_join(path, sizeof(path), USB_DATA_SUBDIR "/downloads");
+    storage_join(path, sizeof(path), STORAGE_DATA_SUBDIR "/downloads");
     roms_mkdir_p(path);
 }
 
@@ -432,7 +447,7 @@ bool roms_resolve_target_path(const RomEntry *rom,
      * safe fallback in case the user points at a different system. */
     if (strcasecmp(rom->system, "PS2") != 0) {
         char fallback[128];
-        usb_join(fallback, sizeof(fallback), USB_DATA_SUBDIR "/downloads");
+        storage_join(fallback, sizeof(fallback), STORAGE_DATA_SUBDIR "/downloads");
         int n = snprintf(out_path, out_size,
                          "%s/%s", fallback, rom->filename);
         return n > 0 && (size_t)n < out_size;
@@ -459,7 +474,7 @@ bool roms_resolve_target_path(const RomEntry *rom,
     if (strlen(title) > 32) title[32] = '\0';
 
     char root[64];
-    usb_join(root, sizeof(root), rom->is_cd ? "/CD" : "/DVD");
+    storage_join(root, sizeof(root), rom->is_cd ? "/CD" : "/DVD");
     int n = snprintf(out_path, out_size,
                      "%s/%s.%s.iso", root, serial, title);
     return n > 0 && (size_t)n < out_size;
@@ -563,8 +578,8 @@ void roms_scan_local(LocalRomList *out) {
     out->last_error[0] = '\0';
 
     char dvd_path[64], cd_path[64];
-    usb_join(dvd_path, sizeof(dvd_path), "/DVD");
-    usb_join(cd_path,  sizeof(cd_path),  "/CD");
+    storage_join(dvd_path, sizeof(dvd_path), "/DVD");
+    storage_join(cd_path,  sizeof(cd_path),  "/CD");
 
     int dvd_count = local_scan_dir(dvd_path, false, out);
     int cd_count  = local_scan_dir(cd_path,  true,  out);

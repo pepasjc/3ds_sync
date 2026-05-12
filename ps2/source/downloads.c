@@ -2,7 +2,7 @@
  * downloads.c — flat-file download manager.
  *
  * Same persistence shape as PSP / PS3 clients: a line-per-entry text
- * file with pipe-separated fields on the detected USB root.  In-RAM
+ * file with pipe-separated fields on the detected storage root.  In-RAM
  * mirror mutated via downloads_upsert_from_catalog / downloads_remove
  * and flushed atomically to disk via tmp+rename.
  */
@@ -61,7 +61,7 @@ static void rebase_target_root(char *target_path, size_t target_path_size) {
 
     const char *suffix = colon + 1;
     char rebased[DOWNLOAD_PATH_LEN];
-    snprintf(rebased, sizeof(rebased), "%s%s", roms_usb_root(), suffix);
+    snprintf(rebased, sizeof(rebased), "%s%s", roms_storage_root(), suffix);
     strncpy(target_path, rebased, target_path_size - 1);
     target_path[target_path_size - 1] = '\0';
 }

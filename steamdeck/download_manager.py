@@ -318,16 +318,26 @@ class _DownloadWorker(QObject):
                 # remaining bytes).  Falls back to ``Content-Length`` +
                 # current offset for 206, or ``Content-Length`` alone
                 # for 200.
+                #
+                # The server's headers are also authoritative over the
+                # catalog ``ent.total_bytes`` we seeded ``total`` with —
+                # for ``?extract=`` downloads the catalog size is the
+                # *source* file size (e.g. .cci) while the wire payload
+                # is the converted output (e.g. .iso), and those rarely
+                # match.  If the server tells us a real size, take it.
+                server_total = 0
                 cr = r.headers.get("Content-Range", "")
                 if cr and "/" in cr:
                     try:
-                        total = int(cr.split("/", 1)[1])
+                        server_total = int(cr.split("/", 1)[1])
                     except ValueError:
                         pass
-                if total <= 0:
+                if server_total <= 0:
                     cl = int(r.headers.get("Content-Length", "0") or 0)
                     if cl > 0:
-                        total = downloaded + cl if honoured_range else cl
+                        server_total = downloaded + cl if honoured_range else cl
+                if server_total > 0:
+                    total = server_total
 
                 # Open the .part for append-or-create.  ``r+b`` errors if
                 # the file doesn't exist, so use ``a+b`` then seek.

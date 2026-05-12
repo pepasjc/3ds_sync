@@ -9,9 +9,10 @@
  *   static_ip=192.168.1.95
  *   static_netmask=255.255.255.0
  *   static_gateway=192.168.1.1
+ *   storage=auto      # auto, usb, or hdd
  *
- * USB is only the ROM/download target; catalog fetches should work even
- * when mass:/ is absent.
+ * Storage is only the ROM/download target; catalog fetches should work
+ * even when mass:/ is absent.
  */
 
 #include "config.h"
@@ -66,7 +67,8 @@ static void trim(char *s) {
 
 static void config_clear(SyncState *state) {
     memset(state, 0, sizeof(*state));
-    strncpy(state->usb_root, USB_DEFAULT_ROOT, sizeof(state->usb_root) - 1);
+    state->storage_pref = STORAGE_PREF_AUTO;
+    strncpy(state->usb_root, STORAGE_DEFAULT_ROOT, sizeof(state->usb_root) - 1);
 }
 
 static void config_apply_defaults(SyncState *state) {
@@ -108,6 +110,40 @@ static bool parse_bool_value(const char *value, bool *out) {
         return true;
     }
     return false;
+}
+
+static bool parse_storage_pref_value(const char *value, StoragePreference *out) {
+    if (!value || !out) return false;
+    if (strcasecmp(value, "auto") == 0 ||
+        strcasecmp(value, "default") == 0)
+    {
+        *out = STORAGE_PREF_AUTO;
+        return true;
+    }
+    if (strcasecmp(value, "usb") == 0 ||
+        strcasecmp(value, "mass") == 0 ||
+        strcasecmp(value, "mass0") == 0)
+    {
+        *out = STORAGE_PREF_USB;
+        return true;
+    }
+    if (strcasecmp(value, "hdd") == 0 ||
+        strcasecmp(value, "internal") == 0 ||
+        strcasecmp(value, "ata") == 0)
+    {
+        *out = STORAGE_PREF_HDD;
+        return true;
+    }
+    return false;
+}
+
+const char *config_storage_pref_to_str(StoragePreference pref) {
+    switch (pref) {
+        case STORAGE_PREF_USB:  return "usb";
+        case STORAGE_PREF_HDD:  return "hdd";
+        case STORAGE_PREF_AUTO:
+        default:                return "auto";
+    }
 }
 
 static void set_err(char *err_out, size_t err_size, const char *fmt, ...) {
@@ -243,7 +279,8 @@ static bool write_template(void) {
         "use_static_ip=true\n"
         "static_ip=" DEFAULT_STATIC_IP "\n"
         "static_netmask=" DEFAULT_NETMASK "\n"
-        "static_gateway=" DEFAULT_GATEWAY "\n";
+        "static_gateway=" DEFAULT_GATEWAY "\n"
+        "storage=auto\n";
     return mc_write_text(MC_CONFIG_FILE, text);
 }
 
@@ -308,6 +345,14 @@ static void parse_config_text(SyncState *state, char *text) {
                     strncpy(state->static_gateway, val,
                             sizeof(state->static_gateway) - 1);
                     state->static_gateway[sizeof(state->static_gateway) - 1] = '\0';
+                } else if (strcmp(key, "storage") == 0 ||
+                           strcmp(key, "storage_device") == 0 ||
+                           strcmp(key, "rom_storage") == 0)
+                {
+                    StoragePreference pref = STORAGE_PREF_AUTO;
+                    if (parse_storage_pref_value(val, &pref)) {
+                        state->storage_pref = pref;
+                    }
                 }
             }
         }
@@ -369,6 +414,7 @@ bool config_save(const SyncState *state) {
              "static_ip=%s\n"
              "static_netmask=%s\n"
              "static_gateway=%s\n"
+             "storage=%s\n"
              "%s%s%s",
              state->server_url,
              state->api_key,
@@ -376,6 +422,7 @@ bool config_save(const SyncState *state) {
              state->static_ip,
              state->static_netmask,
              state->static_gateway,
+             config_storage_pref_to_str(state->storage_pref),
              state->console_id[0] ? "console_id=" : "",
              state->console_id[0] ? state->console_id : "",
              state->console_id[0] ? "\n" : "");

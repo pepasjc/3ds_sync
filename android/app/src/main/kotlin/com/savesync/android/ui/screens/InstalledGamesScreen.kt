@@ -66,7 +66,7 @@ import com.savesync.android.ui.SaveDetailState
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
 import com.savesync.android.ui.components.firstLetter
-import com.savesync.android.ui.components.onPress
+import com.savesync.android.ui.components.handleHorizontalHoldKeyEvent
 import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 
@@ -240,6 +240,39 @@ fun InstalledGamesScreen(
                 .focusRequester(listFocusRequester)
                 .focusable()
                 .onPreviewKeyEvent { event ->
+                    if (holdNav.handleHorizontalHoldKeyEvent(
+                            event,
+                            scope,
+                            onPage = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val page = listState.layoutInfo.visibleItemsInfo.size
+                                        .coerceAtLeast(1)
+                                    selectedIndex = (selectedIndex + d * page)
+                                        .coerceIn(0, filtered.size - 1)
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                            onAlphabet = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val cur = selectedIndex.coerceIn(0, filtered.size - 1)
+                                    val curLetter = firstLetter(filtered[cur].displayName)
+                                    val step = if (d > 0) 1 else -1
+                                    var row = cur + step
+                                    var found = -1
+                                    while (row in filtered.indices) {
+                                        val ltr = firstLetter(filtered[row].displayName)
+                                        if (ltr.isNotEmpty() && ltr != curLetter) {
+                                            found = row; break
+                                        }
+                                        row += step
+                                    }
+                                    selectedIndex = if (found >= 0) found
+                                        else if (d > 0) filtered.size - 1 else 0
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                        )
+                    ) return@onPreviewKeyEvent true
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
                         Key.DirectionDown -> {
@@ -254,44 +287,6 @@ fun InstalledGamesScreen(
                                 selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
                                 scope.launch { listState.animateScrollToItem(selectedIndex) }
                             }
-                            true
-                        }
-                        // D-pad / stick left/right → page scroll, ramping
-                        // into alphabet jump on long hold (see HoldNav).
-                        // System filter cycle is on L1/R1 (Activity level).
-                        Key.DirectionLeft, Key.DirectionRight -> {
-                            val dir = if (event.key == Key.DirectionLeft) -1 else 1
-                            holdNav.onPress(
-                                dir,
-                                onPage = { d ->
-                                    if (filtered.isNotEmpty()) {
-                                        val page = listState.layoutInfo.visibleItemsInfo.size
-                                            .coerceAtLeast(1)
-                                        selectedIndex = (selectedIndex + d * page)
-                                            .coerceIn(0, filtered.size - 1)
-                                        scope.launch { listState.animateScrollToItem(selectedIndex) }
-                                    }
-                                },
-                                onAlphabet = { d ->
-                                    if (filtered.isNotEmpty()) {
-                                        val cur = selectedIndex.coerceIn(0, filtered.size - 1)
-                                        val curLetter = firstLetter(filtered[cur].displayName)
-                                        val step = if (d > 0) 1 else -1
-                                        var row = cur + step
-                                        var found = -1
-                                        while (row in filtered.indices) {
-                                            val ltr = firstLetter(filtered[row].displayName)
-                                            if (ltr.isNotEmpty() && ltr != curLetter) {
-                                                found = row; break
-                                            }
-                                            row += step
-                                        }
-                                        selectedIndex = if (found >= 0) found
-                                            else if (d > 0) filtered.size - 1 else 0
-                                        scope.launch { listState.animateScrollToItem(selectedIndex) }
-                                    }
-                                },
-                            )
                             true
                         }
                         Key.ButtonA, Key.Enter -> {
@@ -319,7 +314,7 @@ fun InstalledGamesScreen(
                             viewModel.scanInstalledRoms(force = true)
                             true
                         }
-                        // L1/R1 (tab cycle) and L2/R2 (system cycle) are
+                        // L1/R1 (system cycle) and L2/R2 (tab cycle) are
                         // intercepted at the Activity level — never reach here.
                         else -> false
                     }

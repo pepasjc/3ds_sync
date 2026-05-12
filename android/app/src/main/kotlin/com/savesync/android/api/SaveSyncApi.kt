@@ -149,6 +149,17 @@ interface SaveSyncApi {
         @Body request: SaturnArchiveLookupRequest
     ): SaturnArchiveLookupResponse
 
+    /**
+     * Resolve emulator-style title_ids (SYSTEM_slug) to canonical No-Intro /
+     * DAT names by joining against the server's ROM catalog.  Used when
+     * synthesising save filenames for server-only entries so the path
+     * matches what the emulator writes to disk.
+     */
+    @POST("api/v1/titles/canonical-names")
+    suspend fun lookupCanonicalNames(
+        @Body request: CanonicalNamesRequest
+    ): CanonicalNamesResponse
+
     // ── ROM catalog ──────────────────────────────────────────────────────
 
     @GET("api/v1/roms")

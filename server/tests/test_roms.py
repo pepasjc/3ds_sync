@@ -293,6 +293,38 @@ class TestRomCatalog:
         assert resp.status_code == 200
         assert resp.json()["total"] == 0
 
+    def test_canonical_names_resolves_emulator_title_ids(
+        self, rom_client, auth_headers
+    ):
+        resp = rom_client.post(
+            "/api/v1/titles/canonical-names",
+            json={
+                "title_ids": [
+                    "SNES_super_mario_world_usa",
+                    "GBA_test_rom",
+                    "SNES_does_not_exist",
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        names = resp.json()["names"]
+        assert names["SNES_super_mario_world_usa"] == "Super Mario World (USA)"
+        # GBA test rom has no DAT match; canonical name falls back to the
+        # scanner's display name (filename stem cleaned).
+        assert "GBA_test_rom" in names
+        # Unknown title_id is omitted so the client can detect "no match".
+        assert "SNES_does_not_exist" not in names
+
+    def test_canonical_names_empty_catalog(self, client, auth_headers):
+        resp = client.post(
+            "/api/v1/titles/canonical-names",
+            json={"title_ids": ["SNES_super_mario_world_usa"]},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["names"] == {}
+
     def test_list_roms_pagination(self, rom_client, auth_headers):
         # First page of 1 → total still reflects the full filtered count,
         # and has_more is true because page < total.

@@ -94,6 +94,14 @@ data class SaturnArchiveLookupRequest(
     val archive_names: List<String>
 )
 
+// ── Canonical name lookup ─────────────────────────────────────────────────
+// POST /api/v1/titles/canonical-names — resolves emulator-style title_ids
+// (e.g. "SNES_super_mario_world_usa") to their canonical No-Intro/DAT name
+// ("Super Mario World (USA)"). Used to construct save filenames that match
+// what the emulator writes to disk, rather than a slug-derived approximation.
+data class CanonicalNamesRequest(val title_ids: List<String>)
+data class CanonicalNamesResponse(val names: Map<String, String>)
+
 data class SaturnArchiveCandidate(
     val title_id: String,
     val game_name: String

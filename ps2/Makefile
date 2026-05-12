@@ -41,18 +41,23 @@ EE_CFLAGS  = -O2 -Wall -Wno-unused-function -DAPP_VERSION=\"$(APP_VERSION_STR)\"
 
 # IRX modules linked into the ELF as embedded blobs (bin2c-style).  This
 # avoids hunting for IRX files at runtime and lets a single .elf boot
-# from any device (USB, MC, host:).
+# from any device (USB, HDD, MC, host:).
 #
 # IRX list:
 #   iomanX       — extended IOP I/O manager (block devices register here)
 #   fileXio      — fileXio RPC, the EE→IOP bridge newlib stdio routes through
 #   usbd         — USB driver core
 #   bdm          — block-device manager (mount dispatcher)
+#   ata_bd       — internal ATA HDD → bdm bridge (PS2 fat network adapter)
 #   usbmass_bd   — USB mass storage → bdm bridge
 #   bdmfs_fatfs  — FAT filesystem on bdm; registers ``mass:`` once a USB
-#                  device with a FAT partition is attached
+#                  or ATA device with a FAT/exFAT partition is attached
 #   usbhdfsd     — legacy single-module USB mass storage; loaded as
 #                  fallback when bdm stack fails (older / mismatched ABI)
+#   poweroff     — IOP power-off callbacks required by ps2fs
+#   ps2atad      — classic ATA driver used by ps2hdd APA/PFS
+#   ps2hdd       — APA partition driver used by the HDD formatter
+#   ps2fs        — PFS filesystem driver used by the HDD formatter
 #   ps2dev9      — DEV9 (network adapter / HDD bridge)
 #   netman       — network manager
 #   smap         — SMAP ethernet driver (built into PS2 slim, ext on fat)
@@ -68,6 +73,7 @@ EE_LIBS    = -lpatches \
              -lcdvd \
              -lmc \
              -lpadx \
+             -lhdd \
              -lfileXio \
              -liopreboot \
              -ldebug \
@@ -80,16 +86,21 @@ IRX_FILES   = iomanX.irx \
               fileXio.irx \
               usbd.irx \
               bdm.irx \
+              ps2dev9.irx \
+              ata_bd.irx \
               usbmass_bd.irx \
               bdmfs_fatfs.irx \
               usbhdfsd.irx \
-              ps2dev9.irx \
+              poweroff.irx \
+              ps2atad.irx \
+              ps2hdd.irx \
+              ps2fs.irx \
               netman.irx \
               smap.irx
 
 # Generate include/irx_mods.h + source/irx_mods.c with bin2c blobs.
 # bin2c output is one .o per IRX, concatenated via the wrapper file.
-source/irx_mods.c include/irx_mods.h: $(addprefix $(IRX_SRC_DIR)/,$(IRX_FILES)) tools/gen_irx_mods.sh
+source/irx_mods.c include/irx_mods.h: $(addprefix $(IRX_SRC_DIR)/,$(IRX_FILES)) tools/gen_irx_mods.sh Makefile
 	@mkdir -p source include
 	bash tools/gen_irx_mods.sh "$(IRX_SRC_DIR)" "$(IRX_FILES)" source/irx_mods.c include/irx_mods.h
 

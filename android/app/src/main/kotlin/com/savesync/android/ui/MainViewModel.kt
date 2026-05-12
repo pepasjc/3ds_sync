@@ -741,13 +741,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val stillUnanchoredTitles = normalizedUnmatchedTitles
                             .filter { !fullyEffectiveRomEntries.containsKey(it.title_id) }
 
+                        // Ask the server for canonical (No-Intro / DAT) names for every
+                        // title we're about to surface as server-only.  PS1 in particular
+                        // builds the DuckStation memory-card filename from the display
+                        // name, so a slug-derived name (e.g. "Ganbare Goemon 2 Kiteretsu
+                        // Shougun Mcguiness Japan") never matches what DuckStation writes
+                        // ("Ganbare Goemon 2 - Kiteretsu Shougun McGuiness (Japan)").
+                        // The lookup is best-effort: if the server has no catalog hit for
+                        // a title we fall back to whatever name came down with the save.
+                        val canonicalNames = fetchCanonicalNames(
+                            api, stillUnanchoredTitles.map { it.title_id }
+                        )
+
                         // Some PS1 titles still cannot be anchored to a scanned ROM entry
                         // (missing serial, odd image format, etc.). In that case we still
                         // surface them using a DuckStation-style predicted card filename so
                         // the user can download them and, in many cases, DuckStation will
                         // already pick them up.
                         val ps1ServerOnly = stillUnanchoredTitles
-                            .mapNotNull { titleInfo -> buildPs1ServerOnlyEntry(titleInfo) }
+                            .mapNotNull { titleInfo ->
+                                buildPs1ServerOnlyEntry(titleInfo, canonicalNames)
+                            }
 
                         // PS2 is a special case: AetherSX2 often uses shared default cards
                         // instead of per-game saves, so there may be no local ROM/save-derived
@@ -758,7 +772,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 buildPs2ServerOnlyEntry(
                                     titleInfo,
                                     currentSettings.saveDirOverrides,
-                                    currentSettings.emudeckDir
+                                    currentSettings.emudeckDir,
+                                    canonicalNames
                                 )
                             }
 
@@ -771,7 +786,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 buildPspServerOnlyEntry(
                                     titleInfo,
                                     currentSettings.saveDirOverrides,
-                                    currentSettings.emudeckDir
+                                    currentSettings.emudeckDir,
+                                    canonicalNames
                                 )
                             }
 
@@ -784,7 +800,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 buildGcServerOnlyEntry(
                                     titleInfo,
                                     currentSettings.saveDirOverrides,
-                                    currentSettings.emudeckDir
+                                    currentSettings.emudeckDir,
+                                    canonicalNames
                                 )
                             }
 
@@ -793,7 +810,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 build3dsServerOnlyEntry(
                                     titleInfo,
                                     currentSettings.saveDirOverrides,
-                                    currentSettings.emudeckDir
+                                    currentSettings.emudeckDir,
+                                    canonicalNames
                                 )
                             }
 
@@ -1004,7 +1022,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun buildPspServerOnlyEntry(
         titleInfo: com.savesync.android.api.TitleInfo,
         saveDirOverrides: Map<String, String>,
-        emudeckDir: String
+        emudeckDir: String,
+        canonicalNames: Map<String, String> = emptyMap()
     ): SaveEntry? {
         val system = normalizeSystemCode(
             titleInfo.platform
@@ -1027,7 +1046,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             PpssppEmulator.defaultSlotDir(pspBase, titleInfo.title_id) ?: return null
         }
 
-        val displayName = titleInfo.name
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: titleInfo.name
             ?: titleInfo.game_name
             ?: titleInfo.title_id
 
@@ -1039,7 +1060,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveDir = slotDir,
             isMultiFile = false,
             isServerOnly = true,
-            canonicalName = titleInfo.name?.takeIf { it != displayName }
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: titleInfo.name?.takeIf { it != displayName }
                 ?: titleInfo.game_name?.takeIf { it != displayName }
         )
     }
@@ -1047,7 +1069,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun buildPs2ServerOnlyEntry(
         titleInfo: com.savesync.android.api.TitleInfo,
         saveDirOverrides: Map<String, String>,
-        emudeckDir: String
+        emudeckDir: String,
+        canonicalNames: Map<String, String> = emptyMap()
     ): SaveEntry? {
         val system = normalizeSystemCode(
             titleInfo.platform
@@ -1075,7 +1098,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ) ?: return null
         }
 
-        val displayName = titleInfo.name
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: titleInfo.name
             ?: titleInfo.game_name
             ?: titleInfo.title_id
         val predictedFile = File(
@@ -1090,7 +1115,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveFile = predictedFile,
             saveDir = null,
             isServerOnly = true,
-            canonicalName = titleInfo.name?.takeIf { it != displayName }
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: titleInfo.name?.takeIf { it != displayName }
                 ?: titleInfo.game_name?.takeIf { it != displayName }
         )
     }
@@ -1110,7 +1136,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun buildGcServerOnlyEntry(
         titleInfo: com.savesync.android.api.TitleInfo,
         saveDirOverrides: Map<String, String>,
-        emudeckDir: String
+        emudeckDir: String,
+        canonicalNames: Map<String, String> = emptyMap()
     ): SaveEntry? {
         val system = normalizeSystemCode(
             titleInfo.platform
@@ -1120,7 +1147,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         if (system != "GC") return null
 
-        val displayName = titleInfo.name
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: titleInfo.name
             ?: titleInfo.game_name
             ?: titleInfo.title_id
 
@@ -1141,7 +1170,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveFile = saveFile,
             saveDir = null,
             isServerOnly = true,
-            canonicalName = titleInfo.name?.takeIf { it != displayName }
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: titleInfo.name?.takeIf { it != displayName }
                 ?: titleInfo.game_name?.takeIf { it != displayName }
         )
     }
@@ -1149,7 +1179,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun build3dsServerOnlyEntry(
         titleInfo: com.savesync.android.api.TitleInfo,
         saveDirOverrides: Map<String, String>,
-        emudeckDir: String
+        emudeckDir: String,
+        canonicalNames: Map<String, String> = emptyMap()
     ): SaveEntry? {
         val system = normalizeSystemCode(
             titleInfo.platform
@@ -1180,7 +1211,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         } ?: return null
 
-        val displayName = titleInfo.game_name
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: titleInfo.game_name
             ?: titleInfo.name
             ?: titleInfo.title_id
 
@@ -1192,7 +1225,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveDir = saveDir,
             isMultiFile = true,
             isServerOnly = true,
-            canonicalName = titleInfo.game_name?.takeIf { it != displayName }
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: titleInfo.game_name?.takeIf { it != displayName }
                 ?: titleInfo.name?.takeIf { it != displayName }
         )
     }
@@ -1367,7 +1401,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * title rather than the serial, and often omits disc numbers, so we mimic that.
      */
     private fun buildPs1ServerOnlyEntry(
-        titleInfo: com.savesync.android.api.TitleInfo
+        titleInfo: com.savesync.android.api.TitleInfo,
+        canonicalNames: Map<String, String> = emptyMap()
     ): SaveEntry? {
         val system = normalizeSystemCode(
             titleInfo.platform
@@ -1380,7 +1415,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val memcardsDir = DuckStationEmulator.findMemcardsDir(Environment.getExternalStorageDirectory())
             ?: return null
 
-        val displayName = titleInfo.game_name
+        // Canonical (No-Intro) name wins: DuckStation derives the per-game
+        // card filename from the ROM label, so we must match the exact
+        // form ("Foo - Subtitle (Region)") rather than a slug-deslugged
+        // approximation ("Foo Subtitle Region").
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: titleInfo.game_name
             ?: titleInfo.name
             ?: titleInfo.title_id
         val predictedBase = duckStationPs1CardBaseName(displayName)
@@ -1393,7 +1434,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveFile = predictedFile,
             saveDir = null,
             isServerOnly = true,
-            canonicalName = titleInfo.game_name?.takeIf { it != displayName }
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: titleInfo.game_name?.takeIf { it != displayName }
                 ?: titleInfo.name?.takeIf { it != displayName }
         )
     }
@@ -1636,6 +1678,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .replace(Regex("""\s*\[[^\]]*]"""), "")
             .replace(Regex("""\s+"""), " ")
             .trim()
+    }
+
+    /**
+     * Batch-resolve emulator-style title_ids to canonical No-Intro / DAT
+     * names via POST /api/v1/titles/canonical-names.  Returns a sparse map:
+     * title_ids with no catalog hit on the server are omitted so the
+     * caller's null-safe fallback chain runs unchanged.  Network / older-
+     * server errors degrade silently to an empty map.
+     */
+    private suspend fun fetchCanonicalNames(
+        api: SaveSyncApi,
+        titleIds: List<String>
+    ): Map<String, String> {
+        if (titleIds.isEmpty()) return emptyMap()
+        return try {
+            val response = api.lookupCanonicalNames(
+                com.savesync.android.api.CanonicalNamesRequest(
+                    title_ids = titleIds.distinct()
+                )
+            )
+            response.names.filterValues { it.isNotBlank() }
+        } catch (_: Exception) {
+            emptyMap()
+        }
     }
 
     private suspend fun lookupServerTitleTypes(

@@ -19,7 +19,9 @@
  * Storage layout.
  *
  * Config + console identity live on the memory card. ROM ISOs and the
- * download queue live on USB at OPL's expected layout:
+ * download queue live on the detected mass-storage root at OPL's
+ * expected layout. That root can be USB or an internal HDD on a PS2
+ * fat model formatted as FAT/exFAT through BDM:
  *   mass:/DVD/<SERIAL>.<title>.iso  - DVD games (>750 MB)
  *   mass:/CD/<SERIAL>.<title>.iso   - CD games (<=750 MB)
  */
@@ -27,9 +29,13 @@
 #define CONFIG_PATH         APP_MC_DIR "/CONFIG.TXT"
 #define CONSOLE_ID_FILE     APP_MC_DIR "/CONSOLEID.TXT"
 
-#define USB_DEFAULT_ROOT    "mass:"
-#define USB_DATA_SUBDIR     "/3dssync"
-#define DOWNLOADS_FILE      USB_DEFAULT_ROOT USB_DATA_SUBDIR "/downloads.dat"
+#define STORAGE_DEFAULT_ROOT    "mass:"
+#define STORAGE_DATA_SUBDIR     "/3dssync"
+#define DOWNLOADS_FILE          STORAGE_DEFAULT_ROOT STORAGE_DATA_SUBDIR "/downloads.dat"
+
+/* Backwards-compatible aliases for older PS2 client code paths. */
+#define USB_DEFAULT_ROOT        STORAGE_DEFAULT_ROOT
+#define USB_DATA_SUBDIR         STORAGE_DATA_SUBDIR
 
 /* Top-level views.  START cycles in order. */
 typedef enum {
@@ -39,6 +45,12 @@ typedef enum {
     APP_VIEW_CONFIG    = 3,
     APP_VIEW_COUNT     = 4,
 } AppView;
+
+typedef enum {
+    STORAGE_PREF_AUTO = 0,
+    STORAGE_PREF_USB  = 1,
+    STORAGE_PREF_HDD  = 2,
+} StoragePreference;
 
 typedef struct {
     char server_url[256];
@@ -58,7 +70,9 @@ typedef struct {
     char static_netmask[16];
     char static_gateway[16];
 
-    /* USB mass storage state */
+    StoragePreference storage_pref; /* auto, usb, or hdd */
+
+    /* Detected BDM mass-storage state (USB or internal HDD FAT/exFAT). */
     bool usb_ready;
     char usb_root[16];       /* "mass:", "mass1:", etc. */
 } SyncState;

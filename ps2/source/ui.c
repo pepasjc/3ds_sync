@@ -14,7 +14,7 @@
  *
  * Layout (80 cols × 28 rows, 8x8 char cells, NTSC 640x224 single field):
  *
- *   row 0..1   header (app + view + net/usb/server line)
+ *   row 0..1   header (app + view + net/storage/server line)
  *   row 2      blue separator
  *   row 3..25  scrolling list (23 rows visible)
  *   row 26     blue separator
@@ -144,9 +144,18 @@ static const char *view_hints(AppView v) {
         case APP_VIEW_DOWNLOADS:
             return "X=start/resume  []=remove  D-pad=move";
         case APP_VIEW_CONFIG:
-            return "Edit mc0:/3DSSYNC/CONFIG.TXT then re-launch";
+            return "Left/Right=storage  /\\=format APA HDD  relaunch after storage change";
         default:
             return "";
+    }
+}
+
+static const char *storage_pref_label(StoragePreference pref) {
+    switch (pref) {
+        case STORAGE_PREF_USB:  return "usb";
+        case STORAGE_PREF_HDD:  return "hdd";
+        case STORAGE_PREF_AUTO:
+        default:                return "auto";
     }
 }
 
@@ -217,7 +226,7 @@ void ui_draw_header(const SyncState *state, AppView view) {
 
     fill_row(1, C_HEADER_BG);
     put_printf(0, 1, C_TEXT_DIM, C_HEADER_BG, COLS,
-               "Net: %-15s  USB: %-7s  Server: %.40s",
+               "Net: %-15s  Store: %-7s  Server: %.38s",
                state->ip[0]         ? state->ip         : "not-ready",
                state->usb_ready     ? state->usb_root   : "not-ready",
                state->server_url[0] ? state->server_url : "(unconfigured)");
@@ -423,11 +432,14 @@ void ui_draw_config(const SyncState *state) {
     cfg_line(&row, C_TEXT, "network    = %s (%s)",
              (state->net_ready && state->dhcp_ok) ? "ready" : "not ready",
              state->ip[0] ? state->ip : "no ip");
-    cfg_line(&row, C_TEXT, "usb        = %s",
+    cfg_line(&row, C_TEXT, "storage    = %s",
+             storage_pref_label(state->storage_pref));
+    cfg_line(&row, C_TEXT, "store_root = %s",
              state->usb_ready ? state->usb_root : "not ready");
+    cfg_line(&row, C_TEXT, "hdd_format = TRIANGLE twice (PS2 APA, wipes disk)");
     row++;
     cfg_line(&row, C_TEXT_DIM,
-             "Edit %s with uLaunchELF, then re-launch ps2sync.",
+             "Use Left/Right for storage, or edit %s with uLaunchELF.",
              CONFIG_PATH);
 }
 

@@ -345,10 +345,27 @@ class ServerWorker(QObject):
         # Generic placeholders for every other system — lets the user see
         # (and Download-ROM for) server saves on systems without a dedicated
         # scanner-level builder (PS1, PS2, PSP, GBA, SNES, NES, ...).
+        #
+        # Filename-derived systems (PS1 .mcd, NES/SNES/GBA .srm, ...) need
+        # the canonical No-Intro name to construct a save path the emulator
+        # can find.  Batch-ask the server for canonical names so we use the
+        # exact stem the emulator uses on disk, rather than reverse-deriving
+        # one from the slug.
         seen_ids = {entry.title_id for entry in updated}
+        unseen_title_ids = [
+            tid for tid in server_saves.keys() if tid not in seen_ids
+        ]
+        canonical_names = (
+            self._client.lookup_canonical_names(unseen_title_ids)
+            if unseen_title_ids
+            else {}
+        )
         updated.extend(
             server_only.build_server_only_entries(
-                server_saves, seen_ids, self._emulation_path
+                server_saves,
+                seen_ids,
+                self._emulation_path,
+                canonical_names=canonical_names,
             )
         )
 
