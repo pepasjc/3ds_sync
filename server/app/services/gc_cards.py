@@ -43,11 +43,20 @@ import struct
 _GC_BLOCK_SIZE = 0x2000
 _GC_DIR1_OFFSET = 0x2000
 _GC_DIR2_OFFSET = 0x4000
+_GC_BAM1_OFFSET = 0x6000
+_GC_BAM2_OFFSET = 0x8000
+_GC_DATA_OFFSET = 0xA000     # block 5 — first user data block
+_GC_FST_BLOCKS = 5           # header + dir + dir-backup + bam + bam-backup
 _GC_DENTRY_SIZE = 64
 _GC_MAX_ENTRIES = 127
 _GAMECODE_OFF = 0
 _FIRST_BLOCK_OFF = 54   # 0x36  (filename field is 0x20 = 32 bytes, per Dolphin source)
 _BLOCK_COUNT_OFF = 56   # 0x38
+
+# Full 8 MB / 1019-block card — the size MemCard Pro produces and the only
+# layout the desktop MemCard Pro GC profile should ever read or write.
+_GC_CARD_SIZE = 0x800000          # 1024 blocks * 0x2000
+_GC_USABLE_BLOCKS = 1019          # 1024 total - 5 system blocks
 
 # A GCI file is at minimum 64-byte header + 1 data block
 _MIN_GCI_SIZE = _GC_DENTRY_SIZE + _GC_BLOCK_SIZE
@@ -158,6 +167,119 @@ def gc_insert_gci(card_bytes: bytes, gci_bytes: bytes) -> bytes | None:
         return bytes(card)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Card formatter — build a full card image from a single GCI
+# ---------------------------------------------------------------------------
+
+def _checksums_be(data: bytes) -> tuple[int, int]:
+    """Dolphin ``calc_checksumsBE`` over big-endian u16 words.
+
+    Returns ``(checksum, inverse_checksum)``. ``data`` length must be even.
+    """
+    csum = 0
+    inv = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) | data[i + 1]
+        csum = (csum + word) & 0xFFFF
+        inv = (inv + (word ^ 0xFFFF)) & 0xFFFF
+    if csum == 0xFFFF:
+        csum = 0
+    if inv == 0xFFFF:
+        inv = 0
+    return csum, inv
+
+
+def gc_card_from_gci(gci_bytes: bytes) -> bytes | None:
+    """Build a full 8 MB GC memory card image holding a single save.
+
+    ``gci_bytes`` is the canonical GCI layout: a 64-byte directory entry
+    followed by ``block_count`` data blocks. The returned card is byte-for-byte
+    the shape MemCard Pro writes (verified against real cards): zeroed header
+    with ``sram_language = 1`` / ``size = 64 Mbit``, primary + backup directory,
+    primary + backup BAM, all checksums valid, and the file allocated starting
+    at block 5. Returns None if the GCI is malformed.
+    """
+    if len(gci_bytes) < _GC_DENTRY_SIZE:
+        return None
+    dentry = bytearray(gci_bytes[:_GC_DENTRY_SIZE])
+    data = gci_bytes[_GC_DENTRY_SIZE:]
+    block_count = struct.unpack_from(">H", dentry, _BLOCK_COUNT_OFF)[0]
+    if block_count == 0 or block_count > _GC_USABLE_BLOCKS:
+        return None
+    if len(data) != block_count * _GC_BLOCK_SIZE:
+        return None
+
+    first_block = _GC_FST_BLOCKS  # always allocate from the first user block
+    struct.pack_into(">H", dentry, _FIRST_BLOCK_OFF, first_block)
+
+    card = bytearray(b"\xff" * _GC_CARD_SIZE)
+
+    # --- Header (block 0) ---
+    card[0:0x26] = bytes(0x26)          # zero the structured header fields
+    struct.pack_into(">I", card, 0x18, 1)    # SRAM language = 1 (English)
+    struct.pack_into(">H", card, 0x22, 64)   # card size in Mbit
+    struct.pack_into(">H", card, 0x24, 0)    # encoding = ANSI/CP1252
+    struct.pack_into(">H", card, 0x1FA, 0)   # update counter
+    csum, inv = _checksums_be(bytes(card[0:0x1FC]))
+    struct.pack_into(">H", card, 0x1FC, csum)
+    struct.pack_into(">H", card, 0x1FE, inv)
+
+    # --- Directory + backup (blocks 1 & 2) ---
+    # Higher update counter is the "current" copy; backup is one behind.
+    for dir_off, counter in ((_GC_DIR1_OFFSET, 1), (_GC_DIR2_OFFSET, 0)):
+        card[dir_off : dir_off + _GC_DENTRY_SIZE] = dentry
+        struct.pack_into(">H", card, dir_off + 0x1FFA, counter)
+        d_csum, d_inv = _checksums_be(bytes(card[dir_off : dir_off + 0x1FFC]))
+        struct.pack_into(">H", card, dir_off + 0x1FFC, d_csum)
+        struct.pack_into(">H", card, dir_off + 0x1FFE, d_inv)
+
+    # --- Block allocation map + backup (blocks 3 & 4) ---
+    # Free blocks are marked 0x0000, so the BAM blocks are zero-filled rather
+    # than inheriting the card's 0xFF padding (0xFFFF would mean "last block of
+    # a chain" and make every free block look allocated -> card reads corrupt).
+    free_blocks = _GC_USABLE_BLOCKS - block_count
+    last_allocated = first_block + block_count - 1
+    for bam_off, counter in ((_GC_BAM1_OFFSET, 1), (_GC_BAM2_OFFSET, 0)):
+        card[bam_off : bam_off + _GC_BLOCK_SIZE] = bytes(_GC_BLOCK_SIZE)
+        struct.pack_into(">H", card, bam_off + 0x0004, counter)
+        struct.pack_into(">H", card, bam_off + 0x0006, free_blocks)
+        struct.pack_into(">H", card, bam_off + 0x0008, last_allocated)
+        # Chain each allocated block to the next; 0xFFFF marks the last.
+        for i in range(block_count):
+            map_off = bam_off + 0x000A + i * 2
+            value = 0xFFFF if i == block_count - 1 else first_block + i + 1
+            struct.pack_into(">H", card, map_off, value)
+        b_csum, b_inv = _checksums_be(bytes(card[bam_off + 0x0004 : bam_off + 0x2000]))
+        struct.pack_into(">H", card, bam_off + 0x0000, b_csum)
+        struct.pack_into(">H", card, bam_off + 0x0002, b_inv)
+
+    # --- File data (block 5+) ---
+    card[_GC_DATA_OFFSET : _GC_DATA_OFFSET + len(data)] = data
+
+    return bytes(card)
+
+
+def get_full_card_from_files(
+    files: list[tuple[str, bytes]],
+) -> tuple[str, bytes] | None:
+    """Return a full 8 MB card image, synthesizing one from a GCI if needed.
+
+    The desktop MemCard Pro profile must always receive a real card image, so
+    if the server only holds a bare GCI (uploaded by Dolphin/Android before any
+    desktop sync) it is wrapped into a fresh card here.
+    """
+    match = get_card_from_files(files)
+    if match is None:
+        return None
+    _, data = match
+    if is_gc_card_image(data):
+        return canonical_card_name(), data
+    card = gc_card_from_gci(data)
+    if card is not None:
+        return canonical_card_name(), card
+    return match  # not a recognizable GCI — hand back whatever we have
 
 
 # ---------------------------------------------------------------------------
