@@ -581,9 +581,23 @@
 </div>
 
 <script>
-// Injected server-side
-const API_KEY  = '__API_KEY__';
+// Injected server-side. The key is only baked in for an authenticated
+// request; otherwise it arrives empty and we fall back to a key the user
+// pastes once and we keep in localStorage. This stops the server from
+// handing the API key to any anonymous visitor who loads this page.
+let API_KEY  = '__API_KEY__';
 const IS_ADMIN = __IS_ADMIN__;
+
+if (!API_KEY) {
+  API_KEY = localStorage.getItem('gamesync_api_key') || '';
+  if (!API_KEY) {
+    const entered = window.prompt('Enter the GameSync API key to access the library:');
+    if (entered) {
+      API_KEY = entered.trim();
+      localStorage.setItem('gamesync_api_key', API_KEY);
+    }
+  }
+}
 
 // ═══════════════════════════════════════════════════════
 //  STATE

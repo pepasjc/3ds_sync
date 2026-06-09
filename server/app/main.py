@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast on an insecure config (weak/placeholder API key) before we
+    # bind a socket and start serving.
+    settings.validate_security()
+
     settings.save_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(settings.save_dir)
 

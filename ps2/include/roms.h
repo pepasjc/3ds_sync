@@ -71,6 +71,7 @@ bool roms_resolve_target_path(const RomEntry *rom,
 void roms_set_storage_root(const char *root);
 const char *roms_storage_root(void);
 const char *roms_downloads_file(void);
+void roms_set_downloads_file(const char *path);
 void roms_storage_data_dir(char *out_path, size_t out_size);
 
 /* Compatibility wrappers kept for existing callers. */
@@ -82,7 +83,7 @@ void roms_ensure_target_dirs(void);
 void roms_mkdir_p(const char *path);
 
 /*
- * Local ISO catalog — what's already on the selected storage root.
+ * Local game catalog — what's already on the selected storage backend.
  *
  * Scans mass:/DVD and mass:/CD for files matching the OPL naming
  * convention `<SERIAL>.<title>.iso`.  Used by the Local view so the

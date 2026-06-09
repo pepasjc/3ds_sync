@@ -21,6 +21,7 @@ EE_OBJS    = source/main.o \
              source/http.o \
              source/roms.o \
              source/downloads.o \
+             source/hdl.o \
              source/sha256.o \
              source/ui.o \
              source/irx_mods.o

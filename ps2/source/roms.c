@@ -51,6 +51,12 @@ const char *roms_downloads_file(void) {
     return g_downloads_file;
 }
 
+void roms_set_downloads_file(const char *path) {
+    if (!path || !path[0]) return;
+    strncpy(g_downloads_file, path, sizeof(g_downloads_file) - 1);
+    g_downloads_file[sizeof(g_downloads_file) - 1] = '\0';
+}
+
 void roms_storage_data_dir(char *out_path, size_t out_size) {
     storage_join(out_path, out_size, STORAGE_DATA_SUBDIR);
 }

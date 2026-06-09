@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from config import load_config, save_config
 from rom_installer import (
     ROM_FORMAT_OPTIONS,
     available_systems_for_profiles,
@@ -55,20 +57,30 @@ class CatalogFetchWorker(QThread):
 
 
 class InstallWorker(QThread):
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
+    progress = pyqtSignal(int, int)            # bytes downloaded / total for current item
+    item_started = pyqtSignal(int, int, str)   # index (1-based), total, display name
+    item_error = pyqtSignal(int, int, str, str)  # index, total, display name, message
+    finished = pyqtSignal(int, int, list)      # ok count, fail count, all written paths
 
-    def __init__(self, plan, parent=None):
+    def __init__(self, plans, parent=None):
         super().__init__(parent)
-        self.plan = plan
+        self.plans = plans
 
     def run(self):
-        try:
-            paths = install_rom(self.plan, progress_callback=self.progress.emit)
-            self.finished.emit([str(p) for p in paths])
-        except Exception as exc:
-            self.error.emit(str(exc) or exc.__class__.__name__)
+        ok = 0
+        fail = 0
+        all_paths: list[str] = []
+        total = len(self.plans)
+        for idx, plan in enumerate(self.plans, 1):
+            self.item_started.emit(idx, total, plan.display_name)
+            try:
+                paths = install_rom(plan, progress_callback=self.progress.emit)
+                all_paths.extend(str(p) for p in paths)
+                ok += 1
+            except Exception as exc:
+                fail += 1
+                self.item_error.emit(idx, total, plan.display_name, str(exc) or exc.__class__.__name__)
+        self.finished.emit(ok, fail, all_paths)
 
 
 class RomInstallerTab(QWidget):
@@ -122,6 +134,11 @@ class RomInstallerTab(QWidget):
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["System", "Name", "Filename", "Size", "Install Format", "ROM ID"]
@@ -137,13 +154,15 @@ class RomInstallerTab(QWidget):
         self.table.setColumnWidth(3, 90)
         self.table.setColumnWidth(4, 120)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.doubleClicked.connect(lambda _idx: self.install_selected())
         layout.addWidget(self.table, 1)
 
     def refresh_profiles(self):
-        current = self.profile_combo.currentText()
+        current = self.profile_combo.currentText() or load_config().get(
+            "last_installer_profile", ""
+        )
         self._profiles = self.profiles_tab.get_profiles()
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
@@ -165,6 +184,12 @@ class RomInstallerTab(QWidget):
 
     def _on_profile_changed(self):
         profile = self._current_profile()
+        name = self.profile_combo.currentText().strip()
+        if name:
+            cfg = load_config()
+            if cfg.get("last_installer_profile") != name:
+                cfg["last_installer_profile"] = name
+                save_config(cfg)
         systems = available_systems_for_profiles([profile]) if profile else []
         current = self.system_combo.currentText()
         self.system_combo.blockSignals(True)
@@ -244,57 +269,104 @@ class RomInstallerTab(QWidget):
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, rom)
         self.status_label.setText(f"{len(roms)} ROM(s)")
 
+    def _selected_rows(self) -> list[int]:
+        return sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
+
     def install_selected(self):
         profile = self._current_profile()
-        row = self.table.currentRow()
-        if not profile or row < 0:
+        if not profile:
             return
-        rom_item = self.table.item(row, 0)
-        rom = rom_item.data(Qt.ItemDataRole.UserRole) if rom_item else None
-        if not isinstance(rom, dict):
-            return
-        override = str(self.format_combo.currentData() or "auto")
-        try:
-            plan = build_install_plan(profile, rom, self.system_combo.currentText(), override)
-        except Exception as exc:
-            QMessageBox.critical(self, "ROM Installer", str(exc))
+        rows = self._selected_rows()
+        if not rows:
             return
 
-        target_text = str(plan.target_path)
+        override = str(self.format_combo.currentData() or "auto")
+        system = self.system_combo.currentText()
+        plans = []
+        errors = []
+        for row in rows:
+            rom_item = self.table.item(row, 0)
+            rom = rom_item.data(Qt.ItemDataRole.UserRole) if rom_item else None
+            if not isinstance(rom, dict):
+                continue
+            try:
+                plans.append(build_install_plan(profile, rom, system, override))
+            except Exception as exc:
+                errors.append(f"{rom.get('name') or rom.get('filename', '?')}: {exc}")
+        if not plans:
+            QMessageBox.critical(
+                self, "ROM Installer", "No installable ROMs.\n" + "\n".join(errors)
+            )
+            return
+
+        if len(plans) == 1:
+            p = plans[0]
+            prompt = f"Install {p.display_name} as {p.format_label} to:\n{p.target_path}"
+        else:
+            preview = "\n".join(f"  • {p.display_name} ({p.format_label})" for p in plans[:15])
+            more = f"\n  … and {len(plans) - 15} more" if len(plans) > 15 else ""
+            prompt = f"Install {len(plans)} ROMs (one at a time)?\n\n{preview}{more}"
         reply = QMessageBox.question(
             self,
             "Install ROM",
-            f"Install {plan.display_name} as {plan.format_label} to:\n{target_text}",
+            prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        self._install_errors: list[str] = []
         self.install_btn.setEnabled(False)
-        self.status_label.setText("Installing ROM...")
-        self._install_worker = InstallWorker(plan, self)
+        self.fetch_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self._install_worker = InstallWorker(plans, self)
         self._install_worker.progress.connect(self._on_install_progress)
+        self._install_worker.item_started.connect(self._on_install_item_started)
+        self._install_worker.item_error.connect(self._on_install_item_error)
         self._install_worker.finished.connect(self._on_install_finished)
-        self._install_worker.error.connect(self._on_install_error)
         self._install_worker.start()
 
+    def _on_install_item_started(self, idx: int, total: int, name: str):
+        self._install_prefix = f"[{idx}/{total}] " if total > 1 else ""
+        # Reset to busy/indeterminate for each item — the server converts
+        # CHD/RVZ -> ISO before any byte flows, so the animated bar shows work.
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"{self._install_prefix}Preparing {name}...")
+
     def _on_install_progress(self, downloaded: int, total: int):
+        prefix = getattr(self, "_install_prefix", "")
+        # First byte arrived -> conversion done, real download underway.
         if total > 0:
             pct = int(downloaded * 100 / total)
-            self.status_label.setText(f"Installing ROM... {pct}%")
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(pct)
+            self.status_label.setText(
+                f"{prefix}Downloading... {_fmt_size(downloaded)} / {_fmt_size(total)} ({pct}%)"
+            )
         else:
-            self.status_label.setText(f"Installing ROM... {_fmt_size(downloaded)}")
+            # Unknown total (no Content-Length) -> stay busy, show bytes.
+            self.status_label.setText(f"{prefix}Downloading... {_fmt_size(downloaded)}")
 
-    def _on_install_finished(self, paths: list[str]):
-        self.install_btn.setEnabled(True)
-        self.status_label.setText(f"Installed {len(paths)} file(s).")
-        QMessageBox.information(
-            self,
-            "ROM Installer",
-            "Installed:\n" + "\n".join(paths[:20]),
-        )
+    def _on_install_item_error(self, idx: int, total: int, name: str, message: str):
+        self._install_errors.append(f"{name}: {message}")
 
-    def _on_install_error(self, message: str):
+    def _on_install_finished(self, ok: int, fail: int, paths: list[str]):
         self.install_btn.setEnabled(True)
-        self.status_label.setText("Install failed.")
-        QMessageBox.critical(self, "ROM Installer", message)
+        self.fetch_btn.setEnabled(True)
+        self.progress_bar.hide()
+        errors = getattr(self, "_install_errors", [])
+        if fail:
+            self.status_label.setText(f"Installed {ok}, failed {fail}.")
+            body = f"Installed {ok} ROM(s), {fail} failed.\n\nFailures:\n" + "\n".join(errors[:20])
+            QMessageBox.warning(self, "ROM Installer", body)
+        else:
+            self.status_label.setText(f"Installed {ok} ROM(s), {len(paths)} file(s).")
+            QMessageBox.information(
+                self,
+                "ROM Installer",
+                f"Installed {ok} ROM(s):\n" + "\n".join(paths[:20]),
+            )

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -376,6 +377,16 @@ class ProfileDialog(QDialog):
         self._game_folder_label = QLabel("Game Folder:")
         form.addRow(self._game_folder_label, game_row)
 
+        self.sd_card_check = QCheckBox("This is an SD card (remap drive letter)")
+        self.sd_card_check.setToolTip(
+            "When checked, the drive letter of every path in this profile is\n"
+            "rewritten to the \"Current SD Card Drive\" set in Server Configuration\n"
+            "at sync/install time. Use this when your card reader gets a different\n"
+            "drive letter on each reconnect."
+        )
+        self._sd_card_label = QLabel("Removable:")
+        form.addRow(self._sd_card_label, self.sd_card_check)
+
         # ── Single-system section (Generic / Everdrive) ────────────────
         self._single_widget = QWidget()
         self._build_single_section()
@@ -580,6 +591,8 @@ class ProfileDialog(QDialog):
         ):
             widget.setVisible(is_memcard_ftp)
         self.browse_game_btn.setVisible(not is_memcard_ftp)
+        self._sd_card_label.setVisible(not is_memcard_ftp)
+        self.sd_card_check.setVisible(not is_memcard_ftp)
         # Show Redump DAT field only for CD Folder profiles
         is_cd = device_type == "CD Folder"
         self._dat_row_label.setVisible(is_cd)
@@ -908,6 +921,7 @@ class ProfileDialog(QDialog):
                 self.device_combo.setCurrentIndex(idx)
 
             self.game_folder_edit.setText(profile.get("path", ""))
+            self.sd_card_check.setChecked(bool(profile.get("is_sd_card", False)))
             self.ftp_host_edit.setText(profile.get("ftp_host", ""))
             self.ftp_port_spin.setValue(int(profile.get("ftp_port", 21) or 21))
             self.ftp_username_edit.setText(profile.get("ftp_username", ""))
@@ -997,6 +1011,8 @@ class ProfileDialog(QDialog):
             "path": self.game_folder_edit.text().strip()
             or ("/" if device_type == "MemCard Pro FTP" else ""),
         }
+        if device_type != "MemCard Pro FTP" and self.sd_card_check.isChecked():
+            base["is_sd_card"] = True
         if device_type == "MemCard Pro FTP":
             base.update(
                 {

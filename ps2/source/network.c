@@ -27,13 +27,18 @@
 #include <debug.h>
 
 static NetProgress64Fn g_progress_cb = NULL;
+static uint64_t g_progress_base = 0;
 
 void network_set_progress64_cb(NetProgress64Fn cb) {
     g_progress_cb = cb;
 }
 
 static int progress_bridge(uint64_t done, uint64_t total) {
-    if (g_progress_cb) return g_progress_cb(done, total);
+    if (g_progress_cb) {
+        uint64_t absolute_done  = g_progress_base + done;
+        uint64_t absolute_total = total > 0 ? g_progress_base + total : 0;
+        return g_progress_cb(absolute_done, absolute_total);
+    }
     return 0;
 }
 
@@ -236,6 +241,18 @@ bool network_check_server(const SyncState *state) {
 
 /* ---- Catalog / download wrappers ---- */
 
+static void build_rom_download_path(char *path, size_t path_size,
+                                    const char *rom_id,
+                                    const char *extract_fmt)
+{
+    if (extract_fmt && extract_fmt[0]) {
+        snprintf(path, path_size, "/api/v1/roms/%s?extract=%s",
+                 rom_id, extract_fmt);
+    } else {
+        snprintf(path, path_size, "/api/v1/roms/%s", rom_id);
+    }
+}
+
 int network_fetch_rom_catalog(const SyncState *state,
                               const char *system_code,
                               int offset, int limit,
@@ -271,12 +288,7 @@ int network_download_rom_resumable(const SyncState *state,
     if (total_out) *total_out = 0;
 
     char path[512];
-    if (extract_fmt && extract_fmt[0]) {
-        snprintf(path, sizeof(path), "/api/v1/roms/%s?extract=%s",
-                 rom_id, extract_fmt);
-    } else {
-        snprintf(path, sizeof(path), "/api/v1/roms/%s", rom_id);
-    }
+    build_rom_download_path(path, sizeof(path), rom_id, extract_fmt);
 
     char part[640];
     snprintf(part, sizeof(part), "%s.part", target_path);
@@ -301,7 +313,9 @@ int network_download_rom_resumable(const SyncState *state,
     req.range_start = start_offset;
 
     HttpResponseInfo info;
+    g_progress_base = start_offset;
     int rc = http_get_stream(&req, fp, progress_bridge, &info);
+    g_progress_base = 0;
     fclose(fp);
 
     if (total_out && info.content_length > 0) {
@@ -321,6 +335,51 @@ int network_download_rom_resumable(const SyncState *state,
          * from a previous failed run.  Try unlink then rename. */
         unlink(target_path);
         if (rename(part, target_path) != 0) return -2;
+    }
+    return 0;
+}
+
+int network_download_rom_to_sink(const SyncState *state,
+                                 const char *rom_id,
+                                 const char *extract_fmt,
+                                 NetStreamBeginFn begin,
+                                 NetWriteFn writer,
+                                 void *user,
+                                 uint64_t start_offset,
+                                 uint64_t *total_out)
+{
+    if (total_out) *total_out = 0;
+    if (!network_is_ready(state) || !writer) return -1;
+
+    char path[512];
+    build_rom_download_path(path, sizeof(path), rom_id, extract_fmt);
+
+    HttpRequest req = {0};
+    req.server_url  = state->server_url;
+    req.api_key     = state->api_key;
+    req.path        = path;
+    req.method      = "GET";
+    req.range_start = start_offset;
+
+    HttpResponseInfo info;
+    g_progress_base = start_offset;
+    int rc = http_get_stream_cb(&req,
+                                (HttpStreamBeginFn)begin,
+                                (HttpWriteFn)writer,
+                                user,
+                                progress_bridge,
+                                &info);
+    g_progress_base = 0;
+
+    if (total_out && info.content_length > 0) {
+        *total_out = info.content_length + start_offset;
+    }
+
+    if (rc == 1) return 1;
+    if (rc < 0) {
+        if (info.status > 0 && (info.status < 200 || info.status >= 300))
+            return -3;
+        return -1;
     }
     return 0;
 }

@@ -159,6 +159,16 @@ static const char *storage_pref_label(StoragePreference pref) {
     }
 }
 
+static const char *storage_backend_label(const SyncState *state) {
+    if (!state || !state->usb_ready) return "not-ready";
+    switch (state->storage_backend) {
+        case STORAGE_BACKEND_HDLOADER: return "hdd0:hdl";
+        case STORAGE_BACKEND_MASS:     return state->usb_root;
+        case STORAGE_BACKEND_NONE:
+        default:                       return "not-ready";
+    }
+}
+
 static void draw_status_line(void) {
     const char *line = g_status[0] ? g_status : view_hints(g_view_for_hints);
 
@@ -228,7 +238,7 @@ void ui_draw_header(const SyncState *state, AppView view) {
     put_printf(0, 1, C_TEXT_DIM, C_HEADER_BG, COLS,
                "Net: %-15s  Store: %-7s  Server: %.38s",
                state->ip[0]         ? state->ip         : "not-ready",
-               state->usb_ready     ? state->usb_root   : "not-ready",
+               storage_backend_label(state),
                state->server_url[0] ? state->server_url : "(unconfigured)");
 
     draw_separator(SEP1_ROW);
@@ -434,8 +444,12 @@ void ui_draw_config(const SyncState *state) {
              state->ip[0] ? state->ip : "no ip");
     cfg_line(&row, C_TEXT, "storage    = %s",
              storage_pref_label(state->storage_pref));
-    cfg_line(&row, C_TEXT, "store_root = %s",
-             state->usb_ready ? state->usb_root : "not ready");
+    cfg_line(&row, C_TEXT, "backend    = %s",
+             storage_backend_label(state));
+    cfg_line(&row, C_TEXT, "queue_file = %s",
+             state->storage_backend == STORAGE_BACKEND_HDLOADER
+                 ? HDL_DOWNLOADS_FILE
+                 : roms_downloads_file());
     cfg_line(&row, C_TEXT, "hdd_format = TRIANGLE twice (PS2 APA, wipes disk)");
     row++;
     cfg_line(&row, C_TEXT_DIM,

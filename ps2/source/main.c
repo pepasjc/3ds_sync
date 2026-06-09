@@ -11,16 +11,17 @@
  *   3. Initialise libdebug screen
  *   4. Load config from mc0:/3DSSYNC/CONFIG.TXT
  *   5. Bring up networking via ps2ip (static IP by default, DHCP optional)
- *   6. Probe mass:/ (storage is required for downloads, not catalog browse)
+ *   6. Probe storage: APA/HDLoader hdd0: or mass:/ folder installs
  *   7. Run the menu loop (ROMs / Downloads / Config views)
  *
- * Phase 1 only: ROM browser + mass-storage installer.  Save sync (MCP2) is
- * stubbed in the menu - the next phase wires it up.
+ * Phase 1 only: ROM browser + USB/APA HDD installer.  Save sync (MCP2)
+ * is stubbed in the menu - the next phase wires it up.
  */
 
 #include "common.h"
 #include "config.h"
 #include "downloads.h"
+#include "hdl.h"
 #include "http.h"
 #include "network.h"
 #include "roms.h"
@@ -33,6 +34,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <kernel.h>
 #include <sifrpc.h>
@@ -331,6 +333,8 @@ static bool          g_hdd_format_confirm = false;
 
 static char          g_scratch[256 * 1024];      /* JSON page buffer */
 
+static bool ensure_hdd_format_modules(void);
+
 static bool require_storage_ready(void) {
     if (!g_state.usb_ready) {
         ui_error("Storage not ready; catalog browse still works");
@@ -339,18 +343,62 @@ static bool require_storage_ready(void) {
     return true;
 }
 
-static void init_storage_targets(void) {
-    scr_printf("BOOT: probing storage (%s)...\n",
-               config_storage_pref_to_str(g_state.storage_pref));
-    if (!wait_for_mass(&g_state, 12)) {
-        scr_printf("WARN: no storage root mounted\n");
-        ui_status("Storage not ready; downloads disabled");
-        return;
+static bool init_hdloader_targets(void) {
+    scr_printf("BOOT: probing APA/HDLoader hdd0:...\n");
+    if (!ensure_hdd_format_modules()) return false;
+
+    if (hddCheckPresent() != 0) {
+        scr_printf("BOOT: no internal HDD present\n");
+        return false;
     }
 
-    scr_printf("BOOT: storage ready at %s\n", g_state.usb_root);
-    roms_ensure_target_dirs();
+    if (hddCheckFormatted() != 0) {
+        scr_printf("BOOT: internal HDD is not APA-formatted\n");
+        ui_status("HDD needs APA format; Config TRIANGLE twice");
+        return false;
+    }
+
+    g_state.storage_backend = STORAGE_BACKEND_HDLOADER;
+    g_state.usb_ready = true;     /* legacy readiness flag used by UI/actions */
+    strncpy(g_state.usb_root, "hdd0:hdl", sizeof(g_state.usb_root) - 1);
+    g_state.usb_root[sizeof(g_state.usb_root) - 1] = '\0';
+
+    roms_set_storage_root("hdd0:");
+    roms_set_downloads_file(HDL_DOWNLOADS_FILE);
     downloads_load(&g_downloads);
+    scr_printf("BOOT: APA/HDLoader storage ready at hdd0:\n");
+    return true;
+}
+
+static void init_storage_targets(void) {
+    g_state.storage_backend = STORAGE_BACKEND_NONE;
+    g_state.usb_ready = false;
+    g_downloads.count = 0;
+
+    scr_printf("BOOT: probing storage (%s)...\n",
+               config_storage_pref_to_str(g_state.storage_pref));
+
+    if (g_state.storage_pref != STORAGE_PREF_USB) {
+        if (init_hdloader_targets()) return;
+        if (g_state.storage_pref == STORAGE_PREF_HDD) {
+            scr_printf("WARN: APA/HDLoader storage unavailable\n");
+            ui_status("HDD not ready; format APA from Config");
+            return;
+        }
+    }
+
+    if (g_state.storage_pref != STORAGE_PREF_HDD) {
+        if (!wait_for_mass(&g_state, 12)) {
+            scr_printf("WARN: no storage root mounted\n");
+            ui_status("Storage not ready; downloads disabled");
+            return;
+        }
+
+        g_state.storage_backend = STORAGE_BACKEND_MASS;
+        scr_printf("BOOT: mass storage ready at %s\n", g_state.usb_root);
+        roms_ensure_target_dirs();
+        downloads_load(&g_downloads);
+    }
 }
 
 static bool ensure_hdd_format_modules(void) {
@@ -492,6 +540,33 @@ static int progress_cb(uint64_t done, uint64_t total) {
     return g_pause_requested ? 1 : 0;
 }
 
+typedef struct {
+    DownloadEntry *entry;
+    HdlInstall install;
+} HdlDownloadContext;
+
+static int hdl_download_begin(uint64_t content_length, void *user) {
+    HdlDownloadContext *ctx = (HdlDownloadContext *)user;
+    if (!ctx || !ctx->entry) return -1;
+    return hdl_install_begin(&ctx->install, ctx->entry, content_length);
+}
+
+static int hdl_download_write(const void *data, uint32_t len, void *user) {
+    HdlDownloadContext *ctx = (HdlDownloadContext *)user;
+    if (!ctx) return -1;
+    return hdl_install_write(data, len, &ctx->install);
+}
+
+static DownloadEntry *queue_catalog_entry(const RomEntry *rom) {
+    DownloadEntry *e = downloads_upsert_from_catalog(&g_downloads, rom);
+    if (e && g_state.storage_backend == STORAGE_BACKEND_HDLOADER) {
+        hdl_resolve_target_path_from_rom(rom, e->target_path,
+                                         sizeof(e->target_path));
+        e->offset = 0;  /* HDLoader installs are rewritten atomically. */
+    }
+    return e;
+}
+
 /* ---- View handlers ---- */
 
 static void clamp_scroll(int *selected, int *scroll, int count) {
@@ -526,17 +601,30 @@ static void scan_local(void) {
         g_local.count = 0;
         return;
     }
-    ui_status("Scanning local ISOs...");
+    ui_status("Scanning local games...");
     redraw();
-    roms_scan_local(&g_local);
+    if (g_state.storage_backend == STORAGE_BACKEND_HDLOADER) {
+        hdl_scan_local(&g_local);
+    } else {
+        roms_scan_local(&g_local);
+    }
     if (g_local.count > 0) {
-        ui_status("Local: %d ISOs", g_local.count);
+        ui_status("Local: %d %s", g_local.count,
+                  g_state.storage_backend == STORAGE_BACKEND_HDLOADER
+                      ? "HDL games"
+                      : "ISOs");
     }
     redraw();
 }
 
 static void run_active_download(DownloadEntry *e) {
     if (!e || !require_storage_ready()) return;
+
+    if (g_state.storage_backend == STORAGE_BACKEND_HDLOADER) {
+        hdl_resolve_target_path_from_download(e, e->target_path,
+                                              sizeof(e->target_path));
+        e->offset = 0;   /* No partial APA resume; failed installs are removed. */
+    }
 
     g_active_done       = e->offset;
     g_active_total      = e->total;
@@ -546,38 +634,63 @@ static void run_active_download(DownloadEntry *e) {
 
     network_set_progress64_cb(progress_cb);
 
-    /* Make sure the destination dir exists. */
-    char dir[256];
-    strncpy(dir, e->target_path, sizeof(dir));
-    dir[sizeof(dir) - 1] = '\0';
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        roms_mkdir_p(dir);
+    if (g_state.storage_backend != STORAGE_BACKEND_HDLOADER) {
+        /* Make sure the destination dir exists. */
+        char dir[256];
+        strncpy(dir, e->target_path, sizeof(dir));
+        dir[sizeof(dir) - 1] = '\0';
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            roms_mkdir_p(dir);
+        }
     }
 
     e->status = DL_STATUS_ACTIVE;
     downloads_save(&g_downloads);
 
     uint64_t total = 0;
-    int rc = network_download_rom_resumable(&g_state, e->rom_id,
+    int rc;
+    int finish_rc = 0;
+    HdlDownloadContext hdl_ctx;
+    memset(&hdl_ctx, 0, sizeof(hdl_ctx));
+    hdl_ctx.entry = e;
+
+    if (g_state.storage_backend == STORAGE_BACKEND_HDLOADER) {
+        rc = network_download_rom_to_sink(&g_state, e->rom_id,
+                                          e->extract_format,
+                                          hdl_download_begin,
+                                          hdl_download_write,
+                                          &hdl_ctx,
+                                          0,
+                                          &total);
+        finish_rc = hdl_install_finish(&hdl_ctx.install, rc == 0);
+        if (rc == 0 && finish_rc != 0) rc = finish_rc;
+    } else {
+        rc = network_download_rom_resumable(&g_state, e->rom_id,
                                             e->extract_format,
                                             e->target_path,
                                             e->offset,
                                             &total);
+    }
     network_set_progress64_cb(NULL);
+    if (total > 0) e->total = total;
 
     if (rc == 0) {
         e->status = DL_STATUS_COMPLETED;
-        e->offset = total > 0 ? total : g_active_done;
+        e->offset = e->total > 0 ? e->total : g_active_done;
         ui_status("Done: %s", e->name);
     } else if (rc == 1) {
         e->status = DL_STATUS_PAUSED;
-        e->offset = g_active_done;
+        e->offset = (g_state.storage_backend == STORAGE_BACKEND_HDLOADER)
+                  ? 0
+                  : g_active_done;
         ui_status("Paused: %s", e->name);
     } else {
         e->status = DL_STATUS_ERROR;
-        e->offset = g_active_done;
+        e->offset = (g_state.storage_backend == STORAGE_BACKEND_HDLOADER)
+                  ? 0
+                  : g_active_done;
         ui_error("Download failed (rc=%d)", rc);
     }
     downloads_save(&g_downloads);
@@ -679,7 +792,7 @@ int main(int argc, char *argv[]) {
     ui_init();
 
     /* Auto-populate the views so the user lands on a usable list
-     * instead of "Press X to fetch catalog" / "No ISOs". */
+     * instead of "Press X to fetch catalog" / an empty Local view. */
     if (g_state.usb_ready) {
         scan_local();
     }
@@ -720,8 +833,8 @@ int main(int argc, char *argv[]) {
                 if (require_storage_ready() &&
                     count > 0 && g_rom_selected < count)
                 {
-                    DownloadEntry *e = downloads_upsert_from_catalog(
-                        &g_downloads, &g_catalog.items[g_rom_selected]);
+                    DownloadEntry *e =
+                        queue_catalog_entry(&g_catalog.items[g_rom_selected]);
                     if (e) {
                         downloads_save(&g_downloads);
                         ui_status("Queued: %s", e->name);
@@ -734,8 +847,8 @@ int main(int argc, char *argv[]) {
                 if (require_storage_ready() &&
                     count > 0 && g_rom_selected < count)
                 {
-                    DownloadEntry *e = downloads_upsert_from_catalog(
-                        &g_downloads, &g_catalog.items[g_rom_selected]);
+                    DownloadEntry *e =
+                        queue_catalog_entry(&g_catalog.items[g_rom_selected]);
                     if (e) run_active_download(e);
                 }
             }
@@ -748,10 +861,13 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_RIGHT)    g_local_selected += ui_list_visible();
             else if (pressed & PAD_CROSS)    scan_local();
             else if (pressed & PAD_SQUARE) {
-                /* Delete the selected installed ISO. */
+                /* Delete the selected installed game. */
                 if (count > 0 && g_local_selected < count) {
                     const LocalRom *r = &g_local.items[g_local_selected];
-                    if (unlink(r->path) == 0) {
+                    int del_rc = (g_state.storage_backend == STORAGE_BACKEND_HDLOADER)
+                               ? hdl_remove_partition(r->path)
+                               : unlink(r->path);
+                    if (del_rc == 0) {
                         ui_status("Deleted: %s", r->filename);
                         scan_local();
                     } else {

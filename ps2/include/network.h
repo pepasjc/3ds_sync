@@ -25,6 +25,8 @@ bool network_check_server(const SyncState *state);
  * PSP client.  Returning non-zero aborts the transfer. */
 typedef int (*NetProgress64Fn)(uint64_t downloaded, uint64_t total);
 void network_set_progress64_cb(NetProgress64Fn cb);
+typedef int (*NetStreamBeginFn)(uint64_t content_length, void *user);
+typedef int (*NetWriteFn)(const void *data, uint32_t len, void *user);
 
 /* Catalog fetch — GET /api/v1/roms?system=PS2&offset=X&limit=Y */
 int network_fetch_rom_catalog(const SyncState *state,
@@ -45,5 +47,16 @@ int network_download_rom_resumable(const SyncState *state,
                                    const char *target_path,
                                    uint64_t start_offset,
                                    uint64_t *total_out);
+
+/* Same ROM endpoint, but body bytes are delivered to caller-owned storage
+ * instead of a filesystem path. Used by APA/HDLoader installs. */
+int network_download_rom_to_sink(const SyncState *state,
+                                 const char *rom_id,
+                                 const char *extract_fmt,
+                                 NetStreamBeginFn begin,
+                                 NetWriteFn writer,
+                                 void *user,
+                                 uint64_t start_offset,
+                                 uint64_t *total_out);
 
 #endif /* PS2SYNC_NETWORK_H */

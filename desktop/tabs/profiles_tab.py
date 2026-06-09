@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from config import load_config, save_config
+from config import load_config, resolve_profile_for_sd, save_config
 from dialogs.profile_dialog import ProfileDialog
 from rom_installer import ROM_FORMAT_LABELS
 
@@ -102,11 +102,13 @@ class ProfilesTab(QWidget):
         save_config(config)
 
     def get_profiles(self) -> list[dict]:
+        # SD-card profiles get their drive letter remapped to the currently
+        # mounted reader; the stored copy in the table keeps its fixed letter.
         profiles = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
-                profiles.append(item.data(Qt.ItemDataRole.UserRole))
+                profiles.append(resolve_profile_for_sd(item.data(Qt.ItemDataRole.UserRole)))
         return profiles
 
     def _add_profile(self):

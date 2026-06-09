@@ -38,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
@@ -54,10 +55,14 @@ import com.savesync.android.ui.screens.SaveDetailScreen
 import com.savesync.android.ui.screens.SavesScreen
 import com.savesync.android.ui.screens.SettingsScreen
 import com.savesync.android.ui.theme.SaveSyncTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -80,11 +85,15 @@ class MainActivity : ComponentActivity() {
     private var lastLeftTrigger = false
     private var lastRightTrigger = false
 
-    // Analog stick → DPAD key synthesis. Steam Deck uses deadzone 0.4 + 150 ms
-    // repeat; we mirror that so sticks feel identical across both apps.
-    private var lastAxisDirY = 0
-    private var lastAxisDirX = 0
-    private var lastAxisRepeat = 0L
+    // Analog stick + HAT → DPAD key synthesis.  Steam Deck uses deadzone 0.4
+    // + 150 ms repeat; we mirror that so sticks feel identical across both
+    // apps.  HAT axes (physical D-pad on most pads) only fire ACTION_MOVE on
+    // edge transitions — not while the pad is held — so we drive the repeat
+    // from a coroutine timer keyed off the last known direction rather than
+    // off MotionEvent arrival.
+    private var heldDirX = 0
+    private var heldDirY = 0
+    private var axisRepeatJob: Job? = null
 
     private val storagePermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -184,12 +193,13 @@ class MainActivity : ComponentActivity() {
         lastRightTrigger = rtDown
 
         // ── Stick + HAT → DPAD key synthesis ─────────────────────────────
-        // Combine analog stick and HAT axes so both go through one
-        // edge-detect/repeat pipeline. HAT values are always exactly
-        // -1/0/+1 (digital DPAD); the 0.5 threshold is just a non-zero
-        // check. If the DPAD is held, we get continuous MOVE events at
-        // the driver's poll rate, so the repeat logic kicks in the same
-        // as with the stick.
+        // HAT values are exactly -1/0/+1; the 0.5 threshold is a non-zero
+        // check.  Crucially, HAT axes do NOT emit ACTION_MOVE events while
+        // the pad is held — only on edge transitions — so we can't drive
+        // the repeat off MotionEvent arrival.  Instead, MotionEvent only
+        // updates [heldDirX]/[heldDirY], and a single coroutine fires the
+        // synthesised ACTION_DOWN+ACTION_UP pairs every STICK_REPEAT_MS
+        // until both axes return to zero.
         val y = event.getAxisValue(MotionEvent.AXIS_Y)
         val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
         val x = event.getAxisValue(MotionEvent.AXIS_X)
@@ -206,33 +216,39 @@ class MainActivity : ComponentActivity() {
             else -> 0
         }
 
-        if (dirY == 0 && dirX == 0) {
-            // Stick returned to centre — reset so the next press fires immediately.
-            lastAxisDirY = 0
-            lastAxisDirX = 0
-            lastAxisRepeat = 0L
-            return true
-        }
-
-        val now = SystemClock.uptimeMillis()
-        val directionChanged = dirY != lastAxisDirY || dirX != lastAxisDirX
-        val repeatDue = now - lastAxisRepeat >= STICK_REPEAT_MS
-        if (directionChanged || repeatDue) {
-            if (dirY != 0) {
-                val code = if (dirY < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
-            }
-            if (dirX != 0) {
-                val code = if (dirX < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
-            }
-            lastAxisDirY = dirY
-            lastAxisDirX = dirX
-            lastAxisRepeat = now
-        }
+        updateHeldDpad(dirX, dirY)
         return true
+    }
+
+    private fun emitDpadPulse(dirX: Int, dirY: Int) {
+        if (dirY != 0) {
+            val code = if (dirY < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
+        if (dirX != 0) {
+            val code = if (dirX < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
+    }
+
+    private fun updateHeldDpad(dirX: Int, dirY: Int) {
+        if (dirX == heldDirX && dirY == heldDirY) return
+        heldDirX = dirX
+        heldDirY = dirY
+        axisRepeatJob?.cancel()
+        axisRepeatJob = null
+        if (dirX == 0 && dirY == 0) return
+        // Fire the edge press immediately, then keep pulsing while held.
+        emitDpadPulse(dirX, dirY)
+        axisRepeatJob = lifecycleScope.launch {
+            delay(STICK_REPEAT_MS)
+            while (isActive && (heldDirX != 0 || heldDirY != 0)) {
+                emitDpadPulse(heldDirX, heldDirY)
+                delay(STICK_REPEAT_MS)
+            }
+        }
     }
 
     private fun checkStoragePermission(): Boolean {

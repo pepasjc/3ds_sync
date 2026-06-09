@@ -14,6 +14,8 @@
  */
 
 typedef int (*HttpProgressFn)(uint64_t downloaded, uint64_t total);
+typedef int (*HttpStreamBeginFn)(uint64_t content_length, void *user);
+typedef int (*HttpWriteFn)(const void *data, uint32_t len, void *user);
 
 typedef struct {
     const char *server_url;     /* "http://host:port" — no trailing slash */
@@ -55,5 +57,17 @@ int  http_get_stream(const HttpRequest *req,
                      FILE *out_fp,
                      HttpProgressFn progress,
                      HttpResponseInfo *info_out);
+
+/*
+ * Generic streaming GET.  ``begin`` runs after headers are parsed and before
+ * any body bytes are delivered; returning non-zero aborts the request.  The
+ * writer callback receives raw body chunks and should return 0 on success.
+ */
+int  http_get_stream_cb(const HttpRequest *req,
+                        HttpStreamBeginFn begin,
+                        HttpWriteFn writer,
+                        void *user,
+                        HttpProgressFn progress,
+                        HttpResponseInfo *info_out);
 
 #endif /* PS2SYNC_HTTP_H */

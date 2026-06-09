@@ -32,10 +32,12 @@ typedef struct {
     char     name[DOWNLOAD_NAME_LEN];
     char     target_path[DOWNLOAD_PATH_LEN];
     char     system[8];
+    char     serial[GAME_ID_LEN];
     uint64_t offset;
     uint64_t total;
     DownloadStatus status;
     char     extract_format[8];
+    bool     is_cd;
 } DownloadEntry;
 
 typedef struct {

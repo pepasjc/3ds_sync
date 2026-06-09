@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 
-from config import load_config, SYSTEM_CHOICES
+from config import load_config, resolve_profile_for_sd, SYSTEM_CHOICES
 from systems import CD_ALL_EXTENSIONS, CD_DATA_EXTENSIONS, CD_FOLDER_SYSTEMS
 
 
@@ -376,23 +376,41 @@ class NormalizeScanWorker(QThread):
                                 new_stem = canonical
                                 source = "Serial"
                 if source == "filename" and self.no_intro:
-                    # Step 2: read ROM header, match via No-Intro index
-                    # Handles translated ROMs ("Bahamut Lagoon Eng v31" → "bahamut_lagoon")
-                    # and roman/arabic mismatches ("FINAL FANTASY 5" → "Final Fantasy V")
+                    # Step 2 / 3: try BOTH header-based and fuzzy-filename matching,
+                    # then prefer the more-specific canonical (one with more slug
+                    # segments).  Cartridge headers (SNES, GBA, GB, MD) are truncated
+                    # to ~21 chars and lose subtitles ("THE LEGEND OF ZELDA" cannot
+                    # distinguish Zelda 1 from A Link to the Past), so when the
+                    # filename slug has more words the filename wins.
+                    header_canonical: str | None = None
                     header_title = rn.read_rom_header_title(rom, self.system)
                     if header_title:
-                        canonical = rn.lookup_header_in_index(header_title, name_index)
-                        if canonical:
-                            new_stem = canonical  # e.g. "Final Fantasy V (Japan)"
+                        header_canonical = rn.lookup_header_in_index(
+                            header_title, name_index
+                        )
+                    fuzzy_canonical = rn.fuzzy_filename_search(rom.name, name_index)
+
+                    def _slug_segments(name: str) -> int:
+                        return len(rn.normalize_name(name).split("_"))
+
+                    if header_canonical and fuzzy_canonical:
+                        if header_canonical == fuzzy_canonical:
+                            new_stem = header_canonical
                             source = "Header"
-                    # Step 3: fuzzy filename prefix search — finds games like
-                    # "Chaos Seed.sfc" → "Chaos Seed - Fuusui Kairoki (Japan)"
-                    # when the filename slug is a unique prefix of a No-Intro key.
-                    if source == "filename":
-                        canonical = rn.fuzzy_filename_search(rom.name, name_index)
-                        if canonical:
-                            new_stem = canonical
+                        elif _slug_segments(fuzzy_canonical) >= _slug_segments(
+                            header_canonical
+                        ):
+                            new_stem = fuzzy_canonical
                             source = "Fuzzy"
+                        else:
+                            new_stem = header_canonical
+                            source = "Header"
+                    elif header_canonical:
+                        new_stem = header_canonical
+                        source = "Header"
+                    elif fuzzy_canonical:
+                        new_stem = fuzzy_canonical
+                        source = "Fuzzy"
                     # Step 4: normalize fallback (opt-in) — only if "Enable Normalize ROMs"
                     # is checked. Prefers bracket-trim over full slug normalization.
                     if source == "filename" and self.normalize_fallback:
@@ -693,7 +711,7 @@ class RomNormalizerTab(QWidget):
             self.folder_edit.setText(folder)
 
     def _load_from_profile(self):
-        profiles = load_config().get("profiles", [])
+        profiles = [resolve_profile_for_sd(p) for p in load_config().get("profiles", [])]
         if not profiles:
             QMessageBox.information(
                 self,

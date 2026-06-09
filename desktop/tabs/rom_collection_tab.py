@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from chd_converter import find_chdman
-from config import SYSTEM_CHOICES, load_config
+from config import SYSTEM_CHOICES, load_config, resolve_profile_for_sd
 
 
 def format_build_confirmation_message(
@@ -404,7 +404,7 @@ class RomCollectionTab(QWidget):
             self.folder_edit.setText(folder)
 
     def _load_from_profile(self):
-        profiles = load_config().get("profiles", [])
+        profiles = [resolve_profile_for_sd(p) for p in load_config().get("profiles", [])]
         if not profiles:
             QMessageBox.information(
                 self, "No Profiles", "No sync profiles configured yet."

@@ -32,6 +32,15 @@ class ConfigDialog(QDialog):
         self.api_key_edit.setPlaceholderText("anything")
         layout.addRow("API Key:", self.api_key_edit)
 
+        self.sd_card_edit = QLineEdit()
+        self.sd_card_edit.setPlaceholderText("e.g. K:  — drive where the SD reader is mounted now")
+        self.sd_card_edit.setToolTip(
+            "Current drive of your removable SD card reader.\n"
+            "Profiles marked \"This is an SD card\" have their drive letter\n"
+            "rewritten to this value, so a changing drive letter no longer breaks them."
+        )
+        layout.addRow("Current SD Card Drive:", self.sd_card_edit)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -45,6 +54,7 @@ class ConfigDialog(QDialog):
         self.host_edit.setText(config.get("host", "localhost"))
         self.port_edit.setText(str(config.get("port", "8000")))
         self.api_key_edit.setText(config.get("api_key", "anything"))
+        self.sd_card_edit.setText(config.get("sd_card_location", ""))
 
     def _save(self):
         try:
@@ -57,5 +67,6 @@ class ConfigDialog(QDialog):
         config["host"] = self.host_edit.text() or "localhost"
         config["port"] = port
         config["api_key"] = self.api_key_edit.text() or "anything"
+        config["sd_card_location"] = self.sd_card_edit.text().strip()
         save_config(config)
         self.accept()

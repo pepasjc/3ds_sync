@@ -85,9 +85,38 @@ class Settings(BaseSettings):
     # Example: SYNC_ADMIN_USERS=admin,pepas
     admin_users: str = "admin"
 
+    # ── Security toggles (secure-by-default) ─────────────────────────────
+    # The X-Remote-User header is only trustworthy when set by a reverse
+    # proxy we control (nginx Basic Auth).  A client hitting the server
+    # directly can forge it, so we IGNORE the header unless the operator
+    # explicitly confirms a trusted proxy sits in front.  Default False so
+    # a directly-exposed server can never be tricked into granting admin.
+    trust_proxy_auth: bool = False
+    # Homelab convenience: treat an unauthenticated LAN request as admin and
+    # hand the web UI the API key inline.  This is exactly what leaks the key
+    # to anyone who can reach the port, so it is OFF by default and must be
+    # opted into — and ONLY on a network that is never exposed to the
+    # internet.  When False, the web UI loads without a key and prompts the
+    # user to paste it (stored in their browser's localStorage).
+    lan_admin: bool = False
+    # Escape hatch: allow booting with the placeholder/empty api_key.  Off by
+    # default so a fresh deploy fails loudly instead of running wide open.
+    allow_weak_key: bool = False
+
     @property
     def admin_users_set(self) -> frozenset[str]:
         return frozenset(u.strip() for u in self.admin_users.split(",") if u.strip())
+
+    def validate_security(self) -> None:
+        """Fail fast on an insecure key unless the operator opted out."""
+        weak = {"", "anything", "changeme", "password", "secret"}
+        if self.api_key.strip().lower() in weak and not self.allow_weak_key:
+            raise RuntimeError(
+                "Refusing to start: SYNC_API_KEY is unset or weak "
+                f"({self.api_key!r}). Set a strong SYNC_API_KEY in the "
+                "environment / .env, or set SYNC_ALLOW_WEAK_KEY=true to "
+                "override (NOT recommended)."
+            )
 
     model_config = {
         "env_prefix": "SYNC_",

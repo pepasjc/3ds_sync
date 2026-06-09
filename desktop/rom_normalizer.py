@@ -76,13 +76,20 @@ _LETTER_DIGIT_BOUNDARY_RE = re.compile(
 _MSU_TRACK_RE = re.compile(r"^(.+)-(\d+)\.pcm$", re.IGNORECASE)
 
 _SPECIAL_TAG_RE = re.compile(
-    r"\((?:Beta\s*\d*|Proto\s*\d*|Demo|Sample)\)",
+    r"\((?:Beta\s*\d*|Proto\s*\d*|Demo|Sample|Unl|"
+    r"[A-Za-z0-9]+\s*Conversion|Conversion|"
+    r"Hack|Aftermarket|Homebrew|Pirate|Bootleg|Enhancement)\)",
     re.IGNORECASE,
 )
 
 
 def _has_special_tag(name: str) -> bool:
-    """Return True if name contains a Beta/Proto/Demo/Sample/Unl tag."""
+    """Return True if name contains a hack/conversion/special-release tag.
+
+    Covers Beta/Proto/Demo/Sample/Unl plus aftermarket/hack/conversion variants
+    like ``(NES Conversion)`` or ``(Aftermarket)`` so they don't win header
+    lookups for unrelated canonical games.
+    """
     return bool(_SPECIAL_TAG_RE.search(name))
 
 
@@ -1423,8 +1430,11 @@ def find_companion_files(rom_path: Path, new_stem: str) -> list[tuple[Path, Path
     """Return companion files that should be renamed alongside the given ROM.
 
     Handles:
-    - SNES MSU-1: ``{stem}.msu`` + ``{stem}-N.pcm`` audio tracks
-    - CUE/BIN:    ``{stem}.cue`` sheet alongside a ``{stem}.bin`` ROM
+    - SNES/Genesis MSU-1: when a ``{stem}.msu`` manifest sibling exists, the ROM
+      is treated as an MSU pack and EVERY sibling file whose name begins with
+      ``{stem}.`` or ``{stem}-`` is renamed (covers ``.msu``, ``.xml``, ``.bml``,
+      ``.txt``, plus ``-NNN.pcm`` audio tracks with arbitrary track numbers).
+    - CUE/BIN: ``{stem}.cue`` sheet alongside a ``{stem}.bin`` ROM.
 
     Returns a list of (old_path, new_path) pairs (only existing files).
     """
@@ -1433,22 +1443,25 @@ def find_companion_files(rom_path: Path, new_stem: str) -> list[tuple[Path, Path
     stem = rom_path.stem
     parent = rom_path.parent
 
-    if ext in (".sfc", ".smc"):
-        # MSU-1 manifest
+    if ext in (".sfc", ".smc", ".md", ".bin", ".gen", ".smd"):
         msu = parent / (stem + ".msu")
         if msu.exists():
-            companions.append((msu, parent / (new_stem + ".msu")))
-        # PCM audio tracks: stem-1.pcm, stem-2.pcm, …
-        try:
-            for f in sorted(parent.iterdir()):
-                m = _MSU_TRACK_RE.match(f.name)
-                if m and m.group(1) == stem:
-                    companions.append((f, parent / f"{new_stem}-{m.group(2)}.pcm"))
-        except OSError:
-            pass
+            try:
+                for f in sorted(parent.iterdir()):
+                    if not f.is_file() or f == rom_path:
+                        continue
+                    name = f.name
+                    if not name.startswith(stem):
+                        continue
+                    suffix = name[len(stem):]
+                    if not suffix or suffix[0] not in ".-":
+                        continue
+                    companions.append((f, parent / (new_stem + suffix)))
+            except OSError:
+                pass
+            return companions
 
-    elif ext == ".bin":
-        # CUE sheet that references this .bin
+    if ext == ".bin":
         cue = parent / (stem + ".cue")
         if cue.exists():
             companions.append((cue, parent / (new_stem + ".cue")))

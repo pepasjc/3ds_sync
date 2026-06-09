@@ -274,15 +274,24 @@ int http_get_buf(const HttpRequest *req,
     return (int)written;
 }
 
-int http_get_stream(const HttpRequest *req,
-                    FILE *out_fp,
-                    HttpProgressFn progress,
-                    HttpResponseInfo *info_out)
+static int file_stream_writer(const void *data, uint32_t len, void *user) {
+    FILE *fp = (FILE *)user;
+    if (!fp) return -1;
+    return fwrite(data, 1, len, fp) == len ? 0 : -1;
+}
+
+int http_get_stream_cb(const HttpRequest *req,
+                       HttpStreamBeginFn begin,
+                       HttpWriteFn writer,
+                       void *user,
+                       HttpProgressFn progress,
+                       HttpResponseInfo *info_out)
 {
     if (info_out) {
         info_out->status         = 0;
         info_out->content_length = 0;
     }
+    if (!writer) return -1;
 
     char host[64];
     int  port;
@@ -326,13 +335,18 @@ int http_get_stream(const HttpRequest *req,
         return -6;
     }
 
-    /* Body bytes already in rbuf — flush to file. */
+    if (begin && begin(content_length, user) != 0) {
+        close(fd);
+        return -9;
+    }
+
+    /* Body bytes already in rbuf — deliver before continuing recv loop. */
     uint64_t total_done   = 0;
     size_t   in_rbuf_body = (total_read > (size_t)hlen)
                            ? total_read - (size_t)hlen
                            : 0;
     if (in_rbuf_body > 0) {
-        if (fwrite(rbuf + hlen, 1, in_rbuf_body, out_fp) != in_rbuf_body) {
+        if (writer(rbuf + hlen, (uint32_t)in_rbuf_body, user) != 0) {
             close(fd);
             return -7;
         }
@@ -349,7 +363,7 @@ int http_get_stream(const HttpRequest *req,
         int n = recv(fd, chunk, sizeof(chunk), 0);
         if (n == 0) break;        /* peer closed */
         if (n < 0)  { close(fd); return -8; }
-        if (fwrite(chunk, 1, (size_t)n, out_fp) != (size_t)n) {
+        if (writer(chunk, (uint32_t)n, user) != 0) {
             close(fd);
             return -7;
         }
@@ -361,7 +375,17 @@ int http_get_stream(const HttpRequest *req,
         }
     }
 
-    fflush(out_fp);
     close(fd);
     return 0;
+}
+
+int http_get_stream(const HttpRequest *req,
+                    FILE *out_fp,
+                    HttpProgressFn progress,
+                    HttpResponseInfo *info_out)
+{
+    int rc = http_get_stream_cb(req, NULL, file_stream_writer,
+                                out_fp, progress, info_out);
+    if (out_fp) fflush(out_fp);
+    return rc;
 }

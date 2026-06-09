@@ -40,6 +40,7 @@ DownloadStatus downloads_str_to_status(const char *s) {
 }
 
 static uint64_t stat_part_size(const char *target_path) {
+    if (target_path && strncasecmp(target_path, "hdd0:", 5) == 0) return 0;
     char part[512];
     snprintf(part, sizeof(part), "%s.part", target_path);
     struct stat st;
@@ -48,6 +49,7 @@ static uint64_t stat_part_size(const char *target_path) {
 }
 
 static bool target_already_exists(const char *target_path) {
+    if (target_path && strncasecmp(target_path, "hdd0:", 5) == 0) return false;
     struct stat st;
     return stat(target_path, &st) == 0;
 }
@@ -119,11 +121,17 @@ bool downloads_load(DownloadList *list) {
         next_field(&cursor, e->system,         sizeof(e->system));
         next_field(&cursor, e->name,           sizeof(e->name));
         next_field(&cursor, e->extract_format, sizeof(e->extract_format));
+        next_field(&cursor, e->serial,         sizeof(e->serial));
+        char is_cd_buf[8];
+        next_field(&cursor, is_cd_buf,         sizeof(is_cd_buf));
         rebase_target_root(e->target_path, sizeof(e->target_path));
 
         e->status = downloads_str_to_status(status_buf);
         e->offset = strtoull(offset_buf, NULL, 10);
         e->total  = strtoull(total_buf,  NULL, 10);
+        e->is_cd  = (strcmp(is_cd_buf, "1") == 0 ||
+                     strcasecmp(is_cd_buf, "true") == 0 ||
+                     strcasecmp(is_cd_buf, "cd") == 0);
 
         if (target_already_exists(e->target_path)) {
             e->status = DL_STATUS_COMPLETED;
@@ -155,7 +163,7 @@ bool downloads_save(const DownloadList *list) {
         DownloadStatus persisted =
             (e->status == DL_STATUS_ACTIVE) ? DL_STATUS_PAUSED : e->status;
 
-        fprintf(fp, "%s=%s|%llu|%llu|%s|%s|%s|%s|%s\n",
+        fprintf(fp, "%s=%s|%llu|%llu|%s|%s|%s|%s|%s|%s|%d\n",
                 e->rom_id,
                 downloads_status_to_str(persisted),
                 (unsigned long long)e->offset,
@@ -164,7 +172,9 @@ bool downloads_save(const DownloadList *list) {
                 e->target_path,
                 e->system,
                 e->name,
-                e->extract_format);
+                e->extract_format,
+                e->serial,
+                e->is_cd ? 1 : 0);
     }
     fclose(fp);
 
@@ -202,6 +212,9 @@ DownloadEntry *downloads_upsert_from_catalog(DownloadList *list,
         created = true;
     }
     e->total = rom->size;
+    strncpy(e->serial, rom->serial, sizeof(e->serial) - 1);
+    e->serial[sizeof(e->serial) - 1] = '\0';
+    e->is_cd = rom->is_cd;
     rebase_target_root(e->target_path, sizeof(e->target_path));
 
     const char *fmt = roms_preferred_extract_format(rom);
