@@ -341,6 +341,7 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "header"
 
         canonical = rn.fuzzy_filename_search(path.name, name_index)
@@ -350,6 +351,7 @@ def _resolve_canonical_name_for_file(
             )
             if region_hint:
                 canonical = rn.find_region_preferred(canonical, no_intro, region_hint)
+            canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
             return canonical, "fuzzy"
 
         if path.parent.name:
@@ -362,6 +364,7 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "folder"
 
     return None, match_source
@@ -467,6 +470,11 @@ def _resolve_canonical_name_for_zip(
                                         canonical, no_intro, region_hint
                                     )
                                 match_source = "folder"
+
+                if canonical and match_source in ("header", "fuzzy", "folder"):
+                    canonical = rn.prefer_source_name_over_cosmetic(
+                        member_path.name, canonical
+                    )
 
                 if canonical and not _is_bios_candidate(canonical, info.filename):
                     candidates.append(

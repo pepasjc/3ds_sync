@@ -50,6 +50,7 @@ SYSTEM_CHOICES: list[str] = sorted(
         "PSP",
         "SAT",
         "SEGACD",
+        "SG1000",
         "SMS",
         "SNES",
         "TG16",
@@ -96,6 +97,7 @@ ALL_CONSOLE_TYPES: list[str] = ["All"] + sorted(
         "PSP",
         "SAT",
         "SEGACD",
+        "SG1000",
         "SMS",
         "SNES",
         "VB",
@@ -145,6 +147,7 @@ SYSTEM_CODES: frozenset[str] = frozenset(SYSTEM_CHOICES) | frozenset(
         "ATARIST",   # Atari ST / STE / TT / Falcon
 
         # Sega misc
+        "SG1000",    # Sega SG-1000 / SC-3000
         "NAOMI",     # Sega NAOMI arcade
         "NAOMI2",    # Sega NAOMI 2 arcade
 
@@ -204,6 +207,10 @@ _SYSTEM_NAME_ALIASES: dict[str, str] = {
     "SEGAMEGACD":      "SEGACD",
     "MASTERSYSTEM":    "SMS",
     "SEGAMASTERSYSTEM":"SMS",
+    "SG1000":          "SG1000",
+    "SG-1000":         "SG1000",
+    "SEGASG1000":      "SG1000",
+    "SC3000":          "SG1000",
     "GAMEGEAR":        "GG",
     "SEGA32X":         "32X",
     "SEGASATURN":      "SAT",
@@ -221,6 +228,10 @@ _SYSTEM_NAME_ALIASES: dict[str, str] = {
     "VIRTUALBOY":      "VB",
     "PCENGINE":        "PCE",
     "PCENGINECD":      "PCECD",
+    "SUPERGRAFX":      "PCSG",
+    "PCENGINESUPERGRAFX": "PCSG",
+    "PCFX":            "PCFX",
+    "NECPCFX":         "PCFX",
     "TURBOGRAFX":      "TG16",
     "TURBOGRAFX16":    "TG16",
     "WONDERSWAN":      "WSWAN",
@@ -307,6 +318,8 @@ ROM_EXTENSIONS: frozenset[str] = frozenset(
         # Sega 8-bit
         ".sms",    # Master System
         ".gg",     # Game Gear
+        ".sg",     # SG-1000
+        ".sc",     # SC-3000
         # Sega 16/32-bit
         ".md",
         ".gen",
@@ -468,12 +481,14 @@ SYSTEM_DAT_KEYWORDS: dict[str, list[str]] = {
     "SEGACD": ["Sega - Mega-CD", "Mega-CD", "Sega CD"],
     "GG":     ["Game Gear"],
     "SMS":    ["Master System"],
+    "SG1000": ["Sega - SG-1000", "SG-1000", "SC-3000"],
     "SAT":    ["Sega - Saturn", "Saturn"],
     "DC":     ["Sega - Dreamcast", "Dreamcast"],
     "PCE":    ["NEC - PC Engine - TurboGrafx-16", "NEC - PC Engine - TurboGrafx 16",
                "PC Engine - TurboGrafx-16", "PC Engine - TurboGrafx 16"],
     "PCSG":   ["NEC - PC Engine SuperGrafx", "PC Engine SuperGrafx", "SuperGrafx"],
     "PCECD":  ["PC Engine CD", "TurboGrafx CD", "PC Engine CD-ROM"],
+    "PCFX":   ["NEC - PC-FX", "PC-FX", "PCFX"],
     "NGP":    ["SNK - Neo Geo Pocket", "Neo Geo Pocket"],
     "NGPC":   ["SNK - Neo Geo Pocket Color", "Neo Geo Pocket Color"],
     "NEOCD":  ["SNK - Neo Geo CD", "Neo Geo CD"],
@@ -536,6 +551,9 @@ FOLDER_TO_SYSTEM: dict[str, str] = {
     "megadrive":       "MD",
     "megadrivejp":     "MD",
     "mastersystem":    "SMS",
+    "sg-1000":         "SG1000",
+    "sg1000":          "SG1000",
+    "sc-3000":         "SG1000",
     "megacd":          "SCD",
     "megacdjp":        "SCD",
     "sega32x":         "32X",
@@ -558,7 +576,10 @@ FOLDER_TO_SYSTEM: dict[str, str] = {
     "ngpc":            "NGPC",
     "pcengine":        "PCE",
     "pcenginecd":      "PCECD",
-    "pcfx":            "PCE",
+    "supergrafx":      "PCSG",
+    "sgx":             "PCSG",
+    "pcenginesgx":     "PCSG",
+    "pcfx":            "PCFX",
     "psx":             "PS1",
     "ps1":             "PS1",
     "ps2":             "PS2",
@@ -602,11 +623,14 @@ SYSTEM_COLOR: dict[str, str] = {
     "N64":    "#1565c0",
     "MD":     "#0d47a1",
     "SMS":    "#1976d2",
+    "SG1000": "#1e88e5",
     "GG":     "#00838f",
     "32X":    "#0277bd",
     "SEGACD": "#006064",
     "PCE":    "#558b2f",
     "PCECD":  "#558b2f",
+    "PCSG":   "#689f38",
+    "PCFX":   "#827717",
     "TG16":   "#33691e",
     "TGCD":   "#33691e",
     "A2600":  "#e65100",
@@ -737,6 +761,7 @@ SYNC_ID_RULES: dict[str, dict[str, str]] = {
     "PCSG":     {"strategy": "slug"},
     "POKEMINI": {"strategy": "slug"},
     "SEGACD":   {"strategy": "slug"},
+    "SG1000":   {"strategy": "slug"},
     "SMS":      {"strategy": "slug"},
     "SNES":     {"strategy": "slug"},
     "TG16":     {"strategy": "slug"},

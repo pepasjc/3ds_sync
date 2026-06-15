@@ -136,7 +136,7 @@ class RetroArchEmulator(
          * single-file save layout.
          */
         internal val CD_SYSTEMS: Set<String> = setOf(
-            "PS1", "PS2", "SAT", "SEGACD", "DC", "PCE", "NEOCD"
+            "PS1", "PS2", "SAT", "SEGACD", "DC", "PCE", "PCFX", "NEOCD"
         )
 
         /**
@@ -297,10 +297,15 @@ class RetroArchEmulator(
         "genesis"                   to "MD",
         "sega master"               to "SMS",
         "master system"             to "SMS",
+        "sg-1000"                   to "SG1000",
+        "sg1000"                    to "SG1000",
         "game gear"                 to "GG",
         "sega cd"                   to "SEGACD",
         "sega saturn"               to "SAT",
         "saturn"                    to "SAT",
+        "supergrafx"                to "PCSG",   // must be before "pc engine" (playlist is "NEC - PC Engine SuperGrafx")
+        "pc-fx"                     to "PCFX",
+        "pcfx"                      to "PCFX",
         "pc engine"                 to "PCE",
         "turbografx"                to "PCE",
         "neo geo pocket"            to "NGP",
@@ -327,6 +332,8 @@ class RetroArchEmulator(
         "PS1" to "PS1", "PSX" to "PS1", "PSP" to "PSP",
         "GEN" to "MD", "GENESIS" to "MD", "MEGADRIVE" to "MD", "MD" to "MD",
         "SMS" to "SMS", "GG" to "GG", "PCE" to "PCE",
+        "SG1000" to "SG1000", "SG-1000" to "SG1000",
+        "PCSG" to "PCSG", "SUPERGRAFX" to "PCSG", "PCFX" to "PCFX",
         "SATURN" to "SAT", "SAT" to "SAT", "BEETLE SATURN" to "SAT",
         "KRONOS" to "SAT", "YABAUSE" to "SAT", "YABASANSHIRO" to "SAT",
         "YABASANSHIRO 2" to "SAT", "DC" to "DC",

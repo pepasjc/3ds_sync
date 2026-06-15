@@ -93,6 +93,52 @@ def _has_special_tag(name: str) -> bool:
     return bool(_SPECIAL_TAG_RE.search(name))
 
 
+# Parenthetical tags that denote a compilation / re-release rather than a
+# distinct game.  These are the redundant suffixes No-Intro/Redump attach to the
+# representative cart of a title (e.g. "(SEGA Classic Collection)") that users
+# don't want appended to an otherwise-clean filename.
+_COSMETIC_TAG_RE = re.compile(
+    r"\s*\([^)]*\b(?:"
+    r"Classic|Classics|Collection|Compilation|Anthology|Selection|"
+    r"Virtual\s*Console|Switch\s*Online|e[-\s]?Shop|PSN|Steam|GameTap|"
+    r"GameCube|Wii\s*U|Wii|3DS|Mini|Sega\s*Ages|Namco\s*Museum|"
+    r"Greatest\s*Hits|Player's\s*Choice|Platinum|Reprint"
+    r")\b[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_known_ext(filename: str) -> str:
+    """Drop a single trailing ROM/file extension from *filename*."""
+    dot = filename.rfind(".")
+    if 0 < dot and len(filename) - dot - 1 <= 5 and filename[dot + 1 :].isalnum():
+        return filename[:dot]
+    return filename
+
+
+def prefer_source_name_over_cosmetic(source_filename: str, canonical: str) -> str:
+    """Keep the source's clean name when *canonical* only adds a cosmetic tag.
+
+    Name-based DAT matching (header/fuzzy/folder — not CRC/serial) snaps a file
+    to the representative DAT entry for its title, which may carry a redundant
+    compilation/re-release suffix like ``(SEGA Classic Collection)``.  When the
+    source file lacks any such tag and the canonical matches it apart from that
+    suffix, return the source's own (extension-stripped) name so we don't
+    "upgrade" a plain dump to a compilation variant.  Returns *canonical*
+    unchanged when no cosmetic-only difference is detected.
+    """
+    if not _COSMETIC_TAG_RE.search(canonical):
+        return canonical
+    src_stem = _strip_known_ext(source_filename)
+    if _COSMETIC_TAG_RE.search(src_stem):
+        return canonical  # source legitimately carries the tag — keep canonical
+    stripped = _COSMETIC_TAG_RE.sub("", canonical)
+    stripped = re.sub(r"\s{2,}", " ", stripped).strip()
+    if normalize_name(stripped) == normalize_name(src_stem):
+        return src_stem
+    return canonical
+
+
 _PATCH_SUFFIX_RE = re.compile(
     r"(?:_(?:eng|ger|jpn|fre|fra|spa|por|ita|pol|rus|chi|kor|dut|swe|nor|dan|fin|"
     r"v\d[\d_a-z]*|r\d+|rev\d+|patch\d*|translation|fix\d*|hack))+$",

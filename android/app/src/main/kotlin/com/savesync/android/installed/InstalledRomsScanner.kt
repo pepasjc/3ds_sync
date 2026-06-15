@@ -41,6 +41,7 @@ object InstalledRomsScanner {
         "MD"     to listOf("megadrive", "genesis", "MD", "Mega Drive", "Genesis", "MegaDrive"),
         "SEGACD" to listOf("segacd", "megacd", "Sega CD", "Mega CD", "SegaCD", "MegaCD"),
         "SMS"    to listOf("mastersystem", "SMS", "Master System", "Sega Master System"),
+        "SG1000" to listOf("sg-1000", "sg1000", "sc-3000", "SG1000", "SG-1000", "Sega SG-1000"),
         "GG"     to listOf("gamegear", "GG", "Game Gear", "GameGear"),
         "SAT"    to listOf("saturn", "Saturn", "Sega Saturn", "Sega - Saturn", "SAT"),
         "DC"     to listOf("dreamcast", "dc", "Dreamcast", "Sega Dreamcast", "DC"),
@@ -48,6 +49,8 @@ object InstalledRomsScanner {
         // NEC / SNK / misc
         "PCE"    to listOf("pcengine", "tg16", "PCE", "PC Engine", "TurboGrafx", "PCEngine"),
         "PCECD"  to listOf("pcenginecd", "tgcd", "PCECD", "PC Engine CD"),
+        "PCSG"   to listOf("supergrafx", "sgx", "pcenginesgx", "PCSG", "PC Engine SuperGrafx", "SuperGrafx"),
+        "PCFX"   to listOf("pcfx", "PCFX", "PC-FX", "NEC PC-FX"),
         "NEOGEO" to listOf("neogeo", "NeoGeo", "NEOGEO"),
         "NEOCD"  to listOf("neogeocd", "NEOCD", "Neo Geo CD", "NeoGeoCD"),
         "NGP"    to listOf("ngp", "NGP", "Neo Geo Pocket", "NeoGeoPocket"),
