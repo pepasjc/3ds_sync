@@ -14,6 +14,13 @@
 #include <lwip/sockets.h>
 
 #define HTTP_HEADER_BUF  4096
+
+// Upper bound on a buffered (non-streamed) response body. Guards malloc()
+// against a malicious/garbage Content-Length: parsing it into a signed int
+// and doing malloc(content_length + 1) would overflow near INT_MAX while the
+// recv loop keeps writing — a heap overflow. Large transfers use the
+// streaming download path, not this buffered one.
+#define HTTP_MAX_BODY    (32 * 1024 * 1024)
 #define HTTP_TIMEOUT_SEC 30
 #define HTTP_STREAM_TIMEOUT_SEC 600
 
@@ -157,7 +164,11 @@ HttpResponse http_request(const char *url,
     }
     freeaddrinfo(res);
 
-    // Build request headers.
+    // Build request headers. Each snprintf is guarded against truncation:
+    // snprintf returns the length it *would* have written, so blindly adding
+    // it to hdr_len can push past sizeof(req) and make the next
+    // `sizeof(req) - hdr_len` wrap to a huge size_t with req+hdr_len pointing
+    // out of bounds. Bail if any append doesn't fit.
     char req[HTTP_HEADER_BUF];
     const char *m = (method == HTTP_GET) ? "GET" : "POST";
     int hdr_len = snprintf(req, sizeof(req),
@@ -166,21 +177,46 @@ HttpResponse http_request(const char *url,
         "User-Agent: XboxSync/1.0\r\n"
         "X-API-Key: %s\r\n",
         m, path, host, port, api_key ? api_key : "");
+    if (hdr_len < 0 || hdr_len >= (int)sizeof(req)) {
+        debugPrint("http: request header overflow\n");
+        close(s);
+        return rsp;
+    }
 
     if (console_id && console_id[0]) {
-        hdr_len += snprintf(req + hdr_len, sizeof(req) - hdr_len,
-                            "X-Console-ID: %s\r\n", console_id);
+        int n = snprintf(req + hdr_len, sizeof(req) - hdr_len,
+                         "X-Console-ID: %s\r\n", console_id);
+        if (n < 0 || n >= (int)sizeof(req) - hdr_len) {
+            debugPrint("http: request header overflow\n");
+            close(s);
+            return rsp;
+        }
+        hdr_len += n;
     }
     if (body && body_size > 0 && method == HTTP_POST) {
         const char *ct = (content_type && content_type[0])
                              ? content_type
                              : "application/octet-stream";
-        hdr_len += snprintf(req + hdr_len, sizeof(req) - hdr_len,
+        int n = snprintf(req + hdr_len, sizeof(req) - hdr_len,
             "Content-Type: %s\r\n"
             "Content-Length: %u\r\n", ct, (unsigned)body_size);
+        if (n < 0 || n >= (int)sizeof(req) - hdr_len) {
+            debugPrint("http: request header overflow\n");
+            close(s);
+            return rsp;
+        }
+        hdr_len += n;
     }
-    hdr_len += snprintf(req + hdr_len, sizeof(req) - hdr_len,
-                        "Connection: close\r\n\r\n");
+    {
+        int n = snprintf(req + hdr_len, sizeof(req) - hdr_len,
+                         "Connection: close\r\n\r\n");
+        if (n < 0 || n >= (int)sizeof(req) - hdr_len) {
+            debugPrint("http: request header overflow\n");
+            close(s);
+            return rsp;
+        }
+        hdr_len += n;
+    }
 
     if (send(s, req, hdr_len, 0) < 0) {
         debugPrint("http: send headers fail\n");
@@ -229,7 +265,17 @@ HttpResponse http_request(const char *url,
         if (body_sep && content_length < 0) {
             char *cl = strstr(hbuf, "Content-Length:");
             if (!cl) cl = strstr(hbuf, "content-length:");
-            if (cl) sscanf(cl + 15, " %d", &content_length);
+            if (cl) {
+                long long parsed = -1;
+                if (sscanf(cl + 15, " %lld", &parsed) == 1) {
+                    if (parsed < 0 || parsed > HTTP_MAX_BODY) {
+                        debugPrint("http: Content-Length %lld rejected\n", parsed);
+                        close(s);
+                        return rsp;
+                    }
+                    content_length = (int)parsed;
+                }
+            }
         }
         if (body_sep && content_length >= 0) {
             int body_off = (int)(body_sep - hbuf);
@@ -391,7 +437,17 @@ HttpResponse http_post_chunked(const char *url,
         if (body_sep && content_length < 0) {
             char *cl = strstr(hbuf, "Content-Length:");
             if (!cl) cl = strstr(hbuf, "content-length:");
-            if (cl) sscanf(cl + 15, " %d", &content_length);
+            if (cl) {
+                long long parsed = -1;
+                if (sscanf(cl + 15, " %lld", &parsed) == 1) {
+                    if (parsed < 0 || parsed > HTTP_MAX_BODY) {
+                        debugPrint("http: Content-Length %lld rejected\n", parsed);
+                        close(s);
+                        return rsp;
+                    }
+                    content_length = (int)parsed;
+                }
+            }
         }
         if (body_sep && content_length >= 0) {
             int body_off = (int)(body_sep - hbuf);

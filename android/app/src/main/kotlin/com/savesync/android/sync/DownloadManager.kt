@@ -692,6 +692,11 @@ class DownloadManager(
         romDirOverrides: Map<String, String> = emptyMap(),
         cdGamesPerContentFolder: Boolean = false,
     ): Pair<File, File> {
+        // The catalog/server-supplied filename is reduced to a bare basename
+        // so a crafted entry (e.g. "../../../sdcard/x") can't escape the
+        // target system directory. The app holds MANAGE_EXTERNAL_STORAGE, so
+        // this boundary matters.
+        val safeName = sanitizeDownloadName(filename)
         val outDir = InstalledRomsScanner.resolveRomTargetDir(
             scanRoot = File(romScanDir),
             system = system,
@@ -699,14 +704,24 @@ class DownloadManager(
         )
         val canonicalSystem = SystemAliases.normalizeSystemCode(system)
         val finalDir = if (cdGamesPerContentFolder && canonicalSystem in CD_FOLDER_SYSTEMS) {
-            val stem = filename.substringBeforeLast('.', filename)
+            val stem = safeName.substringBeforeLast('.', safeName)
             File(outDir, stem)
         } else {
             outDir
         }
-        val finalFile = File(finalDir, filename)
-        val partFile = File(finalDir, "$filename.part")
+        val finalFile = File(finalDir, safeName)
+        val partFile = File(finalDir, "$safeName.part")
         return finalFile to partFile
+    }
+
+    /**
+     * Reduces a catalog/server-supplied filename to a single safe path segment
+     * (strips directory components, rejects ``.``/``..``). Falls back to a
+     * generic name when nothing usable remains.
+     */
+    private fun sanitizeDownloadName(name: String): String {
+        val base = name.replace('\\', '/').substringAfterLast('/').trim()
+        return if (base.isEmpty() || base == "." || base == "..") "download.bin" else base
     }
 
     /**

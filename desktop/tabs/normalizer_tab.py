@@ -309,6 +309,9 @@ class NormalizeScanWorker(QThread):
                             new_stem = rn.find_region_preferred(
                                 new_stem, self.no_intro, region_hint
                             )
+                        new_stem = rn.apply_source_disc(
+                            new_stem, self.no_intro, rom.name
+                        )
 
                     if source == "filename" and self.normalize_fallback:
                         bracket_idx = rom.stem.find("[")
@@ -445,6 +448,11 @@ class NormalizeScanWorker(QThread):
                             new_stem = rn.find_region_preferred(
                                 new_stem, self.no_intro, region_hint
                             )
+                        # Multi-disc: name matching is disc-agnostic, so correct
+                        # the canonical to the disc this source file actually is.
+                        new_stem = rn.apply_source_disc(
+                            new_stem, self.no_intro, rom.name
+                        )
 
             new_rom = rom.parent / (new_stem + ext)
             subfolder = (

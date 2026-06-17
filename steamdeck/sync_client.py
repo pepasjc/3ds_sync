@@ -296,6 +296,16 @@ def _create_dir_bundle(
     return bytes(header) + compressed
 
 
+def _is_unsafe_bundle_path(rel_path: str) -> bool:
+    """True if a server-supplied bundle member would escape its dest dir."""
+    p = rel_path.replace("\\", "/")
+    return (
+        p.startswith("/")
+        or ".." in Path(p).parts
+        or (len(p) >= 2 and p[1] == ":")  # drive-letter absolute (Windows)
+    )
+
+
 def _parse_dir_bundle(data: bytes) -> list[tuple[str, bytes]]:
     """
     Parse a 3DSS v3/v4/v5 bundle, returning list of (filename, file_data).
@@ -915,6 +925,8 @@ class SyncClient:
                         existing.unlink()
                 # Write extracted files
                 for name, data in files:
+                    if _is_unsafe_bundle_path(name):
+                        raise RuntimeError(f"Refusing unsafe bundle member: {name}")
                     (save_path / name).write_bytes(data)
 
                 server_hash = r.headers.get("X-Save-Hash", "")
@@ -940,6 +952,8 @@ class SyncClient:
                     shutil.rmtree(save_path)
                 save_path.mkdir(parents=True, exist_ok=True)
                 for name, data in files:
+                    if _is_unsafe_bundle_path(name):
+                        raise RuntimeError(f"Refusing unsafe bundle member: {name}")
                     target = save_path / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)

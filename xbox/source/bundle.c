@@ -14,6 +14,22 @@
 
 #define ZLIB_CHUNK 8192U
 
+// Hard cap on a bundle's decompressed payload. The Xbox has 64 MB RAM and
+// saves are small; a header claiming ~4 GB would otherwise trigger a giant
+// malloc (DoS / OOM). 32 MB is comfortably above any real save bundle.
+#define BUNDLE_MAX_UNCOMPRESSED (32U * 1024U * 1024U)
+
+// Reject a server-supplied bundle member name that would escape the target
+// title directory (path traversal). Mirrors games.c is_bad_zip_path.
+static int bundle_path_unsafe(const char *name)
+{
+    if (!name || !name[0]) return 1;
+    if (strstr(name, "..")) return 1;
+    if (strchr(name, ':')) return 1;
+    if (name[0] == '/' || name[0] == '\\') return 1;
+    return 0;
+}
+
 // nxdk's zlib is built with Z_SOLO so the convenience helpers (compress(),
 // uncompress(), compressBound()) are excluded. Replicate the worst-case
 // bound formula straight from zlib's compress.c so we can size the output
@@ -741,6 +757,11 @@ int bundle_parse(const uint8_t *data, uint32_t size, ParsedBundle *out)
         return -1;
     }
     if (size < off) return -1;
+    if (uncompressed_size == 0 || uncompressed_size > BUNDLE_MAX_UNCOMPRESSED) {
+        debugPrint("bundle: uncompressed_size=%u out of range\n",
+                   (unsigned)uncompressed_size);
+        return -1;
+    }
 
     // Inflate payload.
     uint8_t *payload = (uint8_t *)malloc(uncompressed_size);
@@ -765,6 +786,11 @@ int bundle_parse(const uint8_t *data, uint32_t size, ParsedBundle *out)
         if (plen >= sizeof(out->files[i].relative_path)) goto bad;
         memcpy(out->files[i].relative_path, payload + p, plen);
         out->files[i].relative_path[plen] = '\0';
+        if (bundle_path_unsafe(out->files[i].relative_path)) {
+            debugPrint("bundle: unsafe member '%s'\n",
+                       out->files[i].relative_path);
+            goto bad;
+        }
         p += plen;
 
         if (p + 4 > uncompressed_size) goto bad;
@@ -1050,6 +1076,10 @@ int bundle_apply_file_to_disk(const char *bundle_path, const char *udata_title_i
         if (plen == 0 || plen >= XBOX_PATH_MAX) goto done;
         if (read_exact(payload, files[i].relative_path, plen) != 0) goto done;
         files[i].relative_path[plen] = '\0';
+        if (bundle_path_unsafe(files[i].relative_path)) {
+            debugPrint("apply: unsafe member '%s'\n", files[i].relative_path);
+            goto done;
+        }
 
         uint8_t sizebuf[4];
         if (read_exact(payload, sizebuf, sizeof(sizebuf)) != 0) goto done;

@@ -1014,7 +1014,11 @@ def cleanup_missing() -> int:
     for entry in list(_catalog.list_all()):
         full = rom_dir / entry.path
         try:
-            if not full.is_file():
+            # Bundle rows store ``path`` as the bundle *directory*, not a
+            # file, so ``is_file()`` would (wrongly) flag every bundle as
+            # missing. Check existence by the right kind.
+            exists = full.is_dir() if entry.is_bundle else full.is_file()
+            if not exists:
                 to_remove.append(entry.rom_id)
         except OSError:
             # Permission/IO issue — leave the row alone rather than

@@ -11,6 +11,7 @@ Sync save files between consoles, handhelds, and emulators through a self-hosted
 | `ds/` | Nintendo DS / DSi homebrew client |
 | `psp/` | PSP homebrew client |
 | `vita/` | PS Vita homebrew client |
+| `ps2/` | PlayStation 2 homebrew client — ⚠️ work in progress, not functional yet |
 | `ps3/` | PS3 homebrew client |
 | `android/` | Android app |
 | `steamdeck/` | Steam Deck / Linux desktop client |

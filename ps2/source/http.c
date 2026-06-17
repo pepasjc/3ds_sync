@@ -249,6 +249,17 @@ int http_get_buf(const HttpRequest *req,
     int status = parse_status(rbuf);
     if (status_out) *status_out = status;
 
+    uint32_t cap = out_size > 0 ? out_size - 1 : 0;
+
+    /* If the server advertised a body larger than the caller's buffer, fail
+     * loudly rather than silently returning a truncated payload (callers parse
+     * JSON / bundles from this and a cut-off body corrupts them). */
+    uint64_t content_length = parse_content_length(rbuf, (size_t)hlen);
+    if (content_length > (uint64_t)cap) {
+        close(fd);
+        return -6;
+    }
+
     /* Body bytes already in rbuf after the headers.  Use the byte count
      * from recv(), not strlen(), so binary data and embedded NULs are safe. */
     size_t body_in_rbuf = (total_read > (size_t)hlen)
@@ -256,7 +267,6 @@ int http_get_buf(const HttpRequest *req,
                         : 0;
 
     uint32_t written = 0;
-    uint32_t cap = out_size > 0 ? out_size - 1 : 0;
     if (body_in_rbuf > 0 && cap > 0) {
         uint32_t take = (body_in_rbuf < cap) ? (uint32_t)body_in_rbuf : cap;
         memcpy(out, rbuf + hlen, take);

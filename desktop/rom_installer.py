@@ -247,6 +247,17 @@ def safe_folder_name(value: str) -> str:
     return text or "download"
 
 
+def safe_file_name(value: str) -> str:
+    """Reduce a server-supplied filename to a safe basename (keeps extension).
+
+    Strips any directory components so a crafted catalog ``filename`` (e.g.
+    ``../../x.rom``) can't escape the resolved target folder.
+    """
+    base = Path(str(value or "").replace("\\", "/")).name.strip()
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base).strip(" .")
+    return base or "download.rom"
+
+
 def _system_subdir(root: Path, system: str, device_type: str) -> Path:
     system_up = system.upper()
     if device_type == "MiSTer":
@@ -287,7 +298,7 @@ def build_install_plan(
     rom_id = str(rom.get("rom_id") or rom.get("title_id") or "")
     if not rom_id:
         raise ValueError("Catalog entry is missing a ROM id.")
-    filename = str(rom.get("filename") or f"{rom_id}.rom")
+    filename = safe_file_name(str(rom.get("filename") or f"{rom_id}.rom"))
     extract = choose_extract_format(profile, rom, system_up, override_format)
     target_root = resolve_profile_rom_folder(profile, system_up)
     display_name = str(rom.get("name") or Path(filename).stem or rom_id)

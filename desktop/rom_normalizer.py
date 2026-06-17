@@ -1472,6 +1472,57 @@ def find_region_preferred(
     return canonical
 
 
+# Captures the disc number from a ``(Disc 2)`` / ``(Disk 2)`` / ``(CD 2)`` tag.
+# Anchored on the opening paren so it never matches inside ``(Sega CD 32X)``.
+_DISC_NUM_RE = re.compile(r"\((?:Disc|Disk|CD)\s*(\d+)\)", re.IGNORECASE)
+
+
+def extract_disc_number(name: str) -> int | None:
+    """Return the disc number from a ``(Disc N)`` tag, or None if absent."""
+    m = _DISC_NUM_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def apply_source_disc(
+    canonical: str, no_intro: dict[str, str], source_filename: str
+) -> str:
+    """Correct a name-matched canonical to the disc the SOURCE file actually is.
+
+    Name matching uses a disc-agnostic index, so every disc of a multi-disc game
+    resolves to the same (disc 1) canonical.  When the source filename carries a
+    ``(Disc N)`` tag, return the real DAT entry for disc N of the same title —
+    preserving per-disc subtitles like ``(Juice)`` — or, if the DAT has no such
+    entry, rewrite the disc number on the canonical so discs stay distinct.
+    """
+    src_disc = extract_disc_number(_strip_known_ext(source_filename))
+    if src_disc is None:
+        return canonical  # source isn't a disc — leave canonical as-is
+    if extract_disc_number(canonical) == src_disc:
+        return canonical  # already the right disc
+
+    base = normalize_name(canonical)  # disc/region/subtitle stripped
+    can_regions = set(extract_region_hints(canonical))
+    best: tuple[int, str] | None = None
+    for cand in no_intro.values():
+        if extract_disc_number(cand) != src_disc:
+            continue
+        if normalize_name(cand) != base:
+            continue
+        cand_regions = set(extract_region_hints(cand))
+        region_score = (
+            0 if (can_regions and cand_regions and can_regions & cand_regions) else 1
+        )
+        if best is None or region_score < best[0]:
+            best = (region_score, cand)
+    if best is not None:
+        return best[1]
+
+    # DAT has no disc-N entry — rewrite the disc number to keep discs distinct.
+    if _DISC_NUM_RE.search(canonical):
+        return _DISC_NUM_RE.sub(f"(Disc {src_disc})", canonical, count=1)
+    return f"{canonical} (Disc {src_disc})"
+
+
 def find_companion_files(rom_path: Path, new_stem: str) -> list[tuple[Path, Path]]:
     """Return companion files that should be renamed alongside the given ROM.
 

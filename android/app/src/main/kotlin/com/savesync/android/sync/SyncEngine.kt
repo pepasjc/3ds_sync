@@ -591,13 +591,17 @@ class SyncEngine(
         val body = response.body()
             ?: throw IOException("Server returned empty response for ROM $romId")
 
-        val filename = expectedFilename
+        val rawFilename = expectedFilename
             ?: response.headers()["Content-Disposition"]
                 ?.let { cd ->
                     val match = Regex("filename=\"?([^\"]+)\"?").find(cd)
                     match?.groupValues?.get(1)
                 }
             ?: "$romId.rom"
+        // Server/header-supplied name: collapse to a bare basename so a
+        // crafted Content-Disposition (e.g. "../../foo") can't escape the
+        // target ROM directory.
+        val filename = sanitizeDownloadName(rawFilename) ?: "$romId.rom"
 
         // Delegate folder selection to the shared helper so the download
         // path, the installed-ROMs scanner, and the Steam Deck client all
@@ -735,7 +739,13 @@ class SyncEngine(
             if (files.isEmpty()) return false
             slotDir.mkdirs()
             for ((name, data) in files) {
-                File(slotDir, name).writeBytes(data)
+                val target = safeChildFile(slotDir, name)
+                if (target == null) {
+                    Log.w(TAG, "Rejected unsafe bundle entry name '$name' for $titleId")
+                    continue
+                }
+                target.parentFile?.mkdirs()
+                target.writeBytes(data)
             }
             true
         } catch (e: Exception) {
@@ -762,7 +772,11 @@ class SyncEngine(
             }
             saveDir.mkdirs()
             for ((name, data) in files) {
-                val target = File(saveDir, name)
+                val target = safeChildFile(saveDir, name)
+                if (target == null) {
+                    Log.w(TAG, "Rejected unsafe bundle entry name '$name' for $titleId")
+                    continue
+                }
                 target.parentFile?.mkdirs()
                 target.writeBytes(data)
             }
@@ -842,8 +856,10 @@ class SyncEngine(
         val zis = java.util.zip.ZipInputStream(bais)
         var entry = zis.nextEntry
         while (entry != null) {
-            val outFile = java.io.File(targetDir, entry.name)
-            if (entry.isDirectory) {
+            val outFile = safeChildFile(targetDir, entry.name)
+            if (outFile == null) {
+                Log.w(TAG, "Rejected unsafe zip entry name '${entry.name}'")
+            } else if (entry.isDirectory) {
                 outFile.mkdirs()
             } else {
                 outFile.parentFile?.mkdirs()
@@ -855,6 +871,33 @@ class SyncEngine(
             entry = zis.nextEntry
         }
         zis.close()
+    }
+
+    /**
+     * Resolves [name] under [baseDir] and returns the [File] only if it stays
+     * within [baseDir] (defends against path traversal / Zip-Slip from
+     * server-controlled bundle and archive entry names). Returns null when the
+     * resolved path would escape the directory.
+     */
+    /**
+     * Reduces a server/header-supplied filename to a single safe path segment
+     * (strips any directory components and rejects ``.``/``..``). Returns null
+     * if nothing usable remains.
+     */
+    private fun sanitizeDownloadName(name: String): String? {
+        val base = name.replace('\\', '/').substringAfterLast('/').trim()
+        return if (base.isEmpty() || base == "." || base == "..") null else base
+    }
+
+    private fun safeChildFile(baseDir: File, name: String): File? {
+        val target = File(baseDir, name)
+        val basePath = baseDir.canonicalPath
+        val targetPath = target.canonicalPath
+        return if (targetPath == basePath || targetPath.startsWith(basePath + File.separator)) {
+            target
+        } else {
+            null
+        }
     }
 
     private fun extractErrorDetail(body: String): String {

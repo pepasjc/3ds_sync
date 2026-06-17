@@ -341,6 +341,7 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.apply_source_disc(canonical, no_intro, path.name)
                 canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "header"
 
@@ -351,6 +352,7 @@ def _resolve_canonical_name_for_file(
             )
             if region_hint:
                 canonical = rn.find_region_preferred(canonical, no_intro, region_hint)
+            canonical = rn.apply_source_disc(canonical, no_intro, path.name)
             canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
             return canonical, "fuzzy"
 
@@ -364,6 +366,7 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.apply_source_disc(canonical, no_intro, path.name)
                 canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "folder"
 
@@ -472,6 +475,9 @@ def _resolve_canonical_name_for_zip(
                                 match_source = "folder"
 
                 if canonical and match_source in ("header", "fuzzy", "folder"):
+                    canonical = rn.apply_source_disc(
+                        canonical, no_intro, member_path.name
+                    )
                     canonical = rn.prefer_source_name_over_cosmetic(
                         member_path.name, canonical
                     )
@@ -541,6 +547,7 @@ def _resolve_canonical_name_for_archive_label(
             )
             if region_hint:
                 canonical = rn.find_region_preferred(canonical, no_intro, region_hint)
+            canonical = rn.apply_source_disc(canonical, no_intro, archive_name)
             return canonical, match_source
 
     return None, "filename"
@@ -732,9 +739,13 @@ def _dedup_key(candidate: CollectionCandidate, clone_map: dict[str, str]) -> str
     to the candidate's own ``base_key``.
     """
     leader = clone_map.get(candidate.canonical_name)
-    if leader:
-        return rn.normalize_name(leader)
-    return candidate.base_key
+    base = rn.normalize_name(leader) if leader else candidate.base_key
+    # Keep each disc of a multi-disc game in its own bucket — otherwise Disc 1-4
+    # share a disc-agnostic base_key and all but one disc get dropped as dupes.
+    disc = rn.extract_disc_number(candidate.canonical_name)
+    if disc is not None:
+        return f"{base}#disc{disc}"
+    return base
 
 
 def _resolve_alias_canonical_name(

@@ -1770,11 +1770,23 @@ def _clear_dir_contents(path: Path) -> None:
             fp.rmdir()
 
 
+def _is_unsafe_bundle_path(rel_path: str) -> bool:
+    """True if a server-supplied bundle member would escape its dest dir."""
+    p = rel_path.replace("\\", "/")
+    return (
+        p.startswith("/")
+        or ".." in Path(p).parts
+        or (len(p) >= 2 and p[1] == ":")  # drive-letter absolute (Windows)
+    )
+
+
 def _extract_bundle_to_dir(data: bytes, dest_dir: Path) -> None:
     files = _parse_dir_bundle(data)
     dest_dir.mkdir(parents=True, exist_ok=True)
     _clear_dir_contents(dest_dir)
     for rel_path, content in files:
+        if _is_unsafe_bundle_path(rel_path):
+            raise RuntimeError(f"Refusing unsafe bundle member: {rel_path}")
         target = dest_dir / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
