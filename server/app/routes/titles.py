@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
-from app.services import storage, game_names, saturn_archives
+from app.services import storage, game_names, rom_scanner, saturn_archives
 
 router = APIRouter()
 
@@ -17,6 +17,10 @@ class NameHintRequest(BaseModel):
 class SaturnArchiveLookupRequest(BaseModel):
     title_id: str
     archive_names: list[str]
+
+
+class CanonicalNamesRequest(BaseModel):
+    title_ids: list[str]
 
 
 def _resolve_console_type(title: dict, typed: dict[str, tuple[str, str]]) -> str:
@@ -125,6 +129,50 @@ async def lookup_game_names(request: NameLookupRequest):
         if (r := game_names.get_psx_retail_serial(c)) is not None
     }
     return {"names": names, "types": types, "retail_serials": retail_serials}
+
+
+@router.post("/titles/canonical-names")
+async def lookup_canonical_names(request: CanonicalNamesRequest):
+    """Resolve emulator-style title_ids to their canonical DAT/No-Intro names.
+
+    For each requested ``title_id`` (e.g. ``SNES_super_mario_world_usa``) the
+    server checks the rom catalog for a matching entry and returns its
+    canonical ``name`` (e.g. ``"Super Mario World (USA)"``).  Clients use this
+    to construct save filenames that match what the emulator expects on disk
+    rather than re-deriving them from a slug.
+
+    Title IDs with no catalog hit are omitted from the response — the client
+    treats a missing key as "not found" and must decide how to fall back.
+    """
+    catalog = rom_scanner.get()
+    names: dict[str, str] = {}
+    if catalog is None:
+        return {"names": names}
+
+    requested = set(request.title_ids)
+    # Direct rom_id hit (the common case for emulator entries where
+    # ``rom_id == title_id``).
+    for tid in requested:
+        entry = catalog.get(tid)
+        if entry is not None and entry.name:
+            names[tid] = entry.name
+
+    # Title IDs that didn't resolve via rom_id: scan the catalog once for a
+    # title_id match.  Multi-disc PS1 games share one title_id across several
+    # rom_ids — picking the first hit is fine since the canonical "name"
+    # field is the same across discs.
+    unresolved = requested - names.keys()
+    if unresolved:
+        for entry in catalog.list_all():
+            if not entry.title_id or entry.title_id not in unresolved:
+                continue
+            if entry.name:
+                names[entry.title_id] = entry.name
+            unresolved.discard(entry.title_id)
+            if not unresolved:
+                break
+
+    return {"names": names}
 
 
 @router.post("/titles/saturn-archives")

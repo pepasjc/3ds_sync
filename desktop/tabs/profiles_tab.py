@@ -11,8 +11,37 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from config import load_config, save_config
+from config import load_config, resolve_profile_for_sd, save_config
 from dialogs.profile_dialog import ProfileDialog
+from rom_installer import ROM_FORMAT_LABELS
+
+
+def _profile_path_display(profile: dict) -> str:
+    if profile.get("device_type") == "MemCard Pro FTP":
+        host = profile.get("ftp_host", "")
+        port = profile.get("ftp_port", 21)
+        path = profile.get("path", "/") or "/"
+        try:
+            port_num = int(port or 21)
+        except (TypeError, ValueError):
+            port_num = 21
+        port_text = "" if port_num == 21 else f":{port_num}"
+        return f"ftp://{host}{port_text}{path}"
+    return profile.get("path", "")
+
+
+def _profile_rom_format_display(profile: dict) -> str:
+    if "systems" in profile:
+        values = {
+            str(s.get("rom_format", "auto") or "auto").lower()
+            for s in profile.get("systems", [])
+            if s.get("enabled", True)
+        }
+        if len(values) == 1:
+            return ROM_FORMAT_LABELS.get(next(iter(values)), "Auto")
+        return "Mixed" if values else "Auto"
+    value = str(profile.get("rom_format", "auto") or "auto").lower()
+    return ROM_FORMAT_LABELS.get(value, "Auto")
 
 
 class ProfilesTab(QWidget):
@@ -38,8 +67,8 @@ class ProfilesTab(QWidget):
         layout.addLayout(btn_row)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Name", "Device Type", "Game Folder", "Save Folder"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Name", "Device Type", "Game Folder", "Save Folder", "ROM Format"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -56,9 +85,10 @@ class ProfilesTab(QWidget):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(p.get("name", "")))
             self.table.setItem(row, 1, QTableWidgetItem(p.get("device_type", "")))
-            self.table.setItem(row, 2, QTableWidgetItem(p.get("path", "")))
+            self.table.setItem(row, 2, QTableWidgetItem(_profile_path_display(p)))
             save_folder = p.get("save_folder", "")
             self.table.setItem(row, 3, QTableWidgetItem(save_folder or "(same as game folder)"))
+            self.table.setItem(row, 4, QTableWidgetItem(_profile_rom_format_display(p)))
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, p)
 
     def _save_profiles(self):
@@ -72,11 +102,13 @@ class ProfilesTab(QWidget):
         save_config(config)
 
     def get_profiles(self) -> list[dict]:
+        # SD-card profiles get their drive letter remapped to the currently
+        # mounted reader; the stored copy in the table keeps its fixed letter.
         profiles = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
-                profiles.append(item.data(Qt.ItemDataRole.UserRole))
+                profiles.append(resolve_profile_for_sd(item.data(Qt.ItemDataRole.UserRole)))
         return profiles
 
     def _add_profile(self):
@@ -87,9 +119,10 @@ class ProfilesTab(QWidget):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(profile["name"]))
             self.table.setItem(row, 1, QTableWidgetItem(profile["device_type"]))
-            self.table.setItem(row, 2, QTableWidgetItem(profile["path"]))
+            self.table.setItem(row, 2, QTableWidgetItem(_profile_path_display(profile)))
             sf = profile.get("save_folder", "")
             self.table.setItem(row, 3, QTableWidgetItem(sf or "(same as game folder)"))
+            self.table.setItem(row, 4, QTableWidgetItem(_profile_rom_format_display(profile)))
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, profile)
             self._save_profiles()
 
@@ -103,9 +136,10 @@ class ProfilesTab(QWidget):
             updated = dialog.get_profile()
             self.table.setItem(row, 0, QTableWidgetItem(updated["name"]))
             self.table.setItem(row, 1, QTableWidgetItem(updated["device_type"]))
-            self.table.setItem(row, 2, QTableWidgetItem(updated["path"]))
+            self.table.setItem(row, 2, QTableWidgetItem(_profile_path_display(updated)))
             sf = updated.get("save_folder", "")
             self.table.setItem(row, 3, QTableWidgetItem(sf or "(same as game folder)"))
+            self.table.setItem(row, 4, QTableWidgetItem(_profile_rom_format_display(updated)))
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, updated)
             self._save_profiles()
 

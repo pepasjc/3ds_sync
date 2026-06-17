@@ -3,23 +3,39 @@
 GET  /api/v1/roms              — List all ROMs in catalog (with optional filters)
 GET  /api/v1/roms/{title_id}   — Download a ROM file (with HTTP Range support)
                                   ?extract=cue  — CHD → CUE/BIN ZIP (PS1, Saturn, etc.)
+                                  ?extract=psio — PS1 CHD/CUE → PSIO BIN/CU2 ZIP
                                   ?extract=gdi  — CHD → GDI ZIP (Dreamcast)
                                   ?extract=iso  — CHD → ISO (PSP)
                                   ?extract=cso  — CHD → CSO compressed image (PSP)
                                   ?extract=rvz  — RVZ → ISO (GameCube / Wii via DolphinTool)
-                                  ?extract=cia  — 3DS cart image → installable CIA
-                                  ?extract=decrypted_cia
-                                                 3DS cart image → decrypted CIA for emulators
+                                  ?extract=cia  — 3DS cart image → decrypted CIA
+                                                 (installable on CFW 3DS AND usable in emulators)
                                   ?extract=decrypted_cci
                                                  3DS cart image → decrypted CCI for emulators
+                                  PS3 .iso files: streamed raw (RPCS3 mounts ISO directly).
+                                  PS3 bundle (subfolder containing .pkg files): streamed as
+                                  ZIP_STORED archive of every file in the subfolder.  Loose
+                                  .pkg at <rom_dir>/ps3/ root are skipped — operators must
+                                  drop PSN content into a per-game subfolder so the catalog
+                                  can derive the game name + group .pkg + .rap files.
+                                  Xbox .iso files: streamed raw or converted to CCI ZIP.
+                                  Xbox bundles (.cci or default.xbe+.iso subfolders):
+                                  ZIP by default, or ?extract=iso streams the disc image.
+GET  /api/v1/roms/{rom_id}/manifest
+                              — Bundle file list (returns single-element list for non-bundle)
+GET  /api/v1/roms/{rom_id}/file/{rel_path}
+                              — Stream a single file out of a bundle (Range support).
+                                Used by the PS3 client to route .pkg → /dev_hdd0/packages
+                                and .rap → /dev_hdd0/exdata.
 POST /api/v1/roms/scan         — Trigger rescan of ROM directory
 GET  /api/v1/roms/systems      — List systems with ROMs and counts
 """
 
 import asyncio
-import io
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -29,9 +45,172 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.config import settings
+
+
+def _conversion_tmp_dir() -> str | None:
+    """Resolve where ``tempfile.mkdtemp`` should put conversion workdirs.
+
+    Returns the configured ``settings.tmp_dir`` (creating it if needed) when
+    set, otherwise ``None`` so ``mkdtemp`` falls back to its system default.
+
+    Centralised here because (a) every conversion path needs the same
+    treatment and (b) we can't rely on the ``TMPDIR`` environment variable —
+    uv's bundled python-build-standalone interpreter strips ``TMPDIR`` on
+    startup while leaving every other env var alone.
+    """
+    if settings.tmp_dir is None:
+        return None
+    try:
+        settings.tmp_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # If the configured dir can't be created (permissions, missing mount,
+        # etc.), fall back to the system default rather than failing the
+        # whole request — the server log already records the OSError.
+        return None
+    return str(settings.tmp_dir)
+
+
+# ── Conversion output cache ─────────────────────────────────────────────────
+#
+# 3DS / GameCube / PSP / CHD conversions are slow (multi-minute CPU-bound
+# decryption + decompression).  The same source ROM converted to the same
+# format always produces the same output, so caching the result by
+# (source_path, mtime, size, format) is a free 100% speedup on every
+# repeat download.  On a Pi serving a developer who's testing the same
+# game over and over, this is the difference between "instant" and
+# "seven minutes per attempt."
+#
+# Cache layout:
+#   <settings.tmp_dir>/_conversion_cache/<sha-prefix>_<stem><output_ext>
+#
+# The cache lives under ``settings.tmp_dir`` (auto-disabled when that's
+# unset, mirroring tmpfs-fallback behaviour).  We never evict anything
+# automatically — on a sane host with the tmp_dir on a multi-TB volume
+# this is fine for years; if disk pressure ever becomes a concern, a
+# cron/systemd-timer can prune oldest-mtime entries.
+
+_CACHE_DIR_NAME = "_conversion_cache"
+
+
+def _conversion_cache_dir() -> Path | None:
+    """Persistent cache directory under ``settings.tmp_dir``.  Returns
+    ``None`` when no tmp_dir is configured (caching disabled — every
+    request goes through the full pipeline)."""
+    tmp = _conversion_tmp_dir()
+    if tmp is None:
+        return None
+    cache = Path(tmp) / _CACHE_DIR_NAME
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return cache
+
+
+def _conversion_cache_key(source_path: Path, fmt: str) -> str:
+    """Stable 16-char SHA-256 prefix of (absolute path, mtime_ns, size,
+    format).  Including mtime + size means the cache invalidates
+    automatically when the source ROM is replaced (e.g. user re-downloads
+    a fresher dump), without any explicit cache-bust step."""
+    st = source_path.stat()
+    payload = f"{source_path.absolute()}|{st.st_mtime_ns}|{st.st_size}|{fmt}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _cached_output_path(source_path: Path, fmt: str, output_ext: str) -> Path | None:
+    """Predicted cache path for this (source, fmt) — does NOT check
+    existence.  Returns ``None`` when caching is disabled."""
+    cache = _conversion_cache_dir()
+    if cache is None:
+        return None
+    key = _conversion_cache_key(source_path, fmt)
+    return cache / f"{source_path.stem}_{key}{output_ext}"
+
+
+def _lookup_cached_output(source_path: Path, fmt: str, output_ext: str) -> Path | None:
+    """Return path to a pre-computed conversion output if one exists,
+    else ``None``.  Callers that get a hit can skip the entire
+    converter pipeline and stream straight from the cached file."""
+    candidate = _cached_output_path(source_path, fmt, output_ext)
+    if candidate is None:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _save_to_cache(temp_output: Path, source_path: Path, fmt: str, output_ext: str) -> Path:
+    """Move a fresh conversion output into the cache and return the new
+    path.  When caching is disabled, returns the original path
+    unchanged so callers always get a usable Path back.
+
+    Move (not copy) avoids paying for a duplicate write on the slow
+    (Pi + USB HDD) tier — ``shutil.move`` is a rename when source +
+    destination are on the same filesystem, which is the common case
+    when ``settings.tmp_dir`` is set.
+    """
+    cached_path = _cached_output_path(source_path, fmt, output_ext)
+    if cached_path is None:
+        return temp_output
+    try:
+        shutil.move(str(temp_output), str(cached_path))
+        return cached_path
+    except OSError:
+        # If the move fails (cross-fs without permission, dest exists and
+        # is busy, etc.), keep using the temp output — the response still
+        # works, we just don't get the cache benefit on this request.
+        return temp_output
+
+
+def _conversion_cache_key_multi(source_paths: list[Path], fmt: str) -> str:
+    """Cache key over an ordered set of source files (multi-disc PS1).
+
+    Hashes each path's (absolute, mtime_ns, size) so the cache invalidates
+    when any disc is replaced.  Discs are hashed in the order supplied
+    because order matters for pop-fe (Disc 1 must be argv[0]) — passing
+    the same set in a different order would legitimately produce a
+    different PBP and so should miss the cache.
+    """
+    parts: list[str] = []
+    for p in source_paths:
+        st = p.stat()
+        parts.append(f"{p.absolute()}|{st.st_mtime_ns}|{st.st_size}")
+    payload = '\n'.join(parts) + f"|{fmt}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _cached_output_by_key(label: str, key: str, output_ext: str) -> Path | None:
+    cache = _conversion_cache_dir()
+    if cache is None:
+        return None
+    return cache / f"{label}_{key}{output_ext}"
+
+
+def _lookup_cached_by_key(label: str, key: str, output_ext: str) -> Path | None:
+    candidate = _cached_output_by_key(label, key, output_ext)
+    if candidate is None:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _save_to_cache_by_key(temp_output: Path, label: str, key: str, output_ext: str) -> Path:
+    cached = _cached_output_by_key(label, key, output_ext)
+    if cached is None:
+        return temp_output
+    try:
+        shutil.move(str(temp_output), str(cached))
+        return cached
+    except OSError:
+        return temp_output
+
+
+# Chunk size for streamed Range responses. 1 MiB is a good balance between
+# syscall overhead and keeping memory bounded — a single in-flight request
+# never holds more than this much in RAM at a time, so 4GB ROMs over slow
+# WAN links cost ~1MB of process memory regardless of file size.
+_STREAM_CHUNK = 1 << 20
 from app.services import rom_scanner
 
 router = APIRouter()
@@ -46,9 +225,18 @@ _CUE_SYSTEMS = frozenset({
     'PCECD', 'PCENGINECD', 'TG16CD',
     '3DO',
     'PCFX',
-    'NGCD',
+    # Neo Geo CD: scanner emits ``NEOCD`` (canonical), some older
+    # configs / external clients use ``NGCD`` or ``NEOGEOCD`` — list
+    # all three so the extract path matches regardless of which alias
+    # arrived.  Same pattern for Atari Jaguar CD below.
+    'NEOCD', 'NGCD', 'NEOGEOCD',
     'AMIGACD32',
-    'JAGCD',
+    'JAGCD', 'JAGUARCD',
+    # PS2 is dual-media — DVDs go through the ISO extract path, CDs
+    # through this CUE/BIN path.  Listing PS2 here gates the CD extract
+    # handler; the actual disc-vs-DVD decision per game is made in
+    # ``_extract_formats_for_entry`` using the DAT.
+    'PS2',
 })
 
 # Dreamcast uses GDI format
@@ -57,36 +245,91 @@ _GDI_SYSTEMS = frozenset({'DC', 'DREAMCAST'})
 # PSP uses its own ISO/CSO pipeline
 _PSP_SYSTEMS = frozenset({'PSP'})
 
+# PS2 uses chdman's ``extractdvd`` subcommand for DVD CHDs (single ISO output).
+# PS2 CDs continue to flow through ``_extract_cd`` like other CD-ROM systems.
+_PS2_SYSTEMS = frozenset({'PS2'})
+
 # GameCube / Wii use RVZ (Dolphin compressed) — convert with DolphinTool
 _GC_SYSTEMS = frozenset({'GC', 'WII'})
+
+# Xbox / Xbox 360 disc images.  The server exposes CCI, ISO, and extracted
+# folder ZIP variants.  CCI source folders are served as ZIPs because the .cci
+# image can travel with attach launchers; ISO source files are streamed raw
+# unless the user requests CCI/folder conversion.
+_XBOX_SYSTEMS = frozenset({'XBOX', 'X360', 'XBOX360'})
+_XBOX_DISC_EXTENSIONS = frozenset({'.cci', '.iso'})
 
 # 3DS cartridge images can be converted to CIA variants
 _3DS_SYSTEMS = frozenset({'3DS'})
 _3DS_CART_EXTENSIONS = frozenset({'.3ds', '.cci'})
+# Output filenames preserve the original ROM stem — only the extension changes.
+# Two formats only: a decrypted CIA (which is also installable on CFW 3DS
+# hardware, so one button covers both use-cases) and a decrypted CCI for
+# emulators that prefer that format.
 _3DS_EXTRACT_SPECS = {
     'cia': {
         'setting': 'rom_3ds_cia_command',
         'env': 'SYNC_ROM_3DS_CIA_COMMAND',
         'label': 'CIA',
         'output_ext': '.cia',
-        'filename_suffix': '',
-    },
-    'decrypted_cia': {
-        'setting': 'rom_3ds_decrypted_cia_command',
-        'env': 'SYNC_ROM_3DS_DECRYPTED_CIA_COMMAND',
-        'label': 'decrypted CIA',
-        'output_ext': '.cia',
-        'filename_suffix': '_decrypted',
     },
     'decrypted_cci': {
         'setting': 'rom_3ds_decrypted_cci_command',
         'env': 'SYNC_ROM_3DS_DECRYPTED_CCI_COMMAND',
         'label': 'decrypted CCI',
         'output_ext': '.cci',
-        'filename_suffix': '_decrypted',
     },
 }
 _3DS_EXTRACT_FORMATS = list(_3DS_EXTRACT_SPECS.keys())
+
+# Xbox conversion specs — same shape as the 3DS table so the shared
+# ``_expand_command_template`` / cache machinery handles them without
+# special-casing.  XGDTool's CLI can create ``--xiso`` and ``--cci`` outputs
+# from the opposite source format; the server wraps CCI outputs in a ZIP for
+# consistent WebUI downloads.
+_XBOX_EXTRACT_SPECS = {
+    'cci': {
+        'setting': 'rom_xbox_cci_command',
+        'env': 'SYNC_ROM_XBOX_CCI_COMMAND',
+        'label': 'CCI ZIP',
+        'output_ext': '.zip',
+        'tool_output_ext': '.cci',
+        'mime': 'application/zip',
+    },
+    'iso': {
+        'setting': 'rom_xbox_iso_command',
+        'env': 'SYNC_ROM_XBOX_ISO_COMMAND',
+        'label': 'ISO',
+        'output_ext': '.iso',
+        'tool_output_ext': '.iso',
+        'mime': 'application/x-iso9660-image',
+    },
+    'folder': {
+        'setting': 'rom_xbox_folder_command',
+        'env': 'SYNC_ROM_XBOX_FOLDER_COMMAND',
+        'label': 'extracted folder ZIP',
+        'output_ext': '.zip',
+        'tool_output_ext': '',
+        'mime': 'application/zip',
+    },
+}
+_XBOX_EXTRACT_FORMATS = list(_XBOX_EXTRACT_SPECS.keys())
+
+# PS1 → PSP EBOOT.PBP conversion (popstation-style).  Used by the PSP
+# client's ROM Catalog so PS1 games convert into a PBP installable
+# under ms0:/PSP/GAME/<id>/.  Spec mirrors the 3DS/Xbox layout so the
+# templated command runner + cache code paths handle it without special
+# casing.  Output is a single .pbp file served raw (Content-Type
+# application/octet-stream) — no zip, no archive, the client writes it
+# directly as EBOOT.PBP at the target path.
+_PS1_EBOOT_SYSTEMS = frozenset({'PS1', 'PSX'})
+_PS1_EBOOT_SPEC = {
+    'setting': 'rom_ps1_eboot_command',
+    'env': 'SYNC_ROM_PS1_EBOOT_COMMAND',
+    'label': 'PSP EBOOT.PBP',
+    'output_ext': '.pbp',
+    'mime': 'application/octet-stream',
+}
 
 # All systems that support any CHD extraction
 _CD_SYSTEMS   = _CUE_SYSTEMS | _GDI_SYSTEMS
@@ -100,10 +343,12 @@ async def list_roms(
     system: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     has_save: Optional[bool] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=20000),
+    offset: int = Query(0, ge=0),
 ):
     catalog = rom_scanner.get()
     if not catalog:
-        return {"roms": [], "total": 0}
+        return {"roms": [], "total": 0, "offset": 0, "limit": limit, "has_more": False}
 
     entries = catalog.list_all()
 
@@ -122,17 +367,72 @@ async def list_roms(
         else:
             entries = [e for e in entries if not storage.title_exists(e.title_id)]
 
+    # `total` is always the full filtered count — essential for the client to
+    # know whether to page further or show a "showing X of Y" hint.
+    total = len(entries)
+
+    # Multi-disc PS1 grouping must be computed over the full filtered set
+    # before pagination — otherwise a multi-disc game split across page
+    # boundaries would report wrong disc_total values.  Maps rom_id →
+    # (disc_index, disc_total, primary_rom_id).  Single-disc games get
+    # the trivial (1, 1, rom_id) tuple.
+    ps1_disc_meta = _ps1_compute_disc_groups(entries)
+
+    if limit is not None:
+        page = entries[offset : offset + limit]
+        has_more = (offset + len(page)) < total
+    else:
+        page = entries[offset:] if offset else entries
+        has_more = False
+
     result = []
-    for e in entries:
+    for e in page:
         d = e.to_dict()
-        extract_format, extract_formats = _extract_formats_for_entry(e.system or '', e.filename)
+        extract_format, extract_formats = _extract_formats_for_entry(e)
         if extract_format:
             d['extract_format'] = extract_format
         if extract_formats:
             d['extract_formats'] = extract_formats
+        meta = ps1_disc_meta.get(e.rom_id)
+        if meta is not None:
+            d['disc_index'], d['disc_total'], d['primary_rom_id'] = meta
         result.append(d)
 
-    return {"roms": result, "total": len(result)}
+    return {
+        "roms": result,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+    }
+
+
+def _ps1_compute_disc_groups(entries) -> dict[str, tuple[int, int, str]]:
+    """Group PS1 entries by ``title_id`` to surface multi-disc info to
+    clients.  Returns a map keyed on ``rom_id``; PS1 entries get
+    ``(disc_index, disc_total, primary_rom_id)``, non-PS1 entries are
+    omitted (clients only branch on PS1).
+
+    Single-disc PS1 games still get an entry with ``(1, 1, rom_id)`` so
+    the PSP client can use the field's presence as a "this is a PS1
+    game" flag without an extra system check.
+    """
+    groups: dict[str, list] = {}
+    for e in entries:
+        if (e.system or '').upper() not in _PS1_EBOOT_SYSTEMS:
+            continue
+        if not e.title_id:
+            continue
+        groups.setdefault(e.title_id, []).append(e)
+
+    meta: dict[str, tuple[int, int, str]] = {}
+    for group in groups.values():
+        group.sort(key=lambda e: (_ps1_disc_number(e.filename), e.filename))
+        total = len(group)
+        primary_rom_id = group[0].rom_id
+        for idx, e in enumerate(group, 1):
+            meta[e.rom_id] = (idx, total, primary_rom_id)
+    return meta
 
 
 # ── Misc endpoints ───────────────────────────────────────────────────────────
@@ -143,6 +443,50 @@ async def list_systems():
     if not catalog:
         return {"systems": [], "stats": {}}
     return {"systems": catalog.systems(), "stats": catalog.stats()}
+
+
+@router.get("/roms/share-link")
+async def create_share_link(
+    path: str = Query(..., description="Path to share, e.g. /api/v1/roms/SLUS00922"),
+    ttl_days: int = Query(7, ge=1, le=30),
+):
+    """Mint an HMAC-signed share URL for a download path.
+
+    The returned URL embeds a short-lived token (default 7 days) and
+    can be pasted into a browser by anyone — no API key needed.  The
+    token is bound to the exact path, so it can't be replayed against
+    another ROM / save.  Rotating ``settings.api_key`` invalidates
+    every previously-issued share link.
+
+    Allow-listed prefixes only (``/api/v1/roms/<id>``,
+    ``/api/v1/saves/<id>``); admin-shaped sub-routes (scan / systems)
+    are rejected so a leaked token can't escalate.
+    """
+    from app.services import share_token
+
+    # Strip any pre-existing query string the caller might have left on
+    # the path (the WebUI sometimes builds these from a download URL
+    # that already had ``?api_key=...``).  We sign the bare path only.
+    bare_path = path.split("?", 1)[0]
+
+    if not share_token.is_shareable_path(bare_path):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": (
+                    "Path is not shareable.  Only individual ROM and save "
+                    "download paths can be shared."
+                )
+            },
+        )
+
+    token, expires = share_token.make(bare_path, ttl_seconds=ttl_days * 86400)
+    return {
+        "path": bare_path,
+        "token": token,
+        "expires_at": expires,
+        "url": f"{bare_path}?token={token}",
+    }
 
 
 @router.get("/roms/scan")
@@ -160,19 +504,327 @@ async def trigger_scan(request: Request, use_crc32: bool = Query(False)):
     return {"status": "ok", "count": len(catalog.entries)}
 
 
+# ── ROM bundle helpers ───────────────────────────────────────────────────────
+#
+# A bundle entry corresponds to ``<rom_dir>/<system>/<subfolder>/`` containing
+# multiple files that must travel together (PS3 .pkg + .rap, Xbox .cci +
+# launchers, PS1 cue/bin folders, etc.).  The catalog row's ``path`` field
+# stores the relative subfolder so the routes below can find the on-disk
+# source without a second DB lookup.
+
+
+def _bundle_dir_for(entry, rom_dir: Path) -> Path | None:
+    if not getattr(entry, 'is_bundle', False):
+        return None
+    bundle_dir = (rom_dir / entry.path).resolve()
+    rom_dir_resolved = rom_dir.resolve()
+    # Guard against a malicious or stale catalog row pointing outside the
+    # rom_dir tree (e.g. an absolute path or "../").  rom_dir_resolved must
+    # be a strict prefix of bundle_dir.
+    try:
+        bundle_dir.relative_to(rom_dir_resolved)
+    except ValueError:
+        return None
+    if not bundle_dir.is_dir():
+        return None
+    return bundle_dir
+
+
+def _bundle_manifest_files(entry) -> list[dict]:
+    """Return the [{name, size}] list stored in the catalog row.
+
+    Falls through to a live filesystem walk when the row didn't carry the
+    list (older catalog rows or a manual rescan glitch).  Filtering matches
+    the scanner's keep-list so we never advertise a file the bundle ZIP
+    wouldn't ship.
+    """
+    files = getattr(entry, 'bundle_files', None) or []
+    if files:
+        return list(files)
+
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return []
+    bundle_dir = _bundle_dir_for(entry, rom_dir)
+    if bundle_dir is None:
+        return []
+
+    sys_up = (getattr(entry, 'system', '') or '').upper()
+    out: list[dict] = []
+    for f in sorted(bundle_dir.rglob('*')):
+        if not f.is_file():
+            continue
+        if f.name.lower() in {'metadata.txt', 'systeminfo.txt'}:
+            continue
+        if sys_up in _XBOX_SYSTEMS:
+            keep = True
+        else:
+            ext = f.suffix.lower()
+            keep = (
+                ext == '.pkg'
+                or ext in {'.rap', '.edat'}
+                or ext in {'.iso', '.pbp', '.cci', '.xbe'}
+            )
+            if not keep:
+                continue
+        out.append({
+            'name': f.relative_to(bundle_dir).as_posix(),
+            'size': f.stat().st_size,
+        })
+    return out
+
+
+def _safe_archive_stem(value: str, fallback: str = "bundle") -> str:
+    return re.sub(r'[^A-Za-z0-9_.\- ]+', '_', value).strip('_ ') or fallback
+
+
+def _xbox_bundle_cci_path(entry, bundle_dir: Path) -> Path | None:
+    files = _bundle_manifest_files(entry)
+    cci_files = [
+        bundle_dir / f['name']
+        for f in files
+        if Path(str(f.get('name', ''))).suffix.lower() == '.cci'
+    ]
+    cci_files = [p for p in cci_files if p.is_file()]
+    if not cci_files:
+        # Stale manifest fallback: scan the directory directly.
+        cci_files = sorted(p for p in bundle_dir.rglob('*.cci') if p.is_file())
+    if not cci_files:
+        return None
+    # Libraries should have one CCI per game folder. If an operator drops
+    # multiple parts in there, choosing the largest is the least surprising
+    # deterministic fallback for the ISO conversion path.
+    return max(cci_files, key=lambda p: p.stat().st_size)
+
+
+def _xbox_bundle_iso_path(entry, bundle_dir: Path) -> Path | None:
+    """Find the .iso file inside an Xbox bundle directory.
+
+    Some Xbox game bundles contain a ``default.xbe`` launcher alongside a
+    raw ``.iso`` instead of a ``.cci``.  These should be treated the same
+    as CCI bundles — when the client requests ``?extract=iso``, we stream
+    the ISO directly (no conversion needed).
+    """
+    files = _bundle_manifest_files(entry)
+    iso_files = [
+        bundle_dir / f['name']
+        for f in files
+        if Path(str(f.get('name', ''))).suffix.lower() == '.iso'
+    ]
+    iso_files = [p for p in iso_files if p.is_file()]
+    if not iso_files:
+        iso_files = sorted(p for p in bundle_dir.rglob('*.iso') if p.is_file())
+    if not iso_files:
+        return None
+    return max(iso_files, key=lambda p: p.stat().st_size)
+
+
+async def _serve_single_file_zip(
+    source_path: Path,
+    zip_stem: str,
+    arcname: str | None = None,
+    cache_source: Path | None = None,
+    cache_fmt: str | None = None,
+) -> Response:
+    """Wrap a single file in a ZIP_STORED archive and stream it."""
+    output_ext = '.zip'
+    if cache_source is not None and cache_fmt:
+        cached = _lookup_cached_output(cache_source, cache_fmt, output_ext)
+        if cached is not None:
+            return _stream_file_response(cached, 'application/zip')
+
+    tmpdir = tempfile.mkdtemp(prefix='single_file_zip_', dir=_conversion_tmp_dir())
+    safe_stem = _safe_archive_stem(zip_stem)
+    zip_path = Path(tmpdir) / f'{safe_stem}.zip'
+    member_name = arcname or source_path.name
+
+    def _build_zip() -> Path:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+            zf.write(source_path, arcname=member_name)
+        return zip_path
+
+    try:
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _build_zip)
+    except Exception as exc:  # pragma: no cover — disk error path
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"ZIP failed: {exc}")
+
+    if cache_source is not None and cache_fmt:
+        out_path = _save_to_cache(out_path, cache_source, cache_fmt, output_ext)
+    return _stream_file_response(out_path, 'application/zip', cleanup_dir=tmpdir)
+
+
+async def _serve_bundle_zip(entry, bundle_dir: Path) -> Response:
+    """Return a ZIP_STORED archive of every file in the bundle.
+
+    PSN packages are already incompressible (encrypted blobs), so deflate
+    just wastes CPU.  ZIP_STORED also lets us advertise an exact
+    Content-Length without re-archiving every request: the ZIP overhead is
+    fixed (30 byte local header + 46 byte central directory entry per
+    member, plus 22 byte EOCD).  We materialise the ZIP to a tempfile so
+    Starlette can stream it with proper Range support.
+    """
+    files = _bundle_manifest_files(entry)
+    if not files:
+        return Response(status_code=404, content="Bundle is empty on disk")
+
+    tmpdir = tempfile.mkdtemp(prefix='rom_bundle_', dir=_conversion_tmp_dir())
+    safe_stem = _safe_archive_stem(entry.name)
+    zip_path = Path(tmpdir) / f'{safe_stem}.zip'
+
+    def _build_zip() -> Path:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for f in files:
+                src = bundle_dir / f['name']
+                if not src.is_file():
+                    continue
+                zf.write(src, arcname=f['name'])
+        return zip_path
+
+    try:
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _build_zip)
+    except Exception as exc:  # pragma: no cover — disk error path
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Bundle ZIP failed: {exc}")
+
+    return _stream_file_response(out_path, 'application/zip', cleanup_dir=tmpdir)
+
+
+# ── Bundle-specific endpoints ───────────────────────────────────────────────
+#
+# Both routes are mounted BEFORE the catch-all download route below so the
+# FastAPI matcher resolves them first.  ``rom_key`` here is always a single
+# segment because ``download_rom`` already URL-escapes it on the way out;
+# bundle ids never contain slashes.
+
+
+@router.get("/roms/{rom_key}/manifest")
+async def rom_manifest(rom_key: str):
+    """Return the file list for a bundle entry.
+
+    Single-file ROMs return a 1-element manifest with the on-disk name +
+    size, so the desktop / steamdeck / PS3 client can use one code path
+    regardless of bundle-ness.
+    """
+    catalog = rom_scanner.get()
+    if not catalog:
+        return JSONResponse(status_code=404, content={"detail": "no catalog"})
+
+    entry = catalog.get(rom_key)
+    if not entry:
+        for e in catalog.list_all():
+            if e.title_id == rom_key:
+                entry = e
+                break
+    if not entry:
+        return JSONResponse(status_code=404,
+                            content={"detail": f"ROM not found: {rom_key}"})
+
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return JSONResponse(status_code=404,
+                            content={"detail": "ROM directory not configured"})
+
+    if getattr(entry, 'is_bundle', False):
+        files = _bundle_manifest_files(entry)
+        return {
+            "rom_id": entry.rom_id,
+            "is_bundle": True,
+            "name": entry.name,
+            "system": entry.system,
+            "total_size": entry.size,
+            "files": files,
+        }
+
+    file_path = rom_dir / entry.path
+    if not file_path.is_file():
+        return JSONResponse(status_code=404,
+                            content={"detail": "ROM file missing on disk"})
+    return {
+        "rom_id": entry.rom_id,
+        "is_bundle": False,
+        "name": entry.name,
+        "system": entry.system,
+        "total_size": file_path.stat().st_size,
+        "files": [{"name": entry.filename, "size": file_path.stat().st_size}],
+    }
+
+
+@router.api_route("/roms/{rom_key}/file/{rel_path:path}",
+                  methods=["GET", "HEAD"])
+async def download_bundle_file(
+    rom_key: str,
+    rel_path: str,
+    range_header: Optional[str] = Header(None, alias="Range"),
+):
+    """Serve a single file out of a PS3 bundle.
+
+    Used by the PS3 client so it can route .pkg files to /dev_hdd0/packages
+    and .rap files to /dev_hdd0/exdata without downloading a ZIP first.
+    Each file uses Range so very large packages can resume across sessions
+    on the slow PS3 connection.
+    """
+    catalog = rom_scanner.get()
+    if not catalog:
+        return Response(status_code=404, content="No ROM catalog available")
+
+    entry = catalog.get(rom_key)
+    if not entry:
+        for e in catalog.list_all():
+            if e.title_id == rom_key:
+                entry = e
+                break
+    if not entry:
+        return Response(status_code=404, content=f"ROM not found: {rom_key}")
+    if not getattr(entry, 'is_bundle', False):
+        return Response(status_code=400,
+                        content="ROM is not a bundle; use /roms/<rom_id>")
+
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return Response(status_code=404, content="ROM directory not configured")
+
+    bundle_dir = _bundle_dir_for(entry, rom_dir)
+    if bundle_dir is None:
+        return Response(status_code=404,
+                        content="Bundle directory missing on disk")
+
+    # Path traversal guard: refuse anything that escapes the bundle dir
+    # after resolution (PSL1GHT / curl / our own clients all send normal
+    # POSIX paths so we don't need URL-decode magic here).
+    requested = (bundle_dir / rel_path).resolve()
+    try:
+        requested.relative_to(bundle_dir.resolve())
+    except ValueError:
+        return Response(status_code=400, content="Bad bundle file path")
+
+    if not requested.is_file():
+        return Response(status_code=404,
+                        content=f"Bundle file not found: {rel_path}")
+
+    file_size = requested.stat().st_size
+    content_type = _content_type(requested.name)
+
+    if range_header:
+        return _serve_range(requested, file_size, content_type, range_header)
+    return _serve_full(requested, file_size, content_type)
+
+
 # ── Download endpoint ────────────────────────────────────────────────────────
 
-@router.get("/roms/{title_id:path}")
+@router.api_route("/roms/{rom_key:path}", methods=["GET", "HEAD"])
 async def download_rom(
-    title_id: str,
+    rom_key: str,
     request: Request,
     extract: Optional[str] = Query(
         None,
         description=(
             "Extract format: 'cue' (CUE/BIN zip), 'gdi' (GDI zip), "
+            "'psio' (PS1 BIN/CU2 zip), "
             "'iso' (PSP ISO), 'cso' (PSP compressed ISO), "
-            "'cia' (3DS installable CIA), 'decrypted_cia' (3DS emulator CIA), "
-            "'decrypted_cci' (3DS emulator CCI)"
+            "'cia' (3DS decrypted CIA, also installable on CFW hardware), "
+            "'decrypted_cci' (3DS decrypted CCI for emulators), "
+            "'cci' (Xbox CCI ZIP), 'iso' (Xbox ISO)"
         ),
     ),
     range_header: Optional[str] = Header(None, alias="Range"),
@@ -181,13 +833,67 @@ async def download_rom(
     if not catalog:
         return Response(status_code=404, content="No ROM catalog available")
 
-    entry = catalog.get(title_id)
+    # The catalog is keyed by `rom_id` (always unique). For most ROMs
+    # rom_id == title_id, so plain title_id lookups still resolve. But
+    # multi-variant titles (e.g. Saturn ROM hacks sharing a Saturn product
+    # code, or multi-disc games whose disc index is stripped from the
+    # serial) collide on title_id and only the rom_id is unique. Older
+    # clients / deep links may still send the title_id; fall back to the
+    # first entry whose title_id matches so they keep working, while new
+    # clients should send rom_id directly.
+    entry = catalog.get(rom_key)
     if not entry:
-        return Response(status_code=404, content=f"ROM not found: {title_id}")
+        for e in catalog.list_all():
+            if e.title_id == rom_key:
+                entry = e
+                break
+    if not entry:
+        return Response(status_code=404, content=f"ROM not found: {rom_key}")
 
     rom_dir = settings.rom_dir
     if not rom_dir:
         return Response(status_code=404, content="ROM directory not configured")
+
+    sys_up = (entry.system or '').upper()
+
+    # Bundle entry → /<system>/<subfolder> on disk holds many files.  Serve
+    # the whole subfolder as a ZIP by default.  Xbox bundles additionally
+    # support ``?extract=iso`` by converting the source .cci inside the
+    # bundle, while ``?extract=cci`` remains the bundle ZIP.
+    if getattr(entry, 'is_bundle', False):
+        bundle_dir = _bundle_dir_for(entry, rom_dir)
+        if bundle_dir is None:
+            return Response(status_code=404,
+                            content="Bundle directory not found on disk")
+        if extract:
+            fmt = extract.lower()
+            if sys_up in _XBOX_SYSTEMS and fmt in _XBOX_EXTRACT_SPECS:
+                if fmt == 'cci':
+                    return await _serve_bundle_zip(entry, bundle_dir)
+                # Try CCI first (needs conversion to ISO or folder extraction).
+                cci_path = _xbox_bundle_cci_path(entry, bundle_dir)
+                if cci_path is not None:
+                    return await _extract_xbox(
+                        cci_path, sys_up, fmt, display_stem=entry.name
+                    )
+                # No CCI found — bundle contains raw files (default.xbe + .iso).
+                if fmt == 'iso':
+                    # Emulator clients (xemu) just need the disc image.
+                    iso_path = _xbox_bundle_iso_path(entry, bundle_dir)
+                    if iso_path is not None:
+                        return _stream_file_response(iso_path, 'application/octet-stream')
+                if fmt == 'folder':
+                    # Xbox hardware client wants extracted game files.
+                    # The bundle already IS an extracted folder (default.xbe
+                    # + .iso), so serve as ZIP directly — no conversion.
+                    return await _serve_bundle_zip(entry, bundle_dir)
+                return Response(
+                    status_code=404,
+                    content="Xbox bundle has no .cci or .iso disc image",
+                )
+            if sys_up in _PS1_EBOOT_SYSTEMS and fmt == 'psio':
+                return await _extract_ps1_psio(sys_up, entry)
+        return await _serve_bundle_zip(entry, bundle_dir)
 
     file_path = rom_dir / entry.path
     if not file_path.is_file():
@@ -195,11 +901,27 @@ async def download_rom(
 
     if extract:
         fmt = extract.lower()
-        sys_up = (entry.system or '').upper()
-        if fmt in _3DS_EXTRACT_SPECS:
+        if sys_up in _XBOX_SYSTEMS and fmt in _XBOX_EXTRACT_SPECS:
+            # Xbox CCI/ISO conversions go through the templated command
+            # runner or a no-op direct stream when the source already
+            # matches the requested target.
+            return await _extract_xbox(file_path, sys_up, fmt)
+        elif fmt in _3DS_EXTRACT_SPECS:
             return await _extract_3ds(file_path, sys_up, fmt)
+        elif fmt == 'eboot' and sys_up in _PS1_EBOOT_SYSTEMS:
+            # PS1 → PSP EBOOT.PBP via pop-fe; check before the generic
+            # CUE/BIN ``_extract_cd`` branch so PS1 doesn't silently
+            # fall through to the wrong handler.  ``entry`` is required
+            # so the handler can look up sibling discs (multi-disc
+            # games) by shared ``title_id``.
+            return await _extract_ps1_eboot(file_path, sys_up, entry)
+        elif fmt == 'psio' and sys_up in _PS1_EBOOT_SYSTEMS:
+            return await _extract_ps1_psio(sys_up, entry)
         elif fmt == 'rvz' or (fmt == 'iso' and file_path.suffix.lower() == '.rvz'):
             return await _extract_rvz(file_path, file_path.stem)
+        elif fmt == 'iso' and sys_up in _PS2_SYSTEMS:
+            # PS2 DVD path — chdman ``extractdvd`` produces a raw ISO.
+            return await _extract_ps2_iso(file_path, file_path.stem)
         elif fmt in ('iso', 'cso'):
             return await _extract_psp(file_path, sys_up, file_path.stem, fmt)
         else:
@@ -212,6 +934,52 @@ async def download_rom(
     if range_header:
         return _serve_range(file_path, file_size, content_type, range_header)
     return _serve_full(file_path, file_size, content_type)
+
+
+# ── Extract helpers — common cleanup + streaming ────────────────────────────
+#
+# All extract endpoints used to call `output.read_bytes()` and return the
+# whole result as `Response(content=bytes)`. For a 4GB Wii ISO that means
+# 4GB of Python heap allocation on a Raspberry Pi — guaranteed OOM.
+#
+# The new pattern:
+#   1. Create a tempdir *manually* (not a context manager) so it survives
+#      past the request handler.
+#   2. Run the conversion blocking in an executor as before.
+#   3. Return FileResponse(path=...) so Starlette streams from disk.
+#   4. Attach a BackgroundTask that wipes the tempdir after the response
+#      body has been fully sent.
+#
+# This keeps RAM bounded to ~1 MB per request regardless of output size,
+# and lets nginx pass bytes through as fast as the client can consume them.
+
+def _cleanup_dir(path: str) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _stream_file_response(
+    file_path: Path,
+    media_type: str,
+    cleanup_dir: str | None = None,
+    download_name: str | None = None,
+) -> FileResponse:
+    """Return a streaming FileResponse, with optional tempdir cleanup.
+
+    ``download_name`` overrides the filename advertised via Content-Disposition.
+    Cached conversion outputs live on disk as ``<stem>_<sha-prefix>.<ext>`` so
+    multiple variants can coexist, but that cache-key suffix should never leak
+    to clients — pass the human-readable filename here when serving a cached
+    artifact.
+    """
+    name = download_name or file_path.name
+    background = BackgroundTask(_cleanup_dir, cleanup_dir) if cleanup_dir else None
+    return FileResponse(
+        path=file_path,
+        media_type=media_type,
+        filename=name,
+        headers={'Content-Disposition': f'attachment; filename="{name}"'},
+        background=background,
+    )
 
 
 # ── GameCube / Wii RVZ → ISO ─────────────────────────────────────────────────
@@ -235,33 +1003,37 @@ async def _extract_rvz(rvz_path: Path, stem: str) -> Response:
             ),
         )
 
-    def _run() -> bytes:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            iso_path = Path(tmpdir) / (stem + '.iso')
-            r = subprocess.run(
-                [dolphin_tool, 'convert', '-f', 'iso', '-i', str(rvz_path), '-o', str(iso_path)],
-                capture_output=True, text=True, timeout=600,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'DolphinTool failed')
-            return iso_path.read_bytes()
+    # Cache fast-path
+    cached = _lookup_cached_output(rvz_path, 'rvz', '.iso')
+    if cached is not None:
+        return _stream_file_response(cached, 'application/x-iso9660-image')
+
+    tmpdir = tempfile.mkdtemp(prefix='rvz_extract_', dir=_conversion_tmp_dir())
+    iso_path = Path(tmpdir) / (stem + '.iso')
+
+    def _run() -> None:
+        r = subprocess.run(
+            [dolphin_tool, 'convert', '-f', 'iso', '-i', str(rvz_path), '-o', str(iso_path)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'DolphinTool failed')
 
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, _run)
+        await asyncio.get_event_loop().run_in_executor(None, _run)
     except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
         return Response(status_code=500, content=f"Conversion failed: {exc}")
     except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
         return Response(status_code=504, content="Conversion timed out (>10 min)")
 
-    filename = stem + '.iso'
-    return Response(
-        content=data,
-        media_type='application/x-iso9660-image',
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': str(len(data)),
-        },
-    )
+    if not iso_path.is_file():
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content="Conversion completed but produced no ISO")
+
+    cached_path = _save_to_cache(iso_path, rvz_path, 'rvz', '.iso')
+    return _stream_file_response(cached_path, 'application/x-iso9660-image', cleanup_dir=tmpdir)
 
 
 # ── Nintendo 3DS cart image → CIA / CCI variants ────────────────────────────
@@ -278,66 +1050,821 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
     if spec is None:
         return Response(status_code=400, content=f"Unsupported 3DS extract format: {fmt}")
 
+    # Cache fast-path: an identical conversion completed before for this
+    # exact source ROM (matched on path + mtime + size + format) — stream
+    # the cached output directly without re-running the slow converter.
+    # Zip wrappers (Foo.3ds.zip) leave a trailing cart suffix on
+    # ``source_path.stem``; strip it so the advertised filename matches what
+    # the user uploaded rather than the intermediate cart extension.
+    base_stem = source_path.stem
+    inner_suffix = Path(base_stem).suffix.lower()
+    if inner_suffix in _3DS_CART_EXTENSIONS:
+        base_stem = Path(base_stem).stem
+    download_name = f"{base_stem}{spec['output_ext']}"
+    cached = _lookup_cached_output(source_path, fmt, spec['output_ext'])
+    if cached is not None:
+        return _stream_file_response(
+            cached, 'application/x-3ds-rom', download_name=download_name
+        )
+
     command_template = getattr(settings, spec['setting'])
     if not command_template:
         return Response(
             status_code=503,
             content=(
-                f"3DS {spec['label']} conversion is not configured. "
-                f"Set {spec['env']} to a command template that writes the output {spec['output_ext']} file."
+                f"3DS {spec['label']} conversion is not configured on the server.\n"
+                f"\n"
+                f"To enable this conversion, set {spec['env']} to a command template that "
+                f"reads {{input}} (a .3ds / .cci cart image) and writes the output to {{output}} "
+                f"(a {spec['output_ext']} file).\n"
+                f"\n"
+                f"On Raspberry Pi / Linux, run the bundled installer from the repo root to set up "
+                f"the full 3DS conversion toolchain (CIA, decrypted CCI):\n"
+                f"    ./install-3ds-rom-tools-rpi.sh\n"
+                f"It prints the exact SYNC_ROM_3DS_* lines to paste into your server/.env file."
             ),
         )
 
-    def _run() -> tuple[str, bytes]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            input_path, stem = _materialize_3ds_source(source_path, tmp)
-            output_name = f"{stem}{spec['filename_suffix']}{spec['output_ext']}"
-            output_path = tmp / output_name
+    tmpdir = tempfile.mkdtemp(prefix='3ds_extract_', dir=_conversion_tmp_dir())
 
-            cmd = _expand_command_template(
-                command_template,
-                input=str(input_path),
-                output=str(output_path),
-                output_dir=str(tmp),
-                stem=stem,
+    def _run() -> Path:
+        tmp = Path(tmpdir)
+        input_path, stem = _materialize_3ds_source(source_path, tmp)
+        # Preserve the original ROM stem verbatim — only the extension changes.
+        output_name = f"{stem}{spec['output_ext']}"
+        output_path = tmp / output_name
+
+        cmd = _expand_command_template(
+            command_template,
+            input=str(input_path),
+            output=str(output_path),
+            output_dir=str(tmp),
+            stem=stem,
+        )
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or '3DS conversion failed')
+
+        final_path = output_path if output_path.is_file() else _find_single_output(tmp, spec['output_ext'])
+        if final_path is None or not final_path.is_file():
+            raise RuntimeError(
+                f"converter completed but did not produce a {spec['output_ext']} file"
             )
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=1800,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or '3DS conversion failed')
-
-            final_path = output_path if output_path.is_file() else _find_single_output(tmp, spec['output_ext'])
-            if final_path is None or not final_path.is_file():
-                raise RuntimeError(
-                    f"converter completed but did not produce a {spec['output_ext']} file"
-                )
-
-            return final_path.name, final_path.read_bytes()
+        return final_path
 
     try:
-        filename, data = await asyncio.get_event_loop().run_in_executor(None, _run)
+        final_path = await asyncio.get_event_loop().run_in_executor(None, _run)
     except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
         return Response(status_code=500, content=f"Conversion failed: {exc}")
     except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
         return Response(status_code=504, content="Conversion timed out (>30 min)")
     except zipfile.BadZipFile:
+        _cleanup_dir(tmpdir)
         return Response(status_code=400, content="Invalid ZIP archive")
     except ValueError as exc:
+        _cleanup_dir(tmpdir)
         return Response(status_code=400, content=str(exc))
 
-    return Response(
-        content=data,
-        media_type='application/x-3ds-rom',
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': str(len(data)),
-        },
+    # Promote the converted output into the persistent cache so the next
+    # request for this exact source+format gets the instant fast-path.
+    # On the same filesystem, ``shutil.move`` is just a rename — zero
+    # extra I/O cost on top of the conversion we already did.
+    cached_path = _save_to_cache(final_path, source_path, fmt, spec['output_ext'])
+    return _stream_file_response(
+        cached_path,
+        'application/x-3ds-rom',
+        cleanup_dir=tmpdir,
+        download_name=download_name,
     )
+
+
+# ── Xbox CCI / ISO conversion ────────────────────────────────────────────────
+
+async def _extract_xbox(
+    source_path: Path,
+    system: str,
+    fmt: str,
+    display_stem: str | None = None,
+) -> Response:
+    """Return an Xbox disc image in the requested CCI or ISO form.
+
+    ``fmt`` is one of:
+      * ``'iso'`` — direct stream for .iso input, or CCI → ISO conversion.
+      * ``'cci'`` — direct ZIP for .cci input, or ISO → CCI conversion
+                    followed by a ZIP wrapper.
+      * ``'folder'`` — CCI/ISO → extracted game folder ZIP.
+
+    Conversions shell out to configurable command templates.  XGDTool is the
+    intended backend, but the route only depends on the template producing the
+    requested output file somewhere under ``{output_dir}``.
+    """
+    if system not in _XBOX_SYSTEMS:
+        return Response(
+            status_code=400,
+            content=f"{fmt} extraction is only supported for Xbox / Xbox 360 ROMs (got {system})",
+        )
+
+    spec = _XBOX_EXTRACT_SPECS.get(fmt)
+    if spec is None:
+        return Response(status_code=400, content=f"Unsupported Xbox extract format: {fmt}")
+
+    if source_path.suffix.lower() not in _XBOX_DISC_EXTENSIONS:
+        return Response(
+            status_code=400,
+            content=(
+                f"Xbox extract expects a {sorted(_XBOX_DISC_EXTENSIONS)} input; "
+                f"got {source_path.suffix}"
+            ),
+        )
+
+    source_ext = source_path.suffix.lower()
+    stem = display_stem or source_path.stem
+
+    if fmt == 'iso' and source_ext == '.iso':
+        return _stream_file_response(source_path, spec['mime'])
+
+    if fmt == 'cci' and source_ext == '.cci':
+        return await _serve_single_file_zip(
+            source_path,
+            zip_stem=stem,
+            arcname=f"{stem}.cci",
+            cache_source=source_path,
+            cache_fmt='xbox_cci_direct',
+        )
+
+    if fmt == 'iso' and source_ext != '.cci':
+        return Response(status_code=400, content="Xbox ISO output expects a .cci or .iso source")
+    if fmt == 'cci' and source_ext != '.iso':
+        return Response(status_code=400, content="Xbox CCI output expects a .iso or .cci source")
+
+    download_name = f"{stem}{spec['output_ext']}"
+    cached = _lookup_cached_output(source_path, f'xbox_{fmt}', spec['output_ext'])
+    if cached is not None:
+        return _stream_file_response(cached, spec['mime'], download_name=download_name)
+
+    command_template = getattr(settings, spec['setting'])
+    if not command_template:
+        return Response(
+            status_code=503,
+            content=(
+                f"Xbox {spec['label']} conversion is not configured on the server.\n"
+                f"\n"
+                f"To enable this conversion, set {spec['env']} to a command template that "
+                f"reads {{input}}. For CCI/ISO outputs it should write the requested "
+                f"file under {{output_dir}}; for folder output it should extract files "
+                f"into {{output_dir}}. ``{{stem}}`` is the input filename without "
+                f"extension.\n"
+                f"\n"
+                f"XGDTool CLI supports --xiso, --cci, and --extract; point this "
+                f"template at your XGDTool executable with --offline."
+            ),
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix='xbox_extract_', dir=_conversion_tmp_dir())
+
+    def _run() -> Path:
+        tmp = Path(tmpdir)
+        tool_output_ext = spec['tool_output_ext']
+        output_dir = tmp
+        if fmt == 'folder':
+            output_dir = tmp / 'extract'
+            output_dir.mkdir()
+            output_path = tmp / f"{stem}.zip"
+        else:
+            output_name = f"{stem}{tool_output_ext}"
+            output_path = tmp / output_name
+
+        cmd = _expand_command_template(
+            command_template,
+            input=str(source_path),
+            output=str(output_path),
+            output_dir=str(output_dir),
+            stem=stem,
+        )
+        # Xbox 360 disc images can hit ~7 GB; leave generous room for
+        # compression/decompression on a slow Pi or USB drive.
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip() or result.stdout.strip() or 'Xbox conversion failed'
+            )
+
+        if fmt == 'folder':
+            zip_root = _zip_root_for_extracted_folder(output_dir)
+            if zip_root is None:
+                raise RuntimeError(
+                    f"converter completed but extracted no files; "
+                    f"{_describe_converter_outputs(output_dir)}{_format_converter_log(result)}"
+                )
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for out in sorted(p for p in zip_root.rglob('*') if p.is_file()):
+                    zf.write(out, arcname=out.relative_to(zip_root).as_posix())
+            return output_path
+
+        if fmt == 'cci':
+            if output_path.is_file():
+                cci_outputs = [output_path]
+            else:
+                cci_outputs = _find_outputs(tmp, {tool_output_ext})
+            if not cci_outputs:
+                raise RuntimeError(
+                    f"converter completed but did not produce a {tool_output_ext} file; "
+                    f"{_describe_converter_outputs(tmp)}{_format_converter_log(result)}"
+                )
+            zip_path = tmp / f"{stem}.zip"
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for out in cci_outputs:
+                    arcname = f"{stem}.cci" if len(cci_outputs) == 1 else out.name
+                    zf.write(out, arcname=arcname)
+            return zip_path
+
+        final_path = (
+            output_path
+            if output_path.is_file()
+            else _find_single_output_any(tmp, {tool_output_ext, '.xiso'})
+        )
+        if final_path is None or not final_path.is_file():
+            raise RuntimeError(
+                f"converter completed but did not produce a {tool_output_ext} file; "
+                f"{_describe_converter_outputs(tmp)}{_format_converter_log(result)}"
+            )
+        if final_path.suffix.lower() == '.xiso':
+            renamed = tmp / f"{stem}.iso"
+            try:
+                shutil.move(str(final_path), str(renamed))
+                final_path = renamed
+            except OSError:
+                pass
+        return final_path
+
+    try:
+        final_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>60 min)")
+
+    cached_path = _save_to_cache(final_path, source_path, f'xbox_{fmt}', spec['output_ext'])
+    return _stream_file_response(
+        cached_path, spec['mime'], cleanup_dir=tmpdir, download_name=download_name
+    )
+
+
+# ── PS1 → PSP EBOOT.PBP ──────────────────────────────────────────────────────
+
+_PS1_SERIAL_RE = re.compile(
+    r'(?:^|[^A-Za-z0-9])'
+    r'((?:SLUS|SCUS|SLES|SCES|SLPS|SLPM|SCPS|SCPM|SLPN|'
+    r'SCAJ|SLAJ|PAPX|PBPX|SLED|SCED)[-_ ]?\d{3}[._\- ]?\d{2})'
+    r'(?=$|[^0-9A-Za-z])',
+    re.IGNORECASE,
+)
+
+
+def _extract_ps1_serial_from_filename(name: str) -> str | None:
+    """Pull a Sony PS1 disc serial out of a filename like
+    ``Crash Bandicoot [SCUS-94900].chd`` → ``SCUS-94900``.
+
+    Mirrors the desktop client's ``extract_ps_serial`` regex but limited
+    to the PS1-only prefixes — the goal is to feed popstation_md a
+    ``main_gamecode`` argument it accepts.
+    """
+    stem = Path(name).stem
+    m = _PS1_SERIAL_RE.search(stem)
+    if not m:
+        return None
+    raw = m.group(1).upper().replace('_', '-').replace(' ', '-').replace('.', '-')
+    # Normalise to PREFIX-12345 (5 contiguous digits, dash separator).
+    parts = re.findall(r'[A-Z]+|\d+', raw)
+    letters = ''.join(p for p in parts if p.isalpha())
+    digits = ''.join(p for p in parts if p.isdigit())
+    if len(letters) >= 4 and len(digits) >= 5:
+        return f"{letters[:4]}-{digits[:5]}"
+    return None
+
+
+def _ps1_clean_title(name: str) -> str:
+    """Strip parentheticals + bracketed serials so the EBOOT title field
+    reads naturally on the PSP XMB.
+    """
+    stem = Path(name).stem
+    cleaned = re.sub(r'\s*[\[\(][^\]\)]*[\]\)]', '', stem)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned or stem
+
+
+# ``Foo (Disc 2) [ENG].chd`` → 2.  Falls back to 1 for files without a
+# disc tag (single-disc games or non-standard naming).
+_PS1_DISC_NUM_RE = re.compile(
+    r'\(\s*[Dd]is[ck]\s+(\d+)\s*(?:of\s+\d+)?\s*\)',
+)
+
+
+def _ps1_disc_number(filename: str) -> int:
+    m = _PS1_DISC_NUM_RE.search(filename)
+    return int(m.group(1)) if m else 1
+
+
+def _ps1_normalize_gamecode(value: str | None) -> str:
+    """Strip non-alphanumerics and uppercase.  pop-fe + popstation expect
+    the canonical PS1 product code form (``SCUS94503``, 9 chars, no dash);
+    the catalog's ``title_id`` is already in that form, but a fallback
+    via ``_extract_ps1_serial_from_filename`` returns the dashed form."""
+    if not value:
+        return ''
+    return re.sub(r'[^A-Za-z0-9]', '', value).upper()
+
+
+def _ps1_disc_siblings(entry) -> list:
+    """Return all PS1 catalog entries sharing ``entry.title_id`` (i.e. the
+    full multi-disc set), sorted by disc number derived from filename.
+
+    Multi-disc PS1 games end up as N RomEntry rows with the same
+    ``title_id`` (the disc serial — same for every disc) but distinct
+    ``rom_id`` (disambiguated by stem suffix).  pop-fe needs all discs
+    in disc-1-first order to produce a single multi-disc EBOOT.PBP that
+    the PSP firmware (POPS) can disc-swap between via the home menu.
+
+    Returns ``[entry]`` for single-disc games or when the catalog isn't
+    populated yet (e.g. a request mid-rescan).
+    """
+    if (entry.system or '').upper() not in _PS1_EBOOT_SYSTEMS:
+        return [entry]
+    title_id = entry.title_id
+    if not title_id:
+        return [entry]
+    catalog = rom_scanner.get()
+    if catalog is None:
+        return [entry]
+    siblings = [
+        e for e in catalog.list_all()
+        if (e.system or '').upper() in _PS1_EBOOT_SYSTEMS
+        and e.title_id == title_id
+    ]
+    if len(siblings) <= 1:
+        return [entry]
+    siblings.sort(key=lambda e: (_ps1_disc_number(e.filename), e.filename))
+    return siblings
+
+
+async def _extract_ps1_eboot(source_path: Path, system: str, entry) -> Response:
+    """Convert a PS1 disc image (or multi-disc set) to a PSP EBOOT.PBP.
+
+    Used by the PSP client's ROM Catalog so PS1 games convert into a PBP
+    installable under ``ms0:/PSP/GAME/<id>/`` and play on real PSP
+    hardware.  Output is the raw .pbp — no zip wrapper — so the client
+    can stream it straight to the target path without an extra extraction
+    step.
+
+    Multi-disc games (Final Fantasy VII, Ace Combat 3, etc.) are
+    detected via shared ``title_id`` across catalog entries.  The full
+    set of disc files is passed to the converter in disc-1-first order
+    in a single invocation, producing one multi-disc PBP that POPS can
+    swap discs in.  The cache key is over the entire disc set, so a
+    request for any disc hits the same cached PBP.
+
+    Until the operator wires up ``SYNC_ROM_PS1_EBOOT_COMMAND``, the
+    route returns 503 with a pop-fe install hint.
+    """
+    if system not in _PS1_EBOOT_SYSTEMS:
+        return Response(
+            status_code=400,
+            content=(
+                "EBOOT extraction is only supported for PS1 ROMs "
+                f"(got {system})"
+            ),
+        )
+
+    spec = _PS1_EBOOT_SPEC
+
+    # Resolve the full multi-disc set (or [entry] for single-disc).
+    siblings = _ps1_disc_siblings(entry)
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return Response(status_code=503, content="ROM directory not configured")
+    disc_paths = [rom_dir / s.path for s in siblings]
+    disc_paths = [p for p in disc_paths if p.is_file()]
+    if not disc_paths:
+        return Response(status_code=404, content="No disc files found on disk")
+
+    # Cache key spans every disc — disc 1 and disc 2 of the same game
+    # map to the same cached PBP.
+    cache_key = _conversion_cache_key_multi(disc_paths, 'eboot')
+    cached = _lookup_cached_by_key('ps1_eboot', cache_key, spec['output_ext'])
+    if cached is not None:
+        return _stream_file_response(cached, spec['mime'])
+
+    command_template = getattr(settings, spec['setting'])
+    if not command_template:
+        return Response(
+            status_code=503,
+            content=(
+                f"PS1 → {spec['label']} conversion is not configured on the server.\n"
+                f"\n"
+                f"Recommended setup with pop-fe (https://github.com/sahlberg/pop-fe):\n"
+                f"  1. git clone https://github.com/sahlberg/pop-fe.git /home/pi/pop-fe\n"
+                f"  2. cd /home/pi/pop-fe && git submodule update --init\n"
+                f"  3. (cd atracdenc/src && cmake . && make)\n"
+                f"  4. pip3 install --user --break-system-packages \\\n"
+                f"       pycdlib ecdsa PyPDF2 pycryptodome rarfile opencv-contrib-python\n"
+                f"  5. Add to server/.env:\n"
+                f"     SYNC_ROM_PS1_EBOOT_CWD=/home/pi/pop-fe\n"
+                f"     SYNC_ROM_PS1_EBOOT_COMMAND=[\"python3\",\"/home/pi/pop-fe/pop-fe.py\","
+                f"\"--psp-dir\",\"{{output_dir}}\",\"--title\",\"{{title}}\","
+                f"\"--game_id\",\"{{gamecode}}\",\"--no-libcrypt\",\"{{inputs}}\"]\n"
+                f"\n"
+                f"Available placeholders:\n"
+                f"  {{inputs}}      — list-valued; expands to N argv entries, one per disc\n"
+                f"                    (multi-disc games pass all discs in disc-1-first order)\n"
+                f"  {{input}}       — primary disc path only\n"
+                f"  {{title}}       — game name (catalog ``name``, falls back to filename)\n"
+                f"  {{gamecode}}    — PS1 product code (catalog ``title_id``, e.g. SCUS94503)\n"
+                f"  {{output_dir}}  — fresh scratch dir; converter must put EBOOT.PBP under it\n"
+                f"  {{stem}}        — primary disc filename without extension\n"
+                f"  {{compression}} — fixed at 9 (kept for popstation-flavoured templates)\n"
+            ),
+        )
+
+    cwd = settings.rom_ps1_eboot_cwd or None
+    tmpdir = tempfile.mkdtemp(prefix='ps1_eboot_', dir=_conversion_tmp_dir())
+
+    title = entry.name or _ps1_clean_title(disc_paths[0].name)
+    gamecode = (
+        _ps1_normalize_gamecode(entry.title_id)
+        or _ps1_normalize_gamecode(_extract_ps1_serial_from_filename(disc_paths[0].name))
+        or 'SLUS00000'  # last-resort placeholder; pop-fe still emits a PBP
+    )
+    primary = disc_paths[0]
+
+    def _run() -> Path:
+        tmp = Path(tmpdir)
+        stage = tmp / 'stage'
+        stage.mkdir()
+
+        cmd = _expand_command_template(
+            command_template,
+            inputs=[str(p) for p in disc_paths],
+            input=str(primary),
+            output=str(stage / 'EBOOT.PBP'),
+            output_dir=str(stage),
+            stem=primary.stem,
+            title=title,
+            gamecode=gamecode,
+            compression='9',
+        )
+        # pop-fe + ATRAC3 encoding + asset fetching can take 5-15 min
+        # per disc on a Pi — give multi-disc runs a full hour.  Run with
+        # ``cwd`` set to the configured pop-fe source tree so its
+        # relative-path lookups for binmerge / cue2cu2.py / atracdenc
+        # resolve correctly; falls back to the per-request scratch dir
+        # for self-contained converters that don't care.
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            cwd=cwd or str(tmp),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or 'PS1 → EBOOT conversion failed'
+            )
+
+        # pop-fe writes ``<psp-dir>/<gameid>/EBOOT.PBP`` (or
+        # ``<psp-dir>/PSP/GAME/<gameid>/EBOOT.PBP`` if that subtree
+        # already existed in the staging dir).  Other converters may
+        # emit it directly into ``output_dir``.  Recover by globbing,
+        # picking the largest match (filters out empty stub PBPs).
+        candidates = list(stage.rglob('EBOOT.PBP'))
+        if not candidates:
+            raise RuntimeError(
+                "converter completed but did not produce an EBOOT.PBP\n"
+                + (result.stdout[-2000:] if result.stdout else '')
+            )
+        candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+        return candidates[0]
+
+    try:
+        final_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>1 hour)")
+
+    cached_path = _save_to_cache_by_key(final_path, 'ps1_eboot', cache_key, spec['output_ext'])
+    return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
+
+
+# ── PS1 CHD / CUE → PSIO BIN/CU2 ZIP ────────────────────────────────────────
+
+_CUE_SECTOR_SIZE_BY_MODE = {
+    'AUDIO': 2352,
+    'CDG': 2448,
+    'MODE1/2048': 2048,
+    'MODE1/2352': 2352,
+    'MODE2/2336': 2336,
+    'MODE2/2352': 2352,
+    'CDI/2336': 2336,
+    'CDI/2352': 2352,
+}
+
+
+def _psio_cache_key(sources: list[Path]) -> str:
+    """Cache PSIO output by all source files in all selected discs."""
+    parts: list[str] = []
+    for source in sources:
+        if source.is_dir():
+            files = sorted(p for p in source.rglob('*') if p.is_file())
+        else:
+            files = [source]
+        for p in files:
+            st = p.stat()
+            parts.append(f"{p.absolute()}|{st.st_mtime_ns}|{st.st_size}")
+    payload = '\n'.join(parts) + '|psio'
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def _cue_time_to_frames(value: str) -> int:
+    parts = value.strip().split(':')
+    if len(parts) != 3:
+        raise ValueError(f"Invalid CUE timestamp: {value}")
+    minutes, seconds, frames = (int(p) for p in parts)
+    if seconds < 0 or seconds >= 60 or frames < 0 or frames >= 75:
+        raise ValueError(f"Invalid CUE timestamp: {value}")
+    return (minutes * 60 + seconds) * 75 + frames
+
+
+def _frames_to_cu2_time(frames: int) -> str:
+    frames = max(0, int(frames))
+    minutes, rem = divmod(frames, 60 * 75)
+    seconds, frame = divmod(rem, 75)
+    return f"{minutes:02d}:{seconds:02d}:{frame:02d}"
+
+
+def _cue_line_tokens(line: str) -> list[str]:
+    try:
+        return shlex.split(line, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Invalid CUE line: {line.strip()}") from exc
+
+
+def _resolve_cue_file_ref(cue_path: Path, ref: str) -> Path:
+    root = cue_path.parent.resolve()
+    resolved = (cue_path.parent / ref).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"CUE file reference escapes disc folder: {ref}") from exc
+    if not resolved.is_file():
+        raise ValueError(f"CUE references missing file: {ref}")
+    return resolved
+
+
+def _parse_cue_for_psio(cue_path: Path) -> tuple[list[dict], list[Path]]:
+    """Parse enough CUE metadata to emit PSIO CU2 lines.
+
+    PSIO's CU2 format expects offsets into a monolithic disc image.  chdman
+    ``extractcd`` produces that shape, and raw CUE/BIN folders often do too.
+    Multi-file CUEs are rejected so we do not emit subtly wrong offsets.
+    """
+    files: list[str] = []
+    tracks: list[dict] = []
+    current_file: str | None = None
+    current_track: dict | None = None
+
+    for raw in cue_path.read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        tokens = _cue_line_tokens(line)
+        if not tokens:
+            continue
+        command = tokens[0].upper()
+        if command == 'FILE':
+            if len(tokens) < 2:
+                raise ValueError(f"Invalid FILE line in {cue_path.name}")
+            current_file = tokens[1]
+            if current_file not in files:
+                files.append(current_file)
+        elif command == 'TRACK':
+            if len(tokens) < 3:
+                raise ValueError(f"Invalid TRACK line in {cue_path.name}")
+            try:
+                track_no = int(tokens[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid TRACK number in {cue_path.name}") from exc
+            current_track = {
+                'number': track_no,
+                'mode': tokens[2].upper(),
+                'file': current_file,
+                'indexes': [],
+            }
+            tracks.append(current_track)
+        elif command == 'INDEX':
+            if current_track is None or len(tokens) < 3:
+                raise ValueError(f"INDEX appears before TRACK in {cue_path.name}")
+            try:
+                index_no = int(tokens[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid INDEX number in {cue_path.name}") from exc
+            current_track['indexes'].append(
+                {'number': index_no, 'frame': _cue_time_to_frames(tokens[2])}
+            )
+
+    if not tracks:
+        raise ValueError(f"No tracks found in {cue_path.name}")
+    if not files:
+        raise ValueError(f"No FILE entry found in {cue_path.name}")
+    if len(files) != 1:
+        raise ValueError(
+            "PSIO CU2 conversion requires a monolithic CUE/BIN image; "
+            f"{cue_path.name} references {len(files)} files"
+        )
+
+    resolved = [_resolve_cue_file_ref(cue_path, files[0])]
+    return tracks, resolved
+
+
+def _cue_track_control_adr(mode: str) -> str:
+    return '01' if mode.upper() == 'AUDIO' else '41'
+
+
+def _cu2_adjusted_frame(track_no: int, frame: int, revision: int = 2) -> int:
+    # Cue2cu2's default revision is v2, where PSIO expects track 1 times
+    # shifted back by the standard 2-second lead-in.
+    if track_no == 1 and revision == 2:
+        return max(0, frame - 150)
+    return max(0, frame)
+
+
+def _cue_to_cu2_text(cue_path: Path) -> tuple[str, list[Path]]:
+    tracks, refs = _parse_cue_for_psio(cue_path)
+    sector_size = _CUE_SECTOR_SIZE_BY_MODE.get(str(tracks[0]['mode']).upper(), 2352)
+    total_frames = refs[0].stat().st_size // sector_size
+
+    events: list[dict] = []
+    for track in tracks:
+        for index in track['indexes']:
+            events.append(
+                {
+                    'track': track,
+                    'index': index['number'],
+                    'frame': index['frame'],
+                }
+            )
+    if not events:
+        raise ValueError(f"No INDEX entries found in {cue_path.name}")
+    events.sort(key=lambda e: (e['frame'], e['track']['number'], e['index']))
+
+    pregaps = {
+        track['number']: next(
+            (idx['frame'] for idx in track['indexes'] if idx['number'] == 0),
+            0,
+        )
+        for track in tracks
+    }
+
+    lines: list[str] = []
+    for i, event in enumerate(events):
+        track = event['track']
+        track_no = int(track['number'])
+        index_no = int(event['index'])
+        frame = int(event['frame'])
+        next_frame = (
+            int(events[i + 1]['frame']) if i + 1 < len(events) else total_frames
+        )
+        length = max(0, next_frame - frame)
+        offset = _cu2_adjusted_frame(track_no, frame)
+        pregap = _cu2_adjusted_frame(track_no, pregaps.get(track_no, 0))
+        lines.append(
+            f"{track_no:02d}_{index_no:02d} "
+            f"{_cue_track_control_adr(str(track['mode']))} "
+            f"{_frames_to_cu2_time(offset)} "
+            f"{_frames_to_cu2_time(pregap)} "
+            f"{_frames_to_cu2_time(length)}"
+        )
+    return '\n'.join(lines) + '\n', refs
+
+
+def _psio_find_cue(source_dir: Path) -> Path:
+    cues = sorted(p for p in source_dir.rglob('*') if p.is_file() and p.suffix.lower() == '.cue')
+    if not cues:
+        raise ValueError(f"No CUE file found in bundle: {source_dir.name}")
+    if len(cues) > 1:
+        raise ValueError(
+            f"PSIO bundle conversion expects one CUE per disc; {source_dir.name} has {len(cues)}"
+        )
+    return cues[0]
+
+
+def _psio_archive_prefix(entry, index: int, total: int) -> str:
+    if total <= 1:
+        return ''
+    name = _safe_archive_stem(getattr(entry, 'name', '') or getattr(entry, 'filename', '') or f"Disc {index}")
+    return f"Disc {index:02d} - {name}"
+
+
+async def _extract_ps1_psio(system: str, entry) -> Response:
+    """Convert PS1 source discs into PSIO-ready BIN/CU2 ZIP output.
+
+    Loose multi-disc catalog rows are grouped by shared PS1 serial/title_id,
+    matching the EBOOT path.  PS1 bundle rows are supported too: each bundle
+    directory must contain exactly one CUE for the disc.
+    """
+    if system not in _PS1_EBOOT_SYSTEMS:
+        return Response(status_code=400, content=f"PSIO extraction is only for PS1 (got {system})")
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return Response(status_code=503, content="ROM directory not configured")
+
+    siblings = _ps1_disc_siblings(entry)
+    source_pairs = [(s, rom_dir / s.path) for s in siblings]
+    source_pairs = [(s, p) for s, p in source_pairs if p.exists()]
+    if not source_pairs:
+        return Response(status_code=404, content="No disc files found on disk")
+    sources = [p for _s, p in source_pairs]
+
+    if any(p.is_file() and p.suffix.lower() == '.chd' for p in sources) and not shutil.which('chdman'):
+        return Response(status_code=503, content="chdman not installed. Run: sudo apt install mame-tools")
+
+    cache_key = _psio_cache_key(sources)
+    cached = _lookup_cached_by_key('ps1_psio', cache_key, '.zip')
+    if cached is not None:
+        return _stream_file_response(cached, 'application/zip')
+
+    tmpdir = tempfile.mkdtemp(prefix='psio_extract_', dir=_conversion_tmp_dir())
+    tmp = Path(tmpdir)
+    zip_path = tmp / f"{_safe_archive_stem(entry.name or entry.filename or 'psio')}.zip"
+
+    def _run() -> Path:
+        extract_root = tmp / 'extract'
+        extract_root.mkdir()
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for index, (sibling, source) in enumerate(source_pairs, start=1):
+                if source.is_dir():
+                    cue_path = _psio_find_cue(source)
+                elif source.suffix.lower() == '.chd':
+                    disc_dir = extract_root / f"disc_{index:02d}"
+                    disc_dir.mkdir()
+                    cue_path = disc_dir / f"{source.stem}.cue"
+                    result = subprocess.run(
+                        ['chdman', 'extractcd', '-i', str(source), '-o', str(cue_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            result.stderr.strip() or result.stdout.strip() or 'chdman failed'
+                        )
+                elif source.suffix.lower() == '.cue':
+                    cue_path = source
+                else:
+                    raise ValueError(
+                        "PSIO extraction requires CHD or monolithic CUE/BIN sources "
+                        f"(got {source.name})"
+                    )
+
+                cu2_text, referenced_files = _cue_to_cu2_text(cue_path)
+                prefix = _psio_archive_prefix(sibling, index, len(source_pairs))
+                arc_prefix = f"{prefix}/" if prefix else ''
+                zf.writestr(f"{arc_prefix}{cue_path.stem}.cu2", cu2_text)
+                for ref in referenced_files:
+                    zf.write(ref, f"{arc_prefix}{ref.name}")
+        return zip_path
+
+    try:
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except ValueError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=400, content=str(exc))
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>10 min)")
+
+    cached_path = _save_to_cache_by_key(out_path, 'ps1_psio', cache_key, '.zip')
+    return _stream_file_response(cached_path, 'application/zip', cleanup_dir=tmpdir)
 
 
 # ── PSP CHD → ISO / CSO ──────────────────────────────────────────────────────
@@ -363,54 +1890,136 @@ async def _extract_psp(chd_path: Path, system: str, stem: str, fmt: str) -> Resp
                 content="No CSO tool found. Install one: sudo apt install ciso  OR  compile maxcso",
             )
 
-    def _run() -> bytes:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            iso_path = tmp / (stem + '.iso')
+    # Cache fast-path
+    output_ext = '.iso' if fmt == 'iso' else '.cso'
+    download_name = f"{chd_path.stem}{output_ext}"
+    cached = _lookup_cached_output(chd_path, fmt, output_ext)
+    if cached is not None:
+        mime = 'application/x-iso9660-image' if fmt == 'iso' else 'application/x-cso'
+        return _stream_file_response(cached, mime, download_name=download_name)
 
-            # PSP CHDs are hard-disk images (createhd), not CD-ROM images (createcd).
-            # Use extracthd which outputs a raw ISO directly.
-            r = subprocess.run(
-                ['chdman', 'extracthd', '-i', str(chd_path), '-o', str(iso_path)],
-                capture_output=True, text=True, timeout=600,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'chdman failed')
+    tmpdir = tempfile.mkdtemp(prefix='psp_extract_', dir=_conversion_tmp_dir())
+    tmp = Path(tmpdir)
+    iso_path = tmp / (stem + '.iso')
+    cso_path = tmp / (stem + '.cso')
 
-            if fmt == 'iso':
-                return iso_path.read_bytes()
+    def _run() -> Path:
+        # PSP CHDs are hard-disk images (createhd), not CD-ROM images (createcd).
+        # Use extracthd which outputs a raw ISO directly.
+        r = subprocess.run(
+            ['chdman', 'extracthd', '-i', str(chd_path), '-o', str(iso_path)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'chdman failed')
 
-            # Step 2 — ISO → CSO
-            cso_path = tmp / (stem + '.cso')
-            if 'maxcso' in (cso_tool or ''):
-                cmd = [cso_tool, str(iso_path), '--output', str(cso_path)]
-            else:
-                # ciso: ciso <level 1-9> <input> <output>
-                cmd = [cso_tool, '9', str(iso_path), str(cso_path)]
+        if fmt == 'iso':
+            return iso_path
 
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'CSO conversion failed')
+        # Step 2 — ISO → CSO
+        if 'maxcso' in (cso_tool or ''):
+            cmd = [cso_tool, str(iso_path), '--output', str(cso_path)]
+        else:
+            # ciso: ciso <level 1-9> <input> <output>
+            cmd = [cso_tool, '9', str(iso_path), str(cso_path)]
 
-            return cso_path.read_bytes()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'CSO conversion failed')
+
+        # ISO is no longer needed; remove early so the tempdir doesn't double in size.
+        try:
+            iso_path.unlink()
+        except OSError:
+            pass
+        return cso_path
 
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, _run)
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _run)
     except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
         return Response(status_code=500, content=f"Conversion failed: {exc}")
     except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
         return Response(status_code=504, content="Conversion timed out (>10 min)")
 
-    ext       = '.' + fmt   # .iso or .cso
-    mime      = 'application/x-iso9660-image' if fmt == 'iso' else 'application/x-cso'
-    filename  = stem + ext
-    return Response(
-        content=data,
-        media_type=mime,
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': str(len(data)),
-        },
+    mime = 'application/x-iso9660-image' if fmt == 'iso' else 'application/x-cso'
+    cached_path = _save_to_cache(out_path, chd_path, fmt, output_ext)
+    return _stream_file_response(
+        cached_path, mime, cleanup_dir=tmpdir, download_name=download_name
+    )
+
+
+# ── PS2 CHD → ISO (DVD images) ──────────────────────────────────────────────
+
+async def _extract_ps2_iso(chd_path: Path, stem: str) -> Response:
+    """Extract a PS2 DVD CHD to a single .iso via ``chdman extractdvd``.
+
+    PS2 ships both DVDs and CDs.  CD images flow through ``_extract_cd``
+    (CUE/BIN zip); only DVD images take this code path, and the caller is
+    responsible for figuring out which it is via the DAT lookup in
+    :func:`_extract_formats_for_entry`.
+
+    Output is a raw ISO image — no further compression — because PS2
+    emulators (PCSX2, AetherSX2) read .iso natively and the CHD already
+    sat in a compressed form on the server, so re-compressing at this
+    stage would just slow things down.
+    """
+    if chd_path.suffix.lower() != '.chd':
+        return Response(status_code=400, content="Only CHD files can be extracted")
+
+    if not shutil.which('chdman'):
+        return Response(
+            status_code=503,
+            content="chdman not installed. Run: sudo apt install mame-tools",
+        )
+
+    # Cache fast-path — same convention as PSP / CD extracts.
+    cached = _lookup_cached_output(chd_path, 'iso', '.iso')
+    if cached is not None:
+        return _stream_file_response(cached, 'application/x-iso9660-image')
+
+    tmpdir = tempfile.mkdtemp(prefix='ps2_extract_', dir=_conversion_tmp_dir())
+    tmp = Path(tmpdir)
+    iso_path = tmp / (stem + '.iso')
+
+    def _run() -> Path:
+        # PS2 DVDs were created with ``chdman createdvd``; ``extractdvd``
+        # is the matching reverse operation.  Some older chdman builds
+        # (pre-0.227) only ship ``extractraw`` — fall back to that on a
+        # "subcommand unknown" failure so older Pi images still work.
+        r = subprocess.run(
+            ['chdman', 'extractdvd', '-i', str(chd_path), '-o', str(iso_path)],
+            capture_output=True, text=True, timeout=900,
+        )
+        if r.returncode != 0:
+            stderr = (r.stderr or '').strip()
+            if 'unknown command' in stderr.lower() or 'usage:' in stderr.lower():
+                # Older chdman — try extractraw as a fallback.
+                r2 = subprocess.run(
+                    ['chdman', 'extractraw', '-i', str(chd_path), '-o', str(iso_path)],
+                    capture_output=True, text=True, timeout=900,
+                )
+                if r2.returncode != 0:
+                    raise RuntimeError(
+                        (r2.stderr or r2.stdout or 'chdman extractraw failed').strip()
+                    )
+            else:
+                raise RuntimeError(stderr or (r.stdout or '').strip() or 'chdman failed')
+        return iso_path
+
+    try:
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>15 min)")
+
+    cached_path = _save_to_cache(out_path, chd_path, 'iso', '.iso')
+    return _stream_file_response(
+        cached_path, 'application/x-iso9660-image', cleanup_dir=tmpdir
     )
 
 
@@ -433,51 +2042,81 @@ async def _extract_cd(chd_path: Path, system: str) -> Response:
     out_ext = '.gdi' if sys_up in _GDI_SYSTEMS else '.cue'
     stem    = chd_path.stem
 
-    def _run_extraction() -> bytes:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_file = Path(tmpdir) / (stem + out_ext)
-            r = subprocess.run(
-                ['chdman', 'extractcd', '-i', str(chd_path), '-o', str(out_file)],
-                capture_output=True, text=True, timeout=600,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'unknown error')
+    # Cache fast-path: the CD extraction is deterministic (chdman is
+    # bit-exact for a given CHD), so caching the final ZIP is safe.
+    # Format key is a fixed literal because there's only one CHD-CD output
+    # variant per system; we use ``out_ext`` to pick a stable cache key.
+    cd_fmt = f'cd_{out_ext.lstrip(".")}'  # e.g. "cd_cue" / "cd_gdi"
+    cached = _lookup_cached_output(chd_path, cd_fmt, '.zip')
+    if cached is not None:
+        return _stream_file_response(cached, 'application/zip')
 
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for f in sorted(Path(tmpdir).iterdir()):
-                    zf.write(f, f.name)
-            return buf.getvalue()
+    # Two-phase tempdir layout:
+    #   <tmpdir>/extract/   — chdman writes its raw output here
+    #   <tmpdir>/<stem>.zip — final archive we stream to the client
+    # We zip with ZIP_STORED (no compression) because BIN/RAW track data is
+    # already incompressible and the client can extract instantly. This also
+    # lets us avoid CPU spike on the Pi during the zip step.
+    tmpdir = tempfile.mkdtemp(prefix='cd_extract_', dir=_conversion_tmp_dir())
+    extract_dir = Path(tmpdir) / 'extract'
+    extract_dir.mkdir()
+    zip_path = Path(tmpdir) / f'{stem}.zip'
+
+    def _run_extraction() -> Path:
+        out_file = extract_dir / (stem + out_ext)
+        r = subprocess.run(
+            ['chdman', 'extractcd', '-i', str(chd_path), '-o', str(out_file)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or 'unknown error')
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
+            for f in sorted(extract_dir.iterdir()):
+                zf.write(f, f.name)
+
+        # Free the raw extracted files now that they're inside the zip — keeps
+        # disk usage from doubling on the Pi.
+        for f in extract_dir.iterdir():
+            try: f.unlink()
+            except OSError: pass
+        try: extract_dir.rmdir()
+        except OSError: pass
+
+        return zip_path
 
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, _run_extraction)
+        out_path = await asyncio.get_event_loop().run_in_executor(None, _run_extraction)
     except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
         return Response(status_code=500, content=f"Extraction failed: {exc}")
     except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
         return Response(status_code=504, content="Extraction timed out (>10 min)")
 
-    fmt      = 'gdi' if sys_up in _GDI_SYSTEMS else 'cue'
-    filename = f"{stem}_{fmt}.zip"
-    return Response(
-        content=data,
-        media_type='application/zip',
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': str(len(data)),
-        },
-    )
+    cached_path = _save_to_cache(out_path, chd_path, cd_fmt, '.zip')
+    return _stream_file_response(cached_path, 'application/zip', cleanup_dir=tmpdir)
 
 
 # ── Regular file serving ─────────────────────────────────────────────────────
+#
+# Both helpers below stream from disk in chunks instead of loading the whole
+# file into RAM. The previous implementation called `file_path.read_bytes()`
+# which on a Pi with 2-4 GB RAM made multi-GB ROM downloads OOM-kill the
+# process — and even when it didn't, the long blocking read held the event
+# loop and tripped nginx's `proxy_read_timeout`, severing the connection.
 
 def _serve_full(file_path: Path, file_size: int, content_type: str) -> Response:
-    return Response(
-        content=file_path.read_bytes(),
+    # FileResponse uses the platform's zero-copy sendfile() under the hood
+    # when possible, otherwise falls back to chunked async reads. Either way
+    # the request handler never holds the whole file in memory.
+    return FileResponse(
+        path=file_path,
         media_type=content_type,
+        filename=file_path.name,
         headers={
-            'Content-Length': str(file_size),
             'Accept-Ranges': 'bytes',
-            'Content-Disposition': f'attachment; filename="{file_path.name}"',
+            'Content-Length': str(file_size),
         },
     )
 
@@ -490,13 +2129,23 @@ def _serve_range(
         return Response(status_code=416, headers={'Content-Range': f'bytes */{file_size}'})
 
     length = end - start + 1
-    with open(file_path, 'rb') as f:
-        f.seek(start)
-        data = f.read(length)
 
-    return Response(
+    def _iter() -> bytes:
+        # Open inside the generator so the file handle's lifetime is tied to
+        # the response stream, not the request handler.
+        with open(file_path, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                buf = f.read(min(_STREAM_CHUNK, remaining))
+                if not buf:
+                    break
+                remaining -= len(buf)
+                yield buf
+
+    return StreamingResponse(
+        _iter(),
         status_code=206,
-        content=data,
         media_type=content_type,
         headers={
             'Content-Range': f'bytes {start}-{end}/{file_size}',
@@ -527,23 +2176,73 @@ def _parse_range(range_header: str, file_size: int) -> tuple[int | None, int | N
         return None, None
 
 
-def _extract_formats_for_entry(system: str, filename: str) -> tuple[str | None, list[str]]:
+def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
+    system = getattr(entry, 'system', '') or ''
+    filename = getattr(entry, 'filename', '') or ''
     sys_up = system.upper()
     suffix = Path(filename).suffix.lower()
+
+    if sys_up in _XBOX_SYSTEMS and getattr(entry, 'is_bundle', False):
+        return 'xbox', list(_XBOX_EXTRACT_FORMATS)
+    if sys_up in _PS1_EBOOT_SYSTEMS and getattr(entry, 'is_bundle', False):
+        names = [
+            str(f.get('name', ''))
+            for f in (getattr(entry, 'bundle_files', None) or [])
+            if isinstance(f, dict)
+        ]
+        if any(Path(name).suffix.lower() in {'.cue', '.chd'} for name in names):
+            return None, ['psio']
 
     if suffix == '.chd':
         if sys_up in _PSP_SYSTEMS:
             return 'psp', ['iso', 'cso']
+        if sys_up in _PS2_SYSTEMS:
+            # PS2 is split media: DVD CHDs extract to a single ISO,
+            # CD CHDs extract to a CUE/BIN zip.  Ask the DAT what the
+            # original disc was.  When the DAT can't answer (game not
+            # in any loaded DAT, or DAT only listed cart entries) we
+            # fall back to no extract option — the user still gets the
+            # raw CHD download.
+            normalizer = _dat_normalizer_get()
+            disc_ext = (
+                normalizer.lookup_disc_format('PS2', filename) if normalizer else None
+            )
+            if disc_ext == 'iso':
+                return 'iso', ['iso']
+            if disc_ext in ('bin', 'cue'):
+                return 'cue', ['cue']
+            return None, []
         if sys_up in _GDI_SYSTEMS:
             return 'gdi', ['gdi']
+        if sys_up in _PS1_EBOOT_SYSTEMS:
+            # PS1 CHD: PS3 client wants CUE/BIN, PSP client wants
+            # EBOOT.PBP, and PSIO wants BIN/CU2. Advertise all so each client picks its
+            # native format from extract_formats[].
+            return 'cue', ['cue', 'eboot', 'psio']
         if sys_up in _CUE_SYSTEMS:
             return 'cue', ['cue']
+    elif sys_up in _PS1_EBOOT_SYSTEMS and suffix in {'.cue', '.bin', '.iso', '.img'}:
+        # PS1 native disc images (no CHD) — no extract needed for the
+        # PS3 client (raw CUE/BIN is fine), but the PSP client needs
+        # an EBOOT, so advertise that as the only option.
+        formats = ['eboot']
+        if suffix == '.cue':
+            formats.append('psio')
+        return None, formats
     elif suffix == '.rvz' and sys_up in _GC_SYSTEMS:
         return 'rvz', ['iso']
     elif sys_up in _3DS_SYSTEMS and suffix in _3DS_CART_EXTENSIONS.union({'.zip'}):
         return '3ds', list(_3DS_EXTRACT_FORMATS)
+    elif sys_up in _XBOX_SYSTEMS and suffix in _XBOX_DISC_EXTENSIONS:
+        return 'xbox', list(_XBOX_EXTRACT_FORMATS)
 
     return None, []
+
+
+def _dat_normalizer_get():
+    """Lazy DatNormalizer accessor — avoids a hard import cycle at module load."""
+    from app.services import dat_normalizer
+    return dat_normalizer.get()
 
 
 def _materialize_3ds_source(source_path: Path, tmp_dir: Path) -> tuple[Path, str]:
@@ -570,11 +2269,17 @@ def _materialize_3ds_source(source_path: Path, tmp_dir: Path) -> tuple[Path, str
         member_name = Path(member.filename).name
         extracted = tmp_dir / member_name
         with zf.open(member) as src, open(extracted, 'wb') as dst:
-            shutil.copyfileobj(src, dst)
+            # Default copyfileobj buffer is 8 KiB.  For multi-GB ROMs that
+            # means hundreds of thousands of read/write syscalls; bumping to
+            # 8 MiB shaves syscall overhead and lets the kernel pipeline I/O
+            # alongside zlib decompression more efficiently.  Decompression
+            # itself stays single-threaded (Python's zipfile module limit),
+            # but every megabyte of avoided syscall churn helps.
+            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
         return extracted, extracted.stem
 
 
-def _expand_command_template(template: str, **values: str) -> list[str]:
+def _expand_command_template(template: str, **values) -> list[str]:
     payload = template.strip()
     if not payload:
         raise RuntimeError("empty command template")
@@ -587,22 +2292,97 @@ def _expand_command_template(template: str, **values: str) -> list[str]:
     else:
         parts = shlex.split(payload, posix=os.name != 'nt')
 
+    # A list-valued placeholder (e.g. ``{inputs}`` for multi-disc PS1)
+    # expands to N argv entries when it appears as a token by itself.
+    # Embedding it inside a larger token like ``--files={inputs}`` is a
+    # template authoring mistake — flag it loudly rather than silently
+    # str(list)-ing.
+    list_values = {k: list(v) for k, v in values.items() if isinstance(v, (list, tuple))}
+    scalar_values = {k: v for k, v in values.items() if not isinstance(v, (list, tuple))}
+
     expanded: list[str] = []
     for part in parts:
+        list_token_match = next(
+            (k for k in list_values if part == f'{{{k}}}'),
+            None,
+        )
+        if list_token_match is not None:
+            expanded.extend(list_values[list_token_match])
+            continue
+        for key in list_values:
+            if f'{{{key}}}' in part:
+                raise RuntimeError(
+                    f"placeholder {{{key}}} is list-valued and must appear "
+                    f"as a standalone token, not embedded in {part!r}"
+                )
         updated = part
-        for key, value in values.items():
+        for key, value in scalar_values.items():
             updated = updated.replace(f'{{{key}}}', value)
         expanded.append(updated)
     return expanded
 
 
-def _find_single_output(tmp_dir: Path, extension: str) -> Path | None:
+def _find_outputs(tmp_dir: Path, extensions: set[str] | frozenset[str]) -> list[Path]:
+    exts = {ext.lower() for ext in extensions}
     outputs = sorted(
-        p for p in tmp_dir.rglob(f'*{extension}') if p.is_file() and p.suffix.lower() == extension
+        p for p in tmp_dir.rglob('*') if p.is_file() and p.suffix.lower() in exts
     )
+    return outputs
+
+
+def _find_single_output_any(tmp_dir: Path, extensions: set[str] | frozenset[str]) -> Path | None:
+    outputs = _find_outputs(tmp_dir, extensions)
     if len(outputs) == 1:
         return outputs[0]
     return None
+
+
+def _find_single_output(tmp_dir: Path, extension: str) -> Path | None:
+    return _find_single_output_any(tmp_dir, {extension})
+
+
+def _describe_converter_outputs(tmp_dir: Path, limit: int = 20) -> str:
+    files = sorted(p for p in tmp_dir.rglob('*') if p.is_file())
+    if not files:
+        return "output directory is empty"
+
+    pieces = []
+    for path in files[:limit]:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        pieces.append(f"{path.relative_to(tmp_dir).as_posix()} ({size} bytes)")
+    if len(files) > limit:
+        pieces.append(f"... {len(files) - limit} more")
+    return "output files: " + ", ".join(pieces)
+
+
+def _format_converter_log(result: subprocess.CompletedProcess, max_chars: int = 2000) -> str:
+    text = "\n".join(
+        part.strip()
+        for part in (result.stdout or "", result.stderr or "")
+        if part and part.strip()
+    )
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = "..." + text[-max_chars:]
+    return f"; converter log: {text}"
+
+
+def _zip_root_for_extracted_folder(output_dir: Path) -> Path | None:
+    files = [p for p in output_dir.rglob('*') if p.is_file()]
+    if not files:
+        return None
+
+    root_files = [p for p in output_dir.iterdir() if p.is_file()]
+    root_dirs = [p for p in output_dir.iterdir() if p.is_dir()]
+    if not root_files and len(root_dirs) == 1:
+        only = root_dirs[0]
+        if any(p.is_file() for p in only.rglob('*')):
+            return only
+    return output_dir
 
 
 _CONTENT_TYPES = {
@@ -620,6 +2400,7 @@ _CONTENT_TYPES = {
     '.n64': 'application/x-n64-rom',
     '.z64': 'application/x-n64-rom',
     '.iso': 'application/x-iso9660-image',
+    '.pkg': 'application/octet-stream',  # PS3 / PSP PSN package — no standard MIME
     '.chd': 'application/x-chd',
     '.cso': 'application/x-cso',
     '.rvz': 'application/x-rvz',

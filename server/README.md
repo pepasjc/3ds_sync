@@ -9,8 +9,8 @@ FastAPI server that stores save files, manages history, coordinates sync across 
 - `chdman` (for CHD extraction) — `sudo apt install mame-tools`
 - `ciso` (for PSP CSO conversion) — `sudo apt install ciso`
 - Optional: a 3DS conversion toolchain wired through command templates if you
-  want `.3ds/.cci` cart image downloads converted to `.cia`, decrypted `.cia`,
-  or decrypted `.cci` from the ROM library
+  want `.3ds/.cci` cart image downloads converted to installable `.cia` or
+  decrypted `.cci` from the ROM library
 
 ## Quick Start
 
@@ -36,8 +36,7 @@ All settings are via environment variables with the `SYNC_` prefix, or in a `ser
 | `SYNC_SAVE_DIR` | `./saves` | Directory where save files and history are stored |
 | `SYNC_ROM_DIR` | *(unset)* | ROM root directory for the web library (see [ROM Library](#rom-library)) |
 | `SYNC_ROM_SCAN_INTERVAL` | `300` | Background ROM rescan interval in seconds (`0` disables it) |
-| `SYNC_ROM_3DS_CIA_COMMAND` | `""` | Optional command template that converts a `.3ds` / `.cci` cart image into an installable `.cia` |
-| `SYNC_ROM_3DS_DECRYPTED_CIA_COMMAND` | `""` | Optional command template that converts a `.3ds` / `.cci` cart image into a decrypted `.cia` for emulators |
+| `SYNC_ROM_3DS_CIA_COMMAND` | `""` | Optional command template that converts a `.3ds` / `.cci` cart image into a decrypted `.cia` (installable on CFW 3DS **and** usable in emulators) |
 | `SYNC_ROM_3DS_DECRYPTED_CCI_COMMAND` | `""` | Optional command template that converts a `.3ds` / `.cci` cart image into a decrypted `.cci` for emulators |
 | `SYNC_HOST` | `0.0.0.0` | Bind address |
 | `SYNC_PORT` | `8000` | Port |
@@ -52,7 +51,6 @@ SYNC_API_KEY=your-secret-key
 SYNC_SAVE_DIR=/home/pi/Documents/3ds_sync/server/saves
 SYNC_ROM_DIR=/mnt/roms
 SYNC_ROM_3DS_CIA_COMMAND=["/usr/local/bin/your-3ds-tool","{input}","{output}"]
-SYNC_ROM_3DS_DECRYPTED_CIA_COMMAND=["/usr/local/bin/your-3ds-tool","--decrypted","{input}","{output}"]
 SYNC_ROM_3DS_DECRYPTED_CCI_COMMAND=["/usr/local/bin/your-3ds-tool","--decrypted-cci","{input}","{output}"]
 SYNC_SITE_TITLE=My Game Library
 SYNC_ADMIN_USERS=pepas
@@ -67,14 +65,32 @@ endpoint will unpack the single `.3ds` / `.cci` file from the ZIP before
 running your configured command.
 
 On Raspberry Pi / Linux, the repository root script
-`install-3ds-rom-tools-rpi.sh` installs an optional server-side CIA conversion
-toolchain without touching `install-3ds-tools-rpi.sh`. It stages private assets
-outside the repo at:
+`install-3ds-rom-tools-rpi.sh` installs the full server-side 3DS conversion
+toolchain (both formats) without touching `install-3ds-tools-rpi.sh`. It
+stages private assets outside the repo at:
 
 ```text
 /opt/3dssync/3ds-rom-tools/assets/boot9.bin
 /opt/3dssync/3ds-rom-tools/assets/seeddb.bin
 ```
+
+The script installs two wrappers under `/usr/local/bin/`:
+
+| Wrapper | Underlying tool | Produces |
+|---|---|---|
+| `3dssync-3ds-to-cia` | `3dsconv` (Python) | Decrypted CIA (installable on CFW hardware **and** bootable in emulators like Citra / Lime3DS) |
+| `3dssync-3ds-to-decrypted-cci` | `ninfs` (`mount_cci`, FUSE) | Decrypted `.cci` for emulators |
+
+After the script completes, paste the two `SYNC_ROM_3DS_*_COMMAND` lines it
+prints into `server/.env` and restart the server:
+
+```bash
+sudo systemctl restart 3dssync@pi
+```
+
+The `decrypted-cci` wrapper requires FUSE: `sudo apt install fuse3 libfuse-dev`.
+If FUSE isn't available, only the CIA button in the web UI will work; the
+CCI button will return a 503 with actionable instructions.
 
 ---
 
@@ -192,8 +208,31 @@ Cert auto-renews via cron every 60 days.
 
 ```nginx
 # /etc/nginx/sites-available/gamesync
+#
+# Key tuning notes for large-file ROM/save downloads:
+#   * proxy_read_timeout / proxy_send_timeout are set to 24h so a 4GB ROM
+#     over a slow cellular connection doesn't get severed mid-stream.
+#   * The dedicated `location ~ ^/api/v1/(roms|saves)/` block disables
+#     proxy_buffering so the FastAPI streaming response passes straight
+#     through to the client — nginx never tries to buffer a multi-GB file
+#     to disk/RAM on the Pi.
+#   * proxy_request_buffering off lets large UPLOADS (saves, raw saves)
+#     stream into uvicorn instead of being spooled to /tmp first.
 
 limit_req_zone $binary_remote_addr zone=main:10m rate=20r/s;
+
+# Shared snippet for all server blocks. Inline if you'd rather not use an
+# include file; this just deduplicates the proxy headers / timeouts.
+#
+#   /etc/nginx/snippets/gamesync-proxy.conf
+#
+#     proxy_pass http://127.0.0.1:8000;
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Real-IP $remote_addr;
+#     proxy_set_header X-Remote-User $remote_user;
+#     proxy_http_version 1.1;
+#     proxy_read_timeout 24h;
+#     proxy_send_timeout 24h;
 
 # ── LAN: plain HTTP (no password) ────────────────────────────────────────────
 server {
@@ -201,8 +240,20 @@ server {
     server_name 192.168.1.201;   # your Pi's LAN IP
 
     client_max_body_size 0;
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
+    proxy_read_timeout 24h;
+    proxy_send_timeout 24h;
+
+    # Streaming endpoints — bypass nginx buffering for ROMs and saves so
+    # multi-GB transfers don't load into Pi RAM on either direction.
+    location ~ ^/api/v1/roms(/|$) {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Remote-User $remote_user;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -221,8 +272,18 @@ server {
     ssl_certificate_key /etc/nginx/ssl/key.pem;
 
     client_max_body_size 0;
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
+    proxy_read_timeout 24h;
+    proxy_send_timeout 24h;
+
+    location ~ ^/api/v1/roms(/|$) {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Remote-User $remote_user;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -251,11 +312,21 @@ server {
     limit_req zone=main burst=30 nodelay;
 
     client_max_body_size 0;
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
+    proxy_read_timeout 24h;
+    proxy_send_timeout 24h;
 
     auth_basic "GameSync";
     auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location ~ ^/api/v1/roms(/|$) {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Remote-User $remote_user;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -386,11 +457,11 @@ All endpoints except `GET /` and `GET /api/v1/status` require `X-API-Key` header
 | `GET` | `/api/v1/roms/scan` | Trigger ROM directory rescan (admin only) |
 | `GET` | `/api/v1/roms/{title_id}` | Download ROM file (supports HTTP Range) |
 | `GET` | `/api/v1/roms/{title_id}?extract=cue` | CHD → CUE/BIN ZIP |
+| `GET` | `/api/v1/roms/{title_id}?extract=psio` | PS1 CHD/CUE → PSIO BIN/CU2 ZIP |
 | `GET` | `/api/v1/roms/{title_id}?extract=gdi` | CHD → GDI ZIP (Dreamcast) |
 | `GET` | `/api/v1/roms/{title_id}?extract=iso` | CHD → ISO (PSP) |
 | `GET` | `/api/v1/roms/{title_id}?extract=cso` | CHD → CSO (PSP, requires `ciso`) |
-| `GET` | `/api/v1/roms/{title_id}?extract=cia` | 3DS cart image / `*.3ds.zip` / `*.cci.zip` → installable CIA |
-| `GET` | `/api/v1/roms/{title_id}?extract=decrypted_cia` | 3DS cart image / `*.3ds.zip` / `*.cci.zip` → decrypted CIA for emulators |
+| `GET` | `/api/v1/roms/{title_id}?extract=cia` | 3DS cart image / `*.3ds.zip` / `*.cci.zip` → decrypted CIA (installable + emulator-friendly) |
 | `GET` | `/api/v1/roms/{title_id}?extract=decrypted_cci` | 3DS cart image / `*.3ds.zip` / `*.cci.zip` → decrypted CCI for emulators |
 
 ### Web UI

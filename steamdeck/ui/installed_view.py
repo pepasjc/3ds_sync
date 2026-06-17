@@ -239,6 +239,34 @@ class InstalledListView(QListView):
         self.move_selection(self._viewport_rows(),
                             QAbstractItemView.ScrollHint.PositionAtBottom)
 
+    def alphabet_jump(self, direction: int) -> None:
+        rows = self._model.rowCount()
+        if rows == 0:
+            return
+        cur = self.currentIndex()
+        cur_row = cur.row() if cur.isValid() else 0
+        cur_rom = self._model.rom_at(cur_row)
+        cur_letter = _first_letter(cur_rom.display_name if cur_rom else "")
+        step = 1 if direction > 0 else -1
+        target = None
+        row = cur_row + step
+        while 0 <= row < rows:
+            rom = self._model.rom_at(row)
+            if rom is not None:
+                letter = _first_letter(rom.display_name)
+                if letter and letter != cur_letter:
+                    target = row
+                    break
+            row += step
+        if target is None:
+            target = rows - 1 if direction > 0 else 0
+        new_idx = self._model.index(target, 0)
+        self.setCurrentIndex(new_idx)
+        hint = (QAbstractItemView.ScrollHint.PositionAtTop
+                if direction > 0 else
+                QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.scrollTo(new_idx, hint)
+
     def row_count(self) -> int:
         return self._model.rowCount()
 
@@ -354,6 +382,9 @@ class InstalledView(QWidget):
     def page_down(self) -> None:
         self._list.page_down()
 
+    def alphabet_jump(self, direction: int) -> None:
+        self._list.alphabet_jump(direction)
+
     def visible_count(self) -> int:
         return self._list.row_count()
 
@@ -422,3 +453,11 @@ def _fmt_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.1f} MB"
     return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _first_letter(name: str) -> str:
+    """Uppercase first alphabetic character of *name*, '' if none."""
+    for ch in name:
+        if ch.isalpha():
+            return ch.upper()
+    return ""

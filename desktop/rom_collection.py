@@ -299,6 +299,7 @@ def _resolve_canonical_name_for_file(
     name_index: dict[str, str],
     alias_index: dict[str, str],
     skip_crc: bool = False,
+    serial_map: dict[str, str] | None = None,
 ) -> tuple[str | None, str]:
     canonical = None
     match_source = "filename"
@@ -312,6 +313,16 @@ def _resolve_canonical_name_for_file(
                 canonical = no_intro.get(crc)
                 if canonical:
                     return canonical, "crc"
+
+        # Sony disc-serial match — applies to PS1 / PS2 / PSP.  Cheap
+        # (filename-only) and highly reliable for Redump-named dumps like
+        # "SCES_538.51.007 Agent Under Fire.iso".
+        if serial_map and rn.supports_serial_lookup(system):
+            serial = rn.extract_ps_serial(path.name)
+            if serial:
+                canonical = rn.lookup_serial(serial, serial_map)
+                if canonical:
+                    return canonical, "serial"
 
         canonical = _resolve_alias_canonical_name(
             alias_index, path.name, path.parent.name
@@ -330,6 +341,8 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.apply_source_disc(canonical, no_intro, path.name)
+                canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "header"
 
         canonical = rn.fuzzy_filename_search(path.name, name_index)
@@ -339,6 +352,8 @@ def _resolve_canonical_name_for_file(
             )
             if region_hint:
                 canonical = rn.find_region_preferred(canonical, no_intro, region_hint)
+            canonical = rn.apply_source_disc(canonical, no_intro, path.name)
+            canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
             return canonical, "fuzzy"
 
         if path.parent.name:
@@ -351,6 +366,8 @@ def _resolve_canonical_name_for_file(
                     canonical = rn.find_region_preferred(
                         canonical, no_intro, region_hint
                     )
+                canonical = rn.apply_source_disc(canonical, no_intro, path.name)
+                canonical = rn.prefer_source_name_over_cosmetic(path.name, canonical)
                 return canonical, "folder"
 
     return None, match_source
@@ -457,6 +474,14 @@ def _resolve_canonical_name_for_zip(
                                     )
                                 match_source = "folder"
 
+                if canonical and match_source in ("header", "fuzzy", "folder"):
+                    canonical = rn.apply_source_disc(
+                        canonical, no_intro, member_path.name
+                    )
+                    canonical = rn.prefer_source_name_over_cosmetic(
+                        member_path.name, canonical
+                    )
+
                 if canonical and not _is_bios_candidate(canonical, info.filename):
                     candidates.append(
                         CollectionCandidate(
@@ -522,6 +547,7 @@ def _resolve_canonical_name_for_archive_label(
             )
             if region_hint:
                 canonical = rn.find_region_preferred(canonical, no_intro, region_hint)
+            canonical = rn.apply_source_disc(canonical, no_intro, archive_name)
             return canonical, match_source
 
     return None, "filename"
@@ -616,6 +642,7 @@ def scan_collection(
     clone_map: dict[str, str] | None = None,
     skip_crc: bool = False,
     one_game_one_rom: bool = True,
+    serial_map: dict[str, str] | None = None,
 ) -> tuple[list[CollectionCandidate], list[CollectionCandidate], list[Path]]:
     name_index = rn.build_name_index(no_intro) if no_intro else {}
     alias_index = rn.load_alias_index(system, no_intro) if no_intro else {}
@@ -666,6 +693,7 @@ def scan_collection(
                 name_index,
                 alias_index,
                 skip_crc=skip_crc,
+                serial_map=serial_map,
             )
             if canonical_name is None:
                 unmatched.append(path)
@@ -711,9 +739,13 @@ def _dedup_key(candidate: CollectionCandidate, clone_map: dict[str, str]) -> str
     to the candidate's own ``base_key``.
     """
     leader = clone_map.get(candidate.canonical_name)
-    if leader:
-        return rn.normalize_name(leader)
-    return candidate.base_key
+    base = rn.normalize_name(leader) if leader else candidate.base_key
+    # Keep each disc of a multi-disc game in its own bucket — otherwise Disc 1-4
+    # share a disc-agnostic base_key and all but one disc get dropped as dupes.
+    disc = rn.extract_disc_number(candidate.canonical_name)
+    if disc is not None:
+        return f"{base}#disc{disc}"
+    return base
 
 
 def _resolve_alias_canonical_name(
@@ -798,6 +830,7 @@ def validate_collection(
     skip_crc: bool = False,
     one_game_one_rom: bool = True,
     enabled_regions: set[str] | None = None,
+    serial_map: dict[str, str] | None = None,
 ) -> CollectionValidationReport:
     clone_map = clone_map or {}
     entries, duplicates, unmatched = scan_collection(
@@ -808,6 +841,7 @@ def validate_collection(
         clone_map=clone_map,
         skip_crc=skip_crc,
         one_game_one_rom=False,
+        serial_map=serial_map,
     )
     if enabled_regions is not None:
         entries = filter_by_regions(entries, enabled_regions)
@@ -993,7 +1027,18 @@ def build_collection(
     unmatched_files: list[Path] | None = None,
     folder_count: int = 1,
     progress_callback=None,
+    convert_to_chd: bool = False,
+    chdman_path: Path | None = None,
 ) -> list[Path]:
+    """Materialise the scanned collection into ``output_folder``.
+
+    When ``convert_to_chd`` is true and ``chdman_path`` is available, each
+    matched ``.cue`` / ``.gdi`` / ``.iso`` source is compressed to ``.chd`` on
+    the fly (``chdman createcd``) instead of being copied verbatim.  Other
+    formats — and files inside zip/7z archives — are always copied.  A
+    conversion failure for an individual entry falls back to a plain copy so
+    the build never aborts mid-collection.
+    """
     output_folder.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     unmatched_files = unmatched_files or []
@@ -1001,16 +1046,50 @@ def build_collection(
     # Keep the managed unmatched-files output deterministic across repeated builds.
     if unmatched_folder.is_dir():
         shutil.rmtree(unmatched_folder)
+
+    chd_ready = bool(convert_to_chd and chdman_path)
+    chd_convertible = {".cue", ".gdi", ".iso"}
+
     total = len(entries) + len(unmatched_files)
     for idx, entry in enumerate(entries, start=1):
-        if progress_callback:
-            progress_callback(f"Copying {idx}/{total}: {entry.output_name}")
         target_dir = (
             output_folder / bucket_name_for_letter(entry.bucket_letter, folder_count)
             if folder_count > 1
             else output_folder
         )
         target_dir.mkdir(parents=True, exist_ok=True)
+
+        # CHD conversion is only meaningful for on-disk sources, not archive
+        # members — chdman needs the referenced tracks sitting next to the
+        # source file.  Members inside zip/7z fall through to the archive
+        # branches below.
+        should_convert = (
+            chd_ready
+            and entry.source_kind == "file"
+            and entry.extension in chd_convertible
+        )
+
+        if should_convert:
+            target = target_dir / f"{entry.canonical_name}.chd"
+            if progress_callback:
+                progress_callback(
+                    f"Converting {idx}/{total}: {entry.source_path.name} -> {target.name}"
+                )
+            ok, err = _run_chdman_createcd(chdman_path, entry.source_path, target)
+            if ok:
+                written.append(target)
+                continue
+            # Fall back to a plain copy so the collection still gets an entry.
+            # The caller sees the copied source name, not the .chd name.
+            if progress_callback:
+                reason = err.splitlines()[-1] if err else "unknown error"
+                progress_callback(
+                    f"CHD conversion failed for {entry.source_path.name} ({reason}); copying original."
+                )
+
+        if progress_callback and not should_convert:
+            progress_callback(f"Copying {idx}/{total}: {entry.output_name}")
+
         if entry.source_kind == "zip" and entry.archive_member:
             if unzip_archives:
                 target = target_dir / entry.output_name
@@ -1057,3 +1136,18 @@ def build_collection(
             shutil.copy2(source_path, target)
             written.append(target)
     return written
+
+
+def _run_chdman_createcd(
+    chdman: Path, source: Path, output: Path
+) -> tuple[bool, str]:
+    """Wrapper around ``chdman createcd`` for use inside build_collection.
+
+    Imported lazily so rom_collection keeps working on systems that don't have
+    the CHD helper module (or chdman itself) available.
+    """
+    try:
+        from chd_converter import convert_to_chd as _convert
+    except Exception as exc:  # pragma: no cover - import failure is developer error
+        return False, f"chd_converter import failed: {exc}"
+    return _convert(chdman, source, output)

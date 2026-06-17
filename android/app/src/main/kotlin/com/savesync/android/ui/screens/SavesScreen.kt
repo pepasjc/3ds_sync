@@ -74,13 +74,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.swiperefresh.SwipeRefresh
 import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
+import com.savesync.android.MainActivity
 import com.savesync.android.emulators.SaveEntry
+import com.savesync.android.findComponentActivity
 import com.savesync.android.storage.SyncStateEntity
 import com.savesync.android.ui.MainViewModel
 import com.savesync.android.ui.SaveSyncStatus
 import com.savesync.android.ui.SyncState
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
+import com.savesync.android.ui.components.firstLetter
+import com.savesync.android.ui.components.handleHorizontalHoldKeyEvent
+import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.net.URI
@@ -117,6 +122,9 @@ fun SavesScreen(
     var selectedIndex by remember { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
+    // Hold-to-accelerate state for d-pad left/right: page scroll → faster
+    // page scroll → alphabet jump.  See HoldNav.kt.
+    val holdNav = rememberHoldNavState()
     val searchFocusRequester = remember { FocusRequester() }
     // Parent container steals focus on entry so the search TextField below
     // doesn't auto-focus and pop the keyboard when this tab opens.
@@ -143,6 +151,19 @@ fun SavesScreen(
     // the search" behaviour.
     LaunchedEffect(Unit) {
         runCatching { listFocusRequester.requestFocus() }
+    }
+
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the binding stays in
+    // sync with the SystemFilterChip in the toolbar.
+    val activity = context.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, availableFilters, selectedFilter) {
+        activity?.systemCycleEvents?.collect { delta ->
+            if (availableFilters.isEmpty()) return@collect
+            val idx = availableFilters.indexOf(selectedFilter).let { if (it < 0) 0 else it }
+            val next = (idx + delta + availableFilters.size) % availableFilters.size
+            viewModel.setFilter(availableFilters[next])
+        }
     }
 
     // Show sync result in snackbar
@@ -299,8 +320,8 @@ fun SavesScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { paddingValues ->
         // ── Master gamepad handler ───────────────────────────────────────
-        // D-pad up/down scrolls the list, left/right cycles the status
-        // filter, L1/R1 cycles the system filter, and the face/start
+        // D-pad up/down steps the list, left/right page-scrolls with hold
+        // acceleration, L1/R1 cycles the system filter, and the face/start
         // buttons mirror the TopAppBar actions. L2/R2 tab-switching is
         // handled at the Activity level, not here, so we don't consume
         // them below.
@@ -313,6 +334,43 @@ fun SavesScreen(
                 .focusRequester(listFocusRequester)
                 .focusable()
                 .onPreviewKeyEvent { event ->
+                    if (holdNav.handleHorizontalHoldKeyEvent(
+                            event,
+                            coroutineScope,
+                            onPage = { d ->
+                                if (saves.isNotEmpty()) {
+                                    val page = listState.layoutInfo.visibleItemsInfo.size
+                                        .coerceAtLeast(1)
+                                    selectedIndex = (selectedIndex + d * page)
+                                        .coerceIn(0, saves.size - 1)
+                                    coroutineScope.launch {
+                                        listState.animateScrollToItem(selectedIndex)
+                                    }
+                                }
+                            },
+                            onAlphabet = { d ->
+                                if (saves.isNotEmpty()) {
+                                    val cur = selectedIndex.coerceIn(0, saves.size - 1)
+                                    val curLetter = firstLetter(saves[cur].displayName)
+                                    val step = if (d > 0) 1 else -1
+                                    var row = cur + step
+                                    var found = -1
+                                    while (row in saves.indices) {
+                                        val ltr = firstLetter(saves[row].displayName)
+                                        if (ltr.isNotEmpty() && ltr != curLetter) {
+                                            found = row; break
+                                        }
+                                        row += step
+                                    }
+                                    selectedIndex = if (found >= 0) found
+                                        else if (d > 0) saves.size - 1 else 0
+                                    coroutineScope.launch {
+                                        listState.animateScrollToItem(selectedIndex)
+                                    }
+                                }
+                            },
+                        )
+                    ) return@onPreviewKeyEvent true
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
                         // D-pad / analog stick — vertical: scroll list
@@ -331,26 +389,6 @@ fun SavesScreen(
                                 coroutineScope.launch {
                                     listState.animateScrollToItem(selectedIndex)
                                 }
-                            }
-                            true
-                        }
-                        // D-pad / stick left/right → cycle system filter
-                        // (unified behaviour across all three tabs)
-                        Key.DirectionLeft -> {
-                            if (availableFilters.isNotEmpty()) {
-                                val idx = availableFilters.indexOf(selectedFilter)
-                                    .let { if (it < 0) 0 else it }
-                                val next = (idx - 1 + availableFilters.size) % availableFilters.size
-                                viewModel.setFilter(availableFilters[next])
-                            }
-                            true
-                        }
-                        Key.DirectionRight -> {
-                            if (availableFilters.isNotEmpty()) {
-                                val idx = availableFilters.indexOf(selectedFilter)
-                                    .let { if (it < 0) 0 else it }
-                                val next = (idx + 1) % availableFilters.size
-                                viewModel.setFilter(availableFilters[next])
                             }
                             true
                         }
@@ -385,33 +423,9 @@ fun SavesScreen(
                             onNavigateToSettings()
                             true
                         }
-                        // L1 / R1 → page scroll (Steam Deck parity).
-                        // Page size = currently-visible items count, so
-                        // each tap jumps roughly one viewport.
-                        Key.ButtonL1 -> {
-                            if (saves.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
-                                coroutineScope.launch {
-                                    listState.animateScrollToItem(selectedIndex)
-                                }
-                            }
-                            true
-                        }
-                        Key.ButtonR1 -> {
-                            if (saves.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex + page)
-                                    .coerceAtMost(saves.size - 1)
-                                coroutineScope.launch {
-                                    listState.animateScrollToItem(selectedIndex)
-                                }
-                            }
-                            true
-                        }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (system cycle) and L2/R2 (tab cycle) are
+                        // intercepted at the Activity level — never reach
+                        // Compose here.
                         else -> false
                     }
                 }
@@ -787,6 +801,7 @@ fun systemChipColor(systemName: String): Color {
         "PSP", "PPSSPP"   -> Color(0xFF01579B)
         "GEN", "MD"       -> Color(0xFF37474F)
         "SMS"             -> Color(0xFF455A64)
+        "SG1000"          -> Color(0xFF1E88E5)
         "GG"              -> Color(0xFF4CAF50)
         "SEGACD"          -> Color(0xFF263238)
         "SAT"             -> Color(0xFF4E342E)
@@ -795,6 +810,8 @@ fun systemChipColor(systemName: String): Color {
         "MAME"            -> Color(0xFFC62828)
         "NEOCD", "NGP"    -> Color(0xFFAD1457)
         "PCE", "TG16"     -> Color(0xFF00695C)
+        "PCSG"            -> Color(0xFF689F38)
+        "PCFX"            -> Color(0xFF827717)
         "WSWAN", "WSWANC" -> Color(0xFF2E7D32)
         "LYNX"            -> Color(0xFF4527A0)
         "A2600", "A7800"  -> Color(0xFF6D4C41)

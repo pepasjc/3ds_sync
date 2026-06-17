@@ -64,7 +64,8 @@ from scanner.installed_roms import (
 )
 from scanner.rom_target import resolve_rom_target_dir
 from sync_client import SyncClient, _find_server_save
-from config import load_config, save_config
+from config import load_config, save_config, DOWNLOADS_DB_PATH
+from download_manager import DownloadManager
 from . import theme
 from .catalog_view import CatalogView
 from .game_list import GameListView
@@ -73,7 +74,7 @@ from .controls_bar import ControlsBar
 from .settings_dialog import SettingsDialog
 from .detail_dialog import DetailDialog
 from .confirm_dialog import ConfirmDialog, ResultDialog
-from .download_dialog import DownloadProgressDialog
+from .downloads_view import DownloadsView
 from .detail_dialog import _NATIVE_COMPRESSED_FORMAT_SYSTEMS as _NATIVE_EXTRACT_SKIP
 
 try:
@@ -344,10 +345,27 @@ class ServerWorker(QObject):
         # Generic placeholders for every other system — lets the user see
         # (and Download-ROM for) server saves on systems without a dedicated
         # scanner-level builder (PS1, PS2, PSP, GBA, SNES, NES, ...).
+        #
+        # Filename-derived systems (PS1 .mcd, NES/SNES/GBA .srm, ...) need
+        # the canonical No-Intro name to construct a save path the emulator
+        # can find.  Batch-ask the server for canonical names so we use the
+        # exact stem the emulator uses on disk, rather than reverse-deriving
+        # one from the slug.
         seen_ids = {entry.title_id for entry in updated}
+        unseen_title_ids = [
+            tid for tid in server_saves.keys() if tid not in seen_ids
+        ]
+        canonical_names = (
+            self._client.lookup_canonical_names(unseen_title_ids)
+            if unseen_title_ids
+            else {}
+        )
         updated.extend(
             server_only.build_server_only_entries(
-                server_saves, seen_ids, self._emulation_path
+                server_saves,
+                seen_ids,
+                self._emulation_path,
+                canonical_names=canonical_names,
             )
         )
 
@@ -503,7 +521,21 @@ class MainWindow(QMainWindow):
         # systems the active tab actually has entries for.
         self._catalog_systems: list[str] = [CatalogView.ALL_SYSTEMS]
         self._installed_systems: list[str] = [InstalledView.ALL_SYSTEMS]
-        self._active_tab = 0  # 0 = saves, 1 = catalog, 2 = installed
+        # 0 = saves, 1 = catalog, 2 = installed, 3 = downloads
+        self._active_tab = 0
+
+        # Background download queue.  The Downloads tab + every
+        # ROM-download trigger site (catalog A button, save-detail
+        # dialog) feed this manager instead of opening modal
+        # progress dialogs that lock the UI.
+        self._download_manager = DownloadManager(self._client, DOWNLOADS_DB_PATH, parent=self)
+        # When a download lands, refresh the saves list (so the
+        # save-status flips) and the Installed tab (so the new file
+        # appears).  Mirrors what the old modal flow did on success.
+        self._download_manager.completed.connect(self._on_download_completed)
+        # Keep the filter-bar count label in sync while the user is
+        # parked on the Downloads tab.
+        self._download_manager.list_changed.connect(self._on_downloads_list_changed)
 
         # Build UI
         central = QWidget()
@@ -531,10 +563,13 @@ class MainWindow(QMainWindow):
         self._installed_view.status_changed.connect(self._on_installed_status_changed)
         self._installed_view.systems_changed.connect(self._on_installed_systems)
 
+        self._downloads_view = DownloadsView(self._download_manager)
+
         self._stack = QStackedWidget()
         self._stack.addWidget(self._list_view)       # idx 0 — saves
         self._stack.addWidget(self._catalog_view)    # idx 1 — catalog
         self._stack.addWidget(self._installed_view)  # idx 2 — installed
+        self._stack.addWidget(self._downloads_view)  # idx 3 — downloads
         root.addWidget(self._stack, 1)
 
         self._controls = ControlsBar()
@@ -627,7 +662,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         self._tab_buttons: list[QPushButton] = []
-        for idx, label in enumerate(("My Games", "ROM Catalog", "Installed")):
+        for idx, label in enumerate(("My Games", "ROM Catalog", "Installed", "Downloads")):
             btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setCheckable(True)
@@ -892,7 +927,7 @@ class MainWindow(QMainWindow):
     # Tab switching
     # ──────────────────────────────────────────────────────────────
 
-    TAB_COUNT = 3
+    TAB_COUNT = 4
 
     def _set_active_tab(self, idx: int) -> None:
         idx = max(0, min(self.TAB_COUNT - 1, idx))
@@ -946,6 +981,18 @@ class MainWindow(QMainWindow):
             self._search_edit.setPlaceholderText(
                 "Search installed ROMs (name, system, filename)…"
             )
+        elif self._active_tab == 3:
+            # Downloads tab has no system / status filter — the rows
+            # carry their own state.  Park the labels at em-dashes so
+            # the filterbar doesn't show a stale value from another tab.
+            self._controls.set_mode(ControlsBar.MODE_DOWNLOADS)
+            self._system_label.setText("—")
+            self._status_filter_label.setText("—")
+            count = len(self._download_manager.list_all())
+            self._count_label.setText(
+                f"{count} download{'' if count == 1 else 's'}"
+            )
+            self._search_edit.setPlaceholderText("Search not available on this tab")
         else:
             self._controls.set_mode(ControlsBar.MODE_SAVES)
             self._system_label.setText(self._system_filter)
@@ -1030,14 +1077,40 @@ class MainWindow(QMainWindow):
         if system in _NATIVE_EXTRACT_SKIP:
             extract_format = None
             target_filename = filename
-        target_path = target_dir / target_filename
 
-        msg = (
-            f"Download ROM '{display}'?\n"
-            f"System: {system or 'unknown'}\n"
-            f"File: {target_filename}{size_txt}\n"
-            f"Destination: {target_dir}"
-        )
+        # PS3 bundle entry: server returns a ZIP_STORED archive of the
+        # whole subfolder.  Target becomes the per-game directory; the
+        # download worker extracts on completion.
+        is_bundle = bool(rom.get("is_bundle"))
+        # Xbox bundles with extract=iso return a single ISO file (not a
+        # ZIP), because the server runs CCI→ISO conversion on the bundled
+        # CCI and streams the result directly. xemu only loads ISO, so
+        # skipping the bundle path here keeps the download as a single
+        # file the emulator can open.
+        if is_bundle and extract_format == "iso" and (system or "").upper() in ("XBOX", "X360", "XBOX360"):
+            is_bundle = False
+        if is_bundle:
+            bundle_dir_name = (rom.get("name") or
+                               Path(target_filename).stem) or rom_id
+            target_path = target_dir / bundle_dir_name
+        else:
+            target_path = target_dir / target_filename
+
+        if is_bundle:
+            file_count = len(rom.get("files") or [])
+            msg = (
+                f"Download PS3 bundle '{display}'?\n"
+                f"System: {system or 'unknown'}\n"
+                f"Files: {file_count}{size_txt}\n"
+                f"Destination: {target_path}"
+            )
+        else:
+            msg = (
+                f"Download ROM '{display}'?\n"
+                f"System: {system or 'unknown'}\n"
+                f"File: {target_filename}{size_txt}\n"
+                f"Destination: {target_dir}"
+            )
         if target_path.exists():
             msg += "\n\nA file with this name already exists and will be overwritten."
 
@@ -1051,36 +1124,47 @@ class MainWindow(QMainWindow):
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
 
-        progress_dlg = DownloadProgressDialog(
-            client=self._client,
+        # Enqueue rather than block — the Downloads tab takes it from
+        # here, and the user can keep browsing the catalog while the
+        # transfer runs.  ``_on_download_completed`` rescans saves
+        # and the Installed tab once a row finishes.
+        self._download_manager.enqueue(
             rom_id=rom_id,
-            target_path=target_path,
-            extract_format=extract_format,
+            system=system or "?",
             display_name=display,
-            parent=self,
+            target_path=target_path,
+            extract_format=None if is_bundle else extract_format,
+            expected_size=size,
+            is_bundle=is_bundle,
         )
-        progress_dlg.exec()
-        ok = progress_dlg.success
-        if ok:
-            msg_done = f"ROM '{display}' downloaded to {target_path}."
-        else:
-            detail = progress_dlg.error_detail or getattr(
-                self._client, "last_download_error", ""
-            ) or ""
-            msg_done = f"Download failed for '{display}'."
-            if detail:
-                msg_done += f"\n\n{detail}"
-        ResultDialog(ok, msg_done, parent=self).exec()
+        # Surface a quick acknowledgement and jump to the Downloads
+        # tab so the user can see the new row immediately.
+        ResultDialog(
+            True,
+            f"'{display}' added to the Downloads tab.",
+            parent=self,
+        ).exec()
+        self._set_active_tab(3)
 
-        if ok:
-            # Mirror the detail-dialog flow so a freshly downloaded ROM
-            # shows up in the scanner list (and flips its save status).
-            self._start_scan()
-            # And invalidate the Installed tab cache — the freshly
-            # downloaded ROM belongs in there too.
-            self._installed_view.mark_loading(True)
-            self._installed_view.set_roms([])
-            self._fetch_installed()
+    def _on_downloads_list_changed(self) -> None:
+        """Refresh the filterbar count when the queue changes (only if visible)."""
+        if self._active_tab == 3:
+            count = len(self._download_manager.list_all())
+            self._count_label.setText(
+                f"{count} download{'' if count == 1 else 's'}"
+            )
+
+    def _on_download_completed(self, _eid: str) -> None:
+        """Refresh the Saves + Installed tabs whenever a download lands.
+
+        The same post-download bookkeeping the modal flow used to do
+        inline; centralising it here keeps the manager-driven enqueue
+        path identical for catalog-tab and detail-dialog triggers.
+        """
+        self._start_scan()
+        self._installed_view.mark_loading(True)
+        self._installed_view.set_roms([])
+        self._fetch_installed()
 
     # ──────────────────────────────────────────────────────────────
     # Installed tab wiring
@@ -1244,6 +1328,16 @@ class MainWindow(QMainWindow):
         if not entry or not entry.server_hash:
             return
         if entry.save_path is None:
+            # Server-only saves on systems without a predicted save_path
+            # (unrecognised platform, missing emulation config) fall through
+            # here.  Tell the user instead of silently ignoring the click.
+            ResultDialog(
+                False,
+                f"No local save destination for '{entry.display_name}' on"
+                f" {entry.system}.  Install the ROM and rescan, or configure"
+                " the emulation path in Settings.",
+                parent=self,
+            ).exec()
             return
 
         # Build confirmation message
@@ -1255,7 +1349,7 @@ class MainWindow(QMainWindow):
             f"Download server save for '{entry.display_name}'?\n"
             f"Title ID: {entry.title_id}{size_str}"
         )
-        if entry.save_path and entry.save_path.exists():
+        if entry.save_path.exists():
             msg += "\n\nThis will overwrite your local save file."
 
         dlg = ConfirmDialog(
@@ -1311,6 +1405,7 @@ class MainWindow(QMainWindow):
             emulation_path=self._config.get("emulation_path"),
             rom_scan_dir=self._config.get("rom_scan_dir", ""),
             rom_dir_overrides=self._config.get("rom_dir_overrides") or {},
+            download_manager=self._download_manager,
         )
         dlg.exec()
         # A freshly downloaded ROM doesn't show up in the current scan result,
@@ -1329,11 +1424,15 @@ class MainWindow(QMainWindow):
         Saves tab rescans the local emulator folders (server + local
         state can drift between launches).  Catalog and Installed tabs
         pop up the search field since their data is already loaded.
+        Downloads tab maps Y to "Clear finished" — the only meaningful
+        global action when the row controls cover everything else.
         """
         if self._active_tab in (1, 2):
             if not self._search_visible:
                 self._toggle_search()
             self._search_edit.setFocus()
+        elif self._active_tab == 3:
+            self._download_manager.clear_finished()
         else:
             self._action_refresh()
 
@@ -1343,6 +1442,11 @@ class MainWindow(QMainWindow):
             self._download_catalog_rom(self._catalog_view.selected_rom())
         elif self._active_tab == 2:
             self._delete_installed_rom(self._installed_view.selected_rom())
+        elif self._active_tab == 3:
+            # Downloads tab has no list-cursor concept — the user
+            # interacts with rows directly via mouse/touch.  Swallow
+            # the press so it doesn't fall through to the saves tab.
+            return
         else:
             self._action_detail()
 
@@ -1440,15 +1544,31 @@ class MainWindow(QMainWindow):
             self._active_view_move(1)
 
     def _active_view_move(self, delta: int) -> None:
+        # Downloads tab has no item-cursor concept — its rows scroll
+        # via the embedded QScrollArea, not via a selection model.
+        if self._active_tab == 3:
+            return
         view = self._current_list_view()
         view.move_selection(delta)
 
     def _active_view_page(self, direction: int) -> None:
+        if self._active_tab == 3:
+            return
         view = self._current_list_view()
         if direction > 0:
             view.page_down()
         else:
             view.page_up()
+
+    def _active_view_alphabet_jump(self, direction: int) -> None:
+        # Last stage of the d-pad hold ramp-up: jump to the next
+        # display-name initial so a held LEFT/RIGHT sweeps A → B → C …
+        if self._active_tab == 3:
+            return
+        view = self._current_list_view()
+        jump = getattr(view, "alphabet_jump", None)
+        if callable(jump):
+            jump(direction)
 
     def _current_list_view(self):
         if self._active_tab == 1:
@@ -1467,6 +1587,14 @@ class MainWindow(QMainWindow):
             pygame.joystick.init()
             self._btn_state: dict[int | str, bool] = {}
             self._axis_nav_time = 0.0
+            # Hold-to-accelerate state for d-pad left/right: ``_nav_x_dir``
+            # is the active direction (-1 / 0 / 1), ``_nav_x_held_since``
+            # is when that direction started, and ``_nav_x_last_action``
+            # is the timestamp of the most recent page-scroll or alphabet
+            # jump.  Both timestamps are pygame.time-derived seconds.
+            self._nav_x_dir = 0
+            self._nav_x_held_since = 0.0
+            self._nav_x_last_action = 0.0
             self._try_grab_joystick()
 
             self._gamepad_timer = QTimer(self)
@@ -1627,10 +1755,10 @@ class MainWindow(QMainWindow):
             self._action_y()  # Y — saves rescan / catalog search
         if btn_pressed(4):
             if dialog_target is None:
-                self._cycle_tab(-1)  # L1 — previous tab
+                self._cycle_system(-1)  # L1 — previous system
         if btn_pressed(5):
             if dialog_target is None:
-                self._cycle_tab(1)  # R1 — next tab
+                self._cycle_system(1)  # R1 — next system
         if btn_pressed(6):
             if dialog_target is None:
                 self._toggle_search()  # Select/View
@@ -1645,13 +1773,13 @@ class MainWindow(QMainWindow):
         except Exception:
             axis_y = 0.0
 
-        # ── L2 / R2 for status filter ─────────────────────────────
+        # ── L2 / R2 for tab cycle ─────────────────────────────────
         if btn_pressed(8):
             pass  # Steam button — ignore
-        # L2/R2 pressed detection via axis crossing threshold.  Both
-        # triggers drive page-wise list scrolling so navigating the
-        # catalog (and large synced-save lists) doesn't require holding
-        # the d-pad for minutes.
+        # L2/R2 pressed detection via axis crossing threshold.  Triggers
+        # cycle the top-level tab (Saves → Catalog → Installed → Downloads).
+        # L1/R1 (shoulders) cycle the system filter instead; d-pad left/right
+        # drives accelerating page-scroll.
         l2_prev = self._btn_state.get("l2", False)
         r2_prev = self._btn_state.get("r2", False)
         l2_cur = l2 > 0.5
@@ -1659,13 +1787,23 @@ class MainWindow(QMainWindow):
         self._btn_state["l2"] = l2_cur
         self._btn_state["r2"] = r2_cur
         if dialog_target is None and l2_cur and not l2_prev:
-            self._active_view_page(-1)
+            self._cycle_tab(-1)
         if dialog_target is None and r2_cur and not r2_prev:
-            self._active_view_page(1)
+            self._cycle_tab(1)
 
         # ── Navigation with repeat ────────────────────────────────
         DEADZONE = 0.4
         REPEAT_DELAY = 0.15
+        # Hold-to-accelerate thresholds for d-pad left/right.  First press
+        # fires one page scroll immediately.  After ``HOLD_FAST_AFTER`` of
+        # continuous holding we start auto-paging at ``FAST_CADENCE``.
+        # After ``HOLD_ALPHA_AFTER`` we escalate to alphabet jumps at
+        # ``ALPHA_CADENCE`` so the user can sweep a long catalog in
+        # seconds without breaking their thumb off the d-pad.
+        HOLD_FAST_AFTER = 0.5
+        HOLD_ALPHA_AFTER = 1.5
+        FAST_CADENCE = 0.10
+        ALPHA_CADENCE = 0.25
 
         nav_y = 0
         if hat_y == 1 or axis_y < -DEADZONE:
@@ -1682,15 +1820,52 @@ class MainWindow(QMainWindow):
         if dialog_target is not None:
             return
 
-        if nav_y != 0 or nav_x != 0:
+        # ── Y axis — single-row move at fixed repeat ──────────────
+        if nav_y != 0:
             if now - self._axis_nav_time >= REPEAT_DELAY:
                 self._axis_nav_time = now
-                if nav_y != 0:
-                    self._active_view_move(nav_y)
-                if nav_x != 0:
-                    self._cycle_system(nav_x)
-        elif nav_y == 0 and nav_x == 0:
-            self._axis_nav_time = 0.0  # reset so next press fires immediately
+                self._active_view_move(nav_y)
+        else:
+            self._axis_nav_time = 0.0
+
+        # ── X axis — page scroll ramping into alphabet jump ───────
+        if nav_x != 0:
+            if self._nav_x_dir != nav_x:
+                # Fresh press (or direction reversal): fire once
+                # immediately and start the hold clock.
+                self._nav_x_dir = nav_x
+                self._nav_x_held_since = now
+                self._nav_x_last_action = now
+                self._active_view_page(nav_x)
+            else:
+                held = now - self._nav_x_held_since
+                since_last = now - self._nav_x_last_action
+                if held >= HOLD_ALPHA_AFTER:
+                    if since_last >= ALPHA_CADENCE:
+                        self._nav_x_last_action = now
+                        self._active_view_alphabet_jump(nav_x)
+                elif held >= HOLD_FAST_AFTER:
+                    if since_last >= FAST_CADENCE:
+                        self._nav_x_last_action = now
+                        self._active_view_page(nav_x)
+                # held < HOLD_FAST_AFTER: do nothing (initial press
+                # already fired; user hasn't held long enough for
+                # auto-repeat yet)
+        else:
+            self._nav_x_dir = 0
+            self._nav_x_held_since = 0.0
+            self._nav_x_last_action = 0.0
+
+    def closeEvent(self, event):
+        # Flag any active downloads as "paused" before tearing down
+        # the worker threads so the .part files aren't left in
+        # ambiguous "downloading" state — the recovery pass on next
+        # launch picks them up cleanly.
+        try:
+            self._download_manager.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
@@ -46,16 +47,22 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.savesync.android.ui.MainViewModel
+import com.savesync.android.ui.screens.DownloadsScreen
+import com.savesync.android.ui.screens.EmulatorsScreen
 import com.savesync.android.ui.screens.InstalledGamesScreen
 import com.savesync.android.ui.screens.RomCatalogScreen
 import com.savesync.android.ui.screens.SaveDetailScreen
 import com.savesync.android.ui.screens.SavesScreen
 import com.savesync.android.ui.screens.SettingsScreen
 import com.savesync.android.ui.theme.SaveSyncTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -64,20 +71,29 @@ class MainActivity : ComponentActivity() {
 
     // ── Gamepad plumbing ─────────────────────────────────────────────────────
     // L2/R2 (digital OR analog trigger) cycle the top-level tabs globally;
-    // MainApp observes this flow to drive navController.
+    // MainApp observes this flow to drive navController.  L1/R1 (digital
+    // shoulders) cycle the system filter on whichever list is focused; each
+    // screen subscribes to systemCycleEvents and runs its own filter step.
     private val _tabCycleEvents = MutableSharedFlow<Int>(extraBufferCapacity = 8)
     val tabCycleEvents: SharedFlow<Int> = _tabCycleEvents
+
+    private val _systemCycleEvents = MutableSharedFlow<Int>(extraBufferCapacity = 8)
+    val systemCycleEvents: SharedFlow<Int> = _systemCycleEvents
 
     // Edge-detected state for analog triggers so we fire once per press,
     // not once per polled sample.
     private var lastLeftTrigger = false
     private var lastRightTrigger = false
 
-    // Analog stick → DPAD key synthesis. Steam Deck uses deadzone 0.4 + 150 ms
-    // repeat; we mirror that so sticks feel identical across both apps.
-    private var lastAxisDirY = 0
-    private var lastAxisDirX = 0
-    private var lastAxisRepeat = 0L
+    // Analog stick + HAT → DPAD key synthesis.  Steam Deck uses deadzone 0.4
+    // + 150 ms repeat; we mirror that so sticks feel identical across both
+    // apps.  HAT axes (physical D-pad on most pads) only fire ACTION_MOVE on
+    // edge transitions — not while the pad is held — so we drive the repeat
+    // from a coroutine timer keyed off the last known direction rather than
+    // off MotionEvent arrival.
+    private var heldDirX = 0
+    private var heldDirY = 0
+    private var axisRepeatJob: Job? = null
 
     private val storagePermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -119,14 +135,16 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Intercept L2/R2 globally to cycle tabs BEFORE any Compose handler sees
-     * them. We match both the standard L2/R2 keycodes AND a couple of common
-     * alternates some PS4/Xbox controllers send. Analog-only triggers are
-     * handled in [dispatchGenericMotionEvent] below.
+     * Intercept L1/R1 and L2/R2 globally BEFORE any Compose handler sees them.
+     *   * L1/R1 → cycle the system filter on the focused list
+     *   * L2/R2 → cycle the top-level tab (saves / catalog / installed / downloads)
+     * Analog-only triggers are handled in [dispatchGenericMotionEvent] below.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             when (event.keyCode) {
+                KeyEvent.KEYCODE_BUTTON_L1 -> { _systemCycleEvents.tryEmit(-1); return true }
+                KeyEvent.KEYCODE_BUTTON_R1 -> { _systemCycleEvents.tryEmit(1); return true }
                 KeyEvent.KEYCODE_BUTTON_L2 -> { _tabCycleEvents.tryEmit(-1); return true }
                 KeyEvent.KEYCODE_BUTTON_R2 -> { _tabCycleEvents.tryEmit(1); return true }
             }
@@ -154,7 +172,11 @@ class MainActivity : ComponentActivity() {
             return super.dispatchGenericMotionEvent(event)
         }
 
-        // ── L2/R2 analog trigger fallback ────────────────────────────────
+        // ── L2/R2 analog trigger fallback → tab cycle ────────────────────
+        // Some controllers (PS4/PS5 over Bluetooth, certain Xbox pads) only
+        // emit analog AXIS_LTRIGGER/RTRIGGER values, never the digital
+        // KEYCODE_BUTTON_L2/R2. Mirror the digital path here so the tab
+        // cycles either way.
         val lt = maxOf(
             event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
             event.getAxisValue(MotionEvent.AXIS_BRAKE),
@@ -171,12 +193,13 @@ class MainActivity : ComponentActivity() {
         lastRightTrigger = rtDown
 
         // ── Stick + HAT → DPAD key synthesis ─────────────────────────────
-        // Combine analog stick and HAT axes so both go through one
-        // edge-detect/repeat pipeline. HAT values are always exactly
-        // -1/0/+1 (digital DPAD); the 0.5 threshold is just a non-zero
-        // check. If the DPAD is held, we get continuous MOVE events at
-        // the driver's poll rate, so the repeat logic kicks in the same
-        // as with the stick.
+        // HAT values are exactly -1/0/+1; the 0.5 threshold is a non-zero
+        // check.  Crucially, HAT axes do NOT emit ACTION_MOVE events while
+        // the pad is held — only on edge transitions — so we can't drive
+        // the repeat off MotionEvent arrival.  Instead, MotionEvent only
+        // updates [heldDirX]/[heldDirY], and a single coroutine fires the
+        // synthesised ACTION_DOWN+ACTION_UP pairs every STICK_REPEAT_MS
+        // until both axes return to zero.
         val y = event.getAxisValue(MotionEvent.AXIS_Y)
         val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
         val x = event.getAxisValue(MotionEvent.AXIS_X)
@@ -193,33 +216,39 @@ class MainActivity : ComponentActivity() {
             else -> 0
         }
 
-        if (dirY == 0 && dirX == 0) {
-            // Stick returned to centre — reset so the next press fires immediately.
-            lastAxisDirY = 0
-            lastAxisDirX = 0
-            lastAxisRepeat = 0L
-            return true
-        }
-
-        val now = SystemClock.uptimeMillis()
-        val directionChanged = dirY != lastAxisDirY || dirX != lastAxisDirX
-        val repeatDue = now - lastAxisRepeat >= STICK_REPEAT_MS
-        if (directionChanged || repeatDue) {
-            if (dirY != 0) {
-                val code = if (dirY < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
-            }
-            if (dirX != 0) {
-                val code = if (dirX < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-                dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
-            }
-            lastAxisDirY = dirY
-            lastAxisDirX = dirX
-            lastAxisRepeat = now
-        }
+        updateHeldDpad(dirX, dirY)
         return true
+    }
+
+    private fun emitDpadPulse(dirX: Int, dirY: Int) {
+        if (dirY != 0) {
+            val code = if (dirY < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
+        if (dirX != 0) {
+            val code = if (dirX < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
+    }
+
+    private fun updateHeldDpad(dirX: Int, dirY: Int) {
+        if (dirX == heldDirX && dirY == heldDirY) return
+        heldDirX = dirX
+        heldDirY = dirY
+        axisRepeatJob?.cancel()
+        axisRepeatJob = null
+        if (dirX == 0 && dirY == 0) return
+        // Fire the edge press immediately, then keep pulsing while held.
+        emitDpadPulse(dirX, dirY)
+        axisRepeatJob = lifecycleScope.launch {
+            delay(STICK_REPEAT_MS)
+            while (isActive && (heldDirX != 0 || heldDirY != 0)) {
+                emitDpadPulse(heldDirX, heldDirY)
+                delay(STICK_REPEAT_MS)
+            }
+        }
     }
 
     private fun checkStoragePermission(): Boolean {
@@ -266,11 +295,11 @@ class MainActivity : ComponentActivity() {
  * Ordered list of top-level tab routes. The index is what [TabSwitchBar]
  * binds to, so any reorder here automatically shifts the selected indicator.
  */
-internal val TAB_ROUTES: List<String> = listOf("saves", "catalog", "installed")
+internal val TAB_ROUTES: List<String> = listOf("saves", "catalog", "installed", "downloads")
 
 /** Unwrap a [Context] (possibly wrapped by a ContextWrapper chain) to the
  *  owning [ComponentActivity]. Returns null in previews. */
-private fun Context.findComponentActivity(): ComponentActivity? {
+internal fun Context.findComponentActivity(): ComponentActivity? {
     var current: Context? = this
     while (current is ContextWrapper) {
         if (current is ComponentActivity) return current
@@ -292,7 +321,8 @@ private fun MainApp() {
 
     // Wire L2/R2 → cycle tabs. The Activity emits on a SharedFlow and we
     // translate it into a navController.navigate() here so the NavHost is
-    // the single source of truth for which tab is visible.
+    // the single source of truth for which tab is visible. L1/R1 emits on
+    // a separate systemCycleEvents flow that each screen subscribes to.
     val activity = LocalContext.current.findComponentActivity() as? MainActivity
     LaunchedEffect(activity, navController) {
         activity?.tabCycleEvents?.collect { delta ->
@@ -303,6 +333,12 @@ private fun MainApp() {
             navigateToTab(navController, TAB_ROUTES[next])
         }
     }
+
+    // (Removed: previously we auto-jumped to the Downloads tab on
+    // enqueue, but that yanked the user out of the catalog mid-browse.
+    // The catalog's own snackbar — "Queued <name> — see Downloads tab
+    // for progress" — is now the only confirmation.  Users navigate
+    // manually when they want to watch.)
 
     val onNavigateToTab: (Int) -> Unit = { idx ->
         navigateToTab(navController, TAB_ROUTES[idx])
@@ -338,8 +374,21 @@ private fun MainApp() {
                     onNavigateToTab = onNavigateToTab,
                 )
             }
+            composable(TAB_ROUTES[3]) {
+                DownloadsScreen(
+                    viewModel = viewModel,
+                    onNavigateToTab = onNavigateToTab,
+                )
+            }
             composable("settings") {
                 SettingsScreen(
+                    viewModel = viewModel,
+                    onNavigateBack = { navController.popBackStack() },
+                    onNavigateToEmulators = { navController.navigate("emulators") }
+                )
+            }
+            composable("emulators") {
+                EmulatorsScreen(
                     viewModel = viewModel,
                     onNavigateBack = { navController.popBackStack() }
                 )

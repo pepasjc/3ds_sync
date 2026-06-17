@@ -77,6 +77,7 @@ class DetailDialog(QDialog, GamepadModalMixin):
         emulation_path: Optional[Path] = None,
         rom_scan_dir: Optional[str] = None,
         rom_dir_overrides: Optional[dict] = None,
+        download_manager=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Save Info")
@@ -91,6 +92,10 @@ class DetailDialog(QDialog, GamepadModalMixin):
         self._emulation_path = Path(emulation_path) if emulation_path else None
         self._rom_scan_dir = rom_scan_dir or ""
         self._rom_dir_overrides = dict(rom_dir_overrides or {})
+        # Optional: when supplied, ROM downloads triggered from this
+        # dialog go onto the background queue instead of the legacy
+        # blocking modal flow.
+        self._download_manager = download_manager
         # Caller checks this after exec() to decide whether to trigger a full
         # rescan — a downloaded ROM changes the SERVER_ONLY → SYNCED status
         # for its save entry, but only after the scanner re-runs.
@@ -293,7 +298,7 @@ QLabel#detailLabel {{
             btn_layout.addWidget(self._upload_btn)
 
         self._download_btn = None
-        if entry.server_hash and entry.save_path:
+        if entry.server_hash:
             self._download_btn = QPushButton("Download  [X]")
             self._download_btn.setStyleSheet(
                 f"QPushButton {{ background:{theme.STATUS_DOWNLOAD}; color:#fff;"
@@ -363,11 +368,21 @@ QLabel#detailLabel {{
 
     def _do_download(self):
         entry = self._entry
+        if entry.save_path is None:
+            ResultDialog(
+                False,
+                f"No local save destination for '{entry.display_name}' on"
+                f" {entry.system}.  Install the ROM and rescan, or configure"
+                " the emulation path in Settings.",
+                parent=self,
+            ).exec()
+            return
+
         msg = (
             f"Download server save for '{entry.display_name}'?\n"
             f"Title ID: {entry.title_id}"
         )
-        if entry.save_path and entry.save_path.exists():
+        if entry.save_path.exists():
             msg += "\n\nThis will overwrite your local save file."
 
         dlg = ConfirmDialog(
@@ -440,13 +455,40 @@ QLabel#detailLabel {{
         if entry.system in _NATIVE_COMPRESSED_FORMAT_SYSTEMS:
             extract_format = None
             target_filename = filename
-        target_path = target_dir / target_filename
 
-        msg = (
-            f"Download ROM for '{entry.display_name}'?\n"
-            f"File: {target_filename}{size_txt}\n"
-            f"Destination: {target_dir}"
-        )
+        # PS3 bundle entries (subfolder containing .pkg files) ship from
+        # the server as ZIP_STORED archives.  We download into a
+        # per-game directory under target_dir and the worker handles
+        # extraction.  ``is_bundle`` flips the worker into the bundle
+        # path; ``target_path`` is the directory, not a file.
+        is_bundle = bool(rom.get("is_bundle"))
+        # Xbox bundles with extract=iso return a single ISO file (not a
+        # ZIP), because the server runs CCI→ISO conversion on the bundled
+        # CCI and streams the result directly. xemu only loads ISO, so
+        # skipping the bundle path here keeps the download as a single
+        # file the emulator can open.
+        if is_bundle and extract_format == "iso" and (entry.system or "").upper() in ("XBOX", "X360", "XBOX360"):
+            is_bundle = False
+        if is_bundle:
+            bundle_dir_name = (rom.get("name") or
+                               Path(target_filename).stem) or rom_id
+            target_path = target_dir / bundle_dir_name
+        else:
+            target_path = target_dir / target_filename
+
+        if is_bundle:
+            file_count = len(rom.get("files") or [])
+            msg = (
+                f"Download PS3 bundle '{entry.display_name}'?\n"
+                f"Files: {file_count}{size_txt}\n"
+                f"Destination: {target_path}"
+            )
+        else:
+            msg = (
+                f"Download ROM for '{entry.display_name}'?\n"
+                f"File: {target_filename}{size_txt}\n"
+                f"Destination: {target_dir}"
+            )
         if target_path.exists():
             msg += "\n\nA file with this name already exists and will be overwritten."
 
@@ -460,9 +502,36 @@ QLabel#detailLabel {{
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
 
+        rom_id = str(rom.get("rom_id") or entry.title_id)
+        if self._download_manager is not None:
+            # Background queue path — drops the row onto the Downloads
+            # tab so the user can keep using the rest of the app.  We
+            # don't set ``self.rom_downloaded = True`` here because the
+            # transfer hasn't actually finished yet; MainWindow's
+            # ``completed`` signal handler will rescan when it does.
+            self._download_manager.enqueue(
+                rom_id=rom_id,
+                system=entry.system or "?",
+                display_name=entry.display_name,
+                target_path=target_path,
+                extract_format=None if is_bundle else extract_format,
+                expected_size=size,
+                is_bundle=is_bundle,
+            )
+            ResultDialog(
+                True,
+                f"'{entry.display_name}' added to the Downloads tab.",
+                parent=self,
+            ).exec()
+            self.accept()
+            return
+
+        # Legacy modal path — still here for callers that haven't been
+        # passed a ``download_manager``.  Will go away once every entry
+        # point routes through the queue.
         progress_dlg = DownloadProgressDialog(
             client=self._client,
-            rom_id=str(rom.get("rom_id") or entry.title_id),
+            rom_id=rom_id,
             target_path=target_path,
             extract_format=extract_format,
             display_name=entry.display_name,

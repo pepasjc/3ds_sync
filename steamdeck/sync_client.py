@@ -296,6 +296,16 @@ def _create_dir_bundle(
     return bytes(header) + compressed
 
 
+def _is_unsafe_bundle_path(rel_path: str) -> bool:
+    """True if a server-supplied bundle member would escape its dest dir."""
+    p = rel_path.replace("\\", "/")
+    return (
+        p.startswith("/")
+        or ".." in Path(p).parts
+        or (len(p) >= 2 and p[1] == ":")  # drive-letter absolute (Windows)
+    )
+
+
 def _parse_dir_bundle(data: bytes) -> list[tuple[str, bytes]]:
     """
     Parse a 3DSS v3/v4/v5 bundle, returning list of (filename, file_data).
@@ -370,7 +380,13 @@ def _parse_dir_bundle(data: bytes) -> list[tuple[str, bytes]]:
 
 
 def _derive_3ds_download_filename(filename: str, extract_format: str) -> str:
-    """Map a raw 3DS catalog filename to the extracted output filename."""
+    """Map a raw 3DS catalog filename to the extracted output filename.
+
+    The ROM stem is preserved verbatim — only the extension changes. Adding a
+    ``_decrypted`` marker would break save-folder detection on the device,
+    which keys off the filename stem. Users who want to keep both a CIA and
+    a decrypted-CIA side by side must rename one locally themselves.
+    """
     stem = filename
     lower = stem.lower()
     if lower.endswith(".zip"):
@@ -383,9 +399,9 @@ def _derive_3ds_download_filename(filename: str, extract_format: str) -> str:
             break
 
     if extract_format == "decrypted_cci":
-        return f"{stem}_decrypted.cci"
-    if extract_format == "decrypted_cia":
-        return f"{stem}_decrypted.cia"
+        return f"{stem}.cci"
+    # The "cia" format produces a decrypted CIA that is ALSO installable on
+    # CFW 3DS hardware, so a single wrapper covers both use-cases.
     return f"{stem}.cia"
 
 
@@ -489,6 +505,12 @@ class SyncClient:
         choose between hardware and emulator outputs.  Desktop emulator clients
         only accept decrypted CCI so the downloaded ROM is directly usable by
         emulator frontends.
+
+        Xbox/X360 catalog rows stored as .cci must be converted to ISO because
+        xemu (the emulator used on Steam Deck and Android) does not support
+        CCI format.  If the source is already .iso the server streams it
+        directly with no conversion overhead.
+
         Other systems continue to use the legacy single ``extract_format`` hint.
         """
         filename = str(rom.get("filename") or f"{rom.get('rom_id') or 'download'}.rom")
@@ -507,6 +529,29 @@ class SyncClient:
             if legacy == "decrypted_cci":
                 return _derive_3ds_download_filename(filename, legacy), legacy
             return filename, None
+
+        if system_up in ("XBOX", "X360", "XBOX360"):
+            # xemu only supports ISO — request conversion when source is CCI.
+            # Server returns raw ISO stream if source is already .iso (no-op),
+            # or runs CCI→ISO conversion via XGDTool and caches the result.
+            advertised = [
+                str(v).strip().lower()
+                for v in (rom.get("extract_formats") or [])
+                if str(v).strip()
+            ]
+            if "iso" in advertised:
+                stem = Path(filename).stem
+                return f"{stem}.iso", "iso"
+            # Source is already .iso (no extract_formats advertised, or only
+            # non-disc formats) — download raw, filename already correct.
+            source_ext = Path(filename).suffix.lower()
+            if source_ext == ".iso":
+                return filename, None
+            # Fallback: request iso conversion anyway; server returns 400 if
+            # the source isn't convertible, which is better than downloading
+            # a CCI that xemu can't load.
+            stem = Path(filename).stem
+            return f"{stem}.iso", "iso"
 
         extract = str(rom.get("extract_format") or "").strip().lower() or None
         return filename, extract
@@ -680,6 +725,36 @@ class SyncClient:
             print(f"[LookupNames] batch lookup failed: {exc}")
         return {"names": {}, "types": {}, "retail_serials": {}}
 
+    def lookup_canonical_names(self, title_ids: list[str]) -> dict[str, str]:
+        """Resolve emulator-style title_ids to canonical No-Intro / DAT names.
+
+        Used when constructing save filenames for server-only entries: the
+        canonical name (e.g. ``"Super Mario World (USA)"``) matches what the
+        emulator writes to disk, while a slug-derived stem (``"Super Mario
+        World Usa"``) does not — so syncing to the slug-derived name leaves
+        the emulator unable to find the save.
+
+        Returns a sparse map: title_ids with no catalog hit are omitted so
+        callers can detect "no match" and refuse to sync rather than guess.
+        """
+        if not title_ids:
+            return {}
+        try:
+            r = requests.post(
+                f"{self.base_url}/titles/canonical-names",
+                json={"title_ids": list(title_ids)},
+                headers={**self.headers, "Content-Type": "application/json"},
+                timeout=self._timeout,
+            )
+            if r.status_code == 200:
+                body = r.json()
+                names = body.get("names", {})
+                if isinstance(names, dict):
+                    return {str(k): str(v) for k, v in names.items() if v}
+        except Exception as exc:
+            print(f"[LookupCanonicalNames] batch lookup failed: {exc}")
+        return {}
+
     # ------------------------------------------------------------------
     # Card metadata (for three-way hash on PS1/PS2/GC)
     # ------------------------------------------------------------------
@@ -850,6 +925,8 @@ class SyncClient:
                         existing.unlink()
                 # Write extracted files
                 for name, data in files:
+                    if _is_unsafe_bundle_path(name):
+                        raise RuntimeError(f"Refusing unsafe bundle member: {name}")
                     (save_path / name).write_bytes(data)
 
                 server_hash = r.headers.get("X-Save-Hash", "")
@@ -875,6 +952,8 @@ class SyncClient:
                     shutil.rmtree(save_path)
                 save_path.mkdir(parents=True, exist_ok=True)
                 for name, data in files:
+                    if _is_unsafe_bundle_path(name):
+                        raise RuntimeError(f"Refusing unsafe bundle member: {name}")
                     target = save_path / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)

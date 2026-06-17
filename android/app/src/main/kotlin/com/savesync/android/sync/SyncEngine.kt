@@ -12,12 +12,22 @@ import com.savesync.android.emulators.SaveEntry
 import com.savesync.android.installed.InstalledRomsScanner
 import com.savesync.android.storage.AppDatabase
 import com.savesync.android.storage.SyncStateEntity
+import com.savesync.android.systems.SystemAliases
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.IOException
 
 private const val TAG = "SyncEngine"
+
+// Disc-based systems where each game conventionally lives in its own
+// subfolder rather than as a flat file in the system directory (PS1
+// .cue+.bin pairs, Saturn, Dreamcast, Sega CD).  Mirrors
+// ``shared/systems.py::CD_FOLDER_SYSTEMS`` — keep the two in sync.
+// When downloading a ROM for one of these systems we wrap the file in a
+// subfolder named after the filename stem so multi-track layouts stay
+// grouped and the system folder stays tidy.
+private val CD_FOLDER_SYSTEMS: Set<String> = setOf("SEGACD", "SAT", "DC", "PS1")
 
 private data class SaturnCanonicalSnapshot(
     val bytes: ByteArray,
@@ -539,8 +549,15 @@ class SyncEngine(
     /**
      * Download a ROM from the server's ROM catalog.
      * Saves to the ROM scan directory under the appropriate system subfolder.
-     * Returns the downloaded File on success, null on failure.
+     * Returns the downloaded File on success.
+     *
+     * On failure, throws [IOException] with a descriptive message so the
+     * caller can surface the real reason to the user (instead of collapsing
+     * every failure to a generic "not found"). Network/timeout exceptions
+     * are re-thrown verbatim so the UI layer can tell "server took too
+     * long" apart from "server said no".
      */
+    @Throws(IOException::class)
     suspend fun downloadRom(
         romId: String,
         system: String,
@@ -548,38 +565,75 @@ class SyncEngine(
         expectedFilename: String? = null,
         romDirOverrides: Map<String, String> = emptyMap(),
         extractFormat: String? = null,
-    ): File? {
-        return try {
-            val response = api.downloadRom(romId, extract = extractFormat)
-            if (!response.isSuccessful) {
-                Log.e(TAG, "ROM download HTTP error for $romId: ${response.code()}")
-                return null
+        cdGamesPerContentFolder: Boolean = false,
+    ): File {
+        val response = try {
+            api.downloadRom(romId, extract = extractFormat)
+        } catch (e: IOException) {
+            Log.e(TAG, "downloadRom network error for $romId", e)
+            throw e
+        }
+        if (!response.isSuccessful) {
+            val code = response.code()
+            val detail = runCatching { response.errorBody()?.string() }.getOrNull()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            val message = when (code) {
+                404 -> detail ?: "ROM not found on server"
+                503 -> detail ?: "Server-side conversion is not configured (HTTP 503)"
+                504 -> detail ?: "Server-side conversion timed out (HTTP 504)"
+                500 -> detail ?: "Server-side conversion failed (HTTP 500)"
+                else -> "HTTP $code" + (detail?.let { ": $it" } ?: "")
             }
-            val body = response.body() ?: return null
+            Log.e(TAG, "ROM download failed for $romId: $message")
+            throw IOException(message)
+        }
+        val body = response.body()
+            ?: throw IOException("Server returned empty response for ROM $romId")
 
-            val filename = expectedFilename
-                ?: response.headers()["Content-Disposition"]
-                    ?.let { cd ->
-                        val match = Regex("filename=\"?([^\"]+)\"?").find(cd)
-                        match?.groupValues?.get(1)
-                    }
-                ?: "$romId.rom"
+        val rawFilename = expectedFilename
+            ?: response.headers()["Content-Disposition"]
+                ?.let { cd ->
+                    val match = Regex("filename=\"?([^\"]+)\"?").find(cd)
+                    match?.groupValues?.get(1)
+                }
+            ?: "$romId.rom"
+        // Server/header-supplied name: collapse to a bare basename so a
+        // crafted Content-Disposition (e.g. "../../foo") can't escape the
+        // target ROM directory.
+        val filename = sanitizeDownloadName(rawFilename) ?: "$romId.rom"
 
-            // Delegate folder selection to the shared helper so the download
-            // path, the installed-ROMs scanner, and the Steam Deck client all
-            // agree on where an incoming ROM lands.  The helper canonicalises
-            // alias codes (``SCD`` → ``SEGACD``, ``GEN`` → ``MD``, …) before
-            // picking a candidate, which fixes the regression where catalog
-            // downloads for Sega CD landed in ``roms/SCD/`` instead of the
-            // user's existing ``roms/segacd/``.
-            val outDir = InstalledRomsScanner.resolveRomTargetDir(
-                scanRoot = File(romScanDir),
-                system = system,
-                romDirOverrides = romDirOverrides,
-            )
-            outDir.mkdirs()
-            val outFile = File(outDir, filename)
+        // Delegate folder selection to the shared helper so the download
+        // path, the installed-ROMs scanner, and the Steam Deck client all
+        // agree on where an incoming ROM lands.  The helper canonicalises
+        // alias codes (``SCD`` → ``SEGACD``, ``GEN`` → ``MD``, …) before
+        // picking a candidate, which fixes the regression where catalog
+        // downloads for Sega CD landed in ``roms/SCD/`` instead of the
+        // user's existing ``roms/segacd/``.
+        val outDir = InstalledRomsScanner.resolveRomTargetDir(
+            scanRoot = File(romScanDir),
+            system = system,
+            romDirOverrides = romDirOverrides,
+        )
+        outDir.mkdirs()
 
+        // CD-ROM style games (PS1 multi-track .cue+.bin, Saturn,
+        // Dreamcast, Sega CD) CAN live in a per-game subfolder by
+        // convention so the data track, cue sheet and any companion
+        // files stay grouped.  Whether to do that is the user's choice
+        // — gated on [cdGamesPerContentFolder] from settings, mirroring
+        // the same toggle that controls SAVE-folder layout.  When off,
+        // CD ROMs land flat in ``<outDir>/<filename>``.
+        val canonicalSystem = SystemAliases.normalizeSystemCode(system)
+        val finalDir = if (cdGamesPerContentFolder && canonicalSystem in CD_FOLDER_SYSTEMS) {
+            val stem = filename.substringBeforeLast('.', filename)
+            File(outDir, stem).also { it.mkdirs() }
+        } else {
+            outDir
+        }
+        val outFile = File(finalDir, filename)
+
+        try {
             body.byteStream().use { input ->
                 outFile.outputStream().use { output ->
                     val buffer = ByteArray(ROM_BUFFER_SIZE)
@@ -589,13 +643,14 @@ class SyncEngine(
                     }
                 }
             }
-
-            Log.i(TAG, "ROM downloaded: ${outFile.absolutePath} (${outFile.length()} bytes)")
-            outFile
-        } catch (e: Exception) {
-            Log.e(TAG, "downloadRom failed for $romId", e)
-            null
+        } catch (e: IOException) {
+            Log.e(TAG, "downloadRom write/stream error for $romId", e)
+            runCatching { outFile.delete() }
+            throw e
         }
+
+        Log.i(TAG, "ROM downloaded: ${outFile.absolutePath} (${outFile.length()} bytes)")
+        return outFile
     }
 
     private suspend fun downloadPs1Card(entry: SaveEntry, titleId: String): Boolean {
@@ -684,7 +739,13 @@ class SyncEngine(
             if (files.isEmpty()) return false
             slotDir.mkdirs()
             for ((name, data) in files) {
-                File(slotDir, name).writeBytes(data)
+                val target = safeChildFile(slotDir, name)
+                if (target == null) {
+                    Log.w(TAG, "Rejected unsafe bundle entry name '$name' for $titleId")
+                    continue
+                }
+                target.parentFile?.mkdirs()
+                target.writeBytes(data)
             }
             true
         } catch (e: Exception) {
@@ -711,7 +772,11 @@ class SyncEngine(
             }
             saveDir.mkdirs()
             for ((name, data) in files) {
-                val target = File(saveDir, name)
+                val target = safeChildFile(saveDir, name)
+                if (target == null) {
+                    Log.w(TAG, "Rejected unsafe bundle entry name '$name' for $titleId")
+                    continue
+                }
                 target.parentFile?.mkdirs()
                 target.writeBytes(data)
             }
@@ -791,8 +856,10 @@ class SyncEngine(
         val zis = java.util.zip.ZipInputStream(bais)
         var entry = zis.nextEntry
         while (entry != null) {
-            val outFile = java.io.File(targetDir, entry.name)
-            if (entry.isDirectory) {
+            val outFile = safeChildFile(targetDir, entry.name)
+            if (outFile == null) {
+                Log.w(TAG, "Rejected unsafe zip entry name '${entry.name}'")
+            } else if (entry.isDirectory) {
                 outFile.mkdirs()
             } else {
                 outFile.parentFile?.mkdirs()
@@ -804,6 +871,33 @@ class SyncEngine(
             entry = zis.nextEntry
         }
         zis.close()
+    }
+
+    /**
+     * Resolves [name] under [baseDir] and returns the [File] only if it stays
+     * within [baseDir] (defends against path traversal / Zip-Slip from
+     * server-controlled bundle and archive entry names). Returns null when the
+     * resolved path would escape the directory.
+     */
+    /**
+     * Reduces a server/header-supplied filename to a single safe path segment
+     * (strips any directory components and rejects ``.``/``..``). Returns null
+     * if nothing usable remains.
+     */
+    private fun sanitizeDownloadName(name: String): String? {
+        val base = name.replace('\\', '/').substringAfterLast('/').trim()
+        return if (base.isEmpty() || base == "." || base == "..") null else base
+    }
+
+    private fun safeChildFile(baseDir: File, name: String): File? {
+        val target = File(baseDir, name)
+        val basePath = baseDir.canonicalPath
+        val targetPath = target.canonicalPath
+        return if (targetPath == basePath || targetPath.startsWith(basePath + File.separator)) {
+            target
+        } else {
+            null
+        }
     }
 
     private fun extractErrorDetail(body: String): String {

@@ -163,6 +163,7 @@ class ScanWorker(QThread):
                 _scan_debug_log_path,
                 compare_with_server,
                 scan_profile,
+                SyncUserError,
             )
 
             if _scan_debug_enabled():
@@ -185,28 +186,39 @@ class ScanWorker(QThread):
             # ── Phase 1: fast scan (saves only, no ROM walk) ──────────────────
             # Scan just the save folders so users see results immediately.
             partial_saves = []
-            for profile in self.profiles:
-                self._emit_progress(f"Quick scan '{profile.get('name', '')}'…")
-                partial_saves.extend(
-                    scan_profile(
-                        profile,
-                        progress_callback=self._emit_progress,
-                        enable_auto_normalize=self.enable_auto_normalize,
-                        saves_only=True,
-                    )
-                )
-            self._emit_progress("Comparing with server…", 0, max(len(partial_saves), 1))
-            partial_statuses = compare_with_server(
-                partial_saves,
-                self.base_url,
-                self.headers,
-                systems_filter=systems_filter or None,
-                progress_callback=self._emit_progress,
+            ftp_only = all(
+                profile.get("device_type") == "MemCard Pro FTP"
+                for profile in self.profiles
             )
-            self.partial_result_ready.emit(partial_statuses)
+            if not ftp_only:
+                for profile in self.profiles:
+                    self._emit_progress(f"Quick scan '{profile.get('name', '')}'…")
+                    partial_saves.extend(
+                        scan_profile(
+                            profile,
+                            progress_callback=self._emit_progress,
+                            enable_auto_normalize=self.enable_auto_normalize,
+                            saves_only=True,
+                        )
+                    )
+                self._emit_progress(
+                    "Comparing with server…", 0, max(len(partial_saves), 1)
+                )
+                partial_statuses = compare_with_server(
+                    partial_saves,
+                    self.base_url,
+                    self.headers,
+                    systems_filter=systems_filter or None,
+                    progress_callback=self._emit_progress,
+                )
+                self.partial_result_ready.emit(partial_statuses)
 
             # ── Phase 2: full scan (ROM library walk for ROM-only entries) ────
-            self._emit_progress("Scanning ROM library…", 0, 0)
+            self._emit_progress(
+                "Scanning remote card files…" if ftp_only else "Scanning ROM library…",
+                0,
+                0,
+            )
             all_saves = []
             for profile in self.profiles:
                 self._emit_progress(f"Full scan '{profile.get('name', '')}'…")
@@ -228,6 +240,8 @@ class ScanWorker(QThread):
             self.result_ready.emit(statuses)
         except InterruptedError:
             self.error.emit("__SCAN_CANCELLED__")
+        except SyncUserError as e:
+            self.error.emit(str(e))
         except Exception as e:
             import traceback
 
@@ -812,6 +826,10 @@ class SyncTab(QWidget):
             try:
                 profile = self.profile_combo.currentData() or {}
                 is_saroo = profile.get("device_type") == "SAROO"
+                is_memcard_pro = profile.get("device_type") in {
+                    "MemCard Pro",
+                    "MemCard Pro FTP",
+                }
                 save_exists = getattr(st.save, "save_exists", True)
                 if (
                     st.status in ("local_newer", "not_on_server")
@@ -854,6 +872,18 @@ class SyncTab(QWidget):
                             headers,
                             system=st.save.system,
                         )
+                        if is_memcard_pro and (st.save.system or "").upper() in {
+                            "PS1",
+                            "PS2",
+                        }:
+                            for path in [
+                                st.save.path,
+                                *getattr(st.save, "alternate_paths", []),
+                            ]:
+                                if path is not None:
+                                    self._finalize_memcard_pro_download(
+                                        path, st.save.game_name
+                                    )
                         self._update_row_status(
                             idx, "up_to_date", new_path=st.save.path
                         )
@@ -871,6 +901,13 @@ class SyncTab(QWidget):
                         if is_saroo:
                             self._finalize_saroo_download(
                                 st.save.title_id, dest_path, profile
+                            )
+                        if is_memcard_pro and (st.save.system or "").upper() in {
+                            "PS1",
+                            "PS2",
+                        }:
+                            self._finalize_memcard_pro_download(
+                                dest_path, st.save.game_name
                             )
                         self._update_row_status(idx, "up_to_date", new_path=dest_path)
                         synced += 1
@@ -1022,18 +1059,9 @@ class SyncTab(QWidget):
 
     def _finalize_memcard_pro_download(self, path: Path, game_name: str):
         """Write MemCard Pro companion metadata after a server download."""
-        serial_dir = path.parent.name
-        if not serial_dir:
-            return
-        if path.suffix.lower() == ".mc2":
-            txt_path = path.parent / "name.txt"
-        else:
-            txt_name = (
-                re.sub(r'[<>:"/\\|?*]', "_", (game_name or "").strip()) or serial_dir
-            )
-            txt_path = path.parent / f"{txt_name}.txt"
-        txt_path.parent.mkdir(parents=True, exist_ok=True)
-        txt_path.write_text((game_name or serial_dir).strip() + "\n", encoding="utf-8")
+        from sync_engine import finalize_memcard_pro_download
+
+        finalize_memcard_pro_download(path, game_name)
 
     def _finalize_saroo_download(
         self, title_id: str, bkr_path: Path, profile: dict
@@ -1112,6 +1140,7 @@ class SyncTab(QWidget):
             POCKET_OPENFPGA_FOLDER_MAP,
             RETROARCH_CORE_MAP,
             _make_title_id_with_region,
+            build_memcard_pro_ftp_path,
             resolve_save_ext,
         )
 
@@ -1206,6 +1235,9 @@ class SyncTab(QWidget):
                     folder_name = f"DL-DOL-{gc_code}-USA"
                 return save_root / folder_name / f"{folder_name}-1.raw"
             return None
+
+        if device_type == "MemCard Pro FTP":
+            return build_memcard_pro_ftp_path(profile, st.save.title_id, system)
 
         if device_type == "SAROO":
             # For server-only downloads, prefer the mednafen save folder so the
@@ -1496,7 +1528,7 @@ class SyncTab(QWidget):
                 system=st.save.system,
             )
             profile = self.profile_combo.currentData() or {}
-            if profile.get("device_type") == "MemCard Pro" and (
+            if profile.get("device_type") in {"MemCard Pro", "MemCard Pro FTP"} and (
                 st.save.system or ""
             ).upper() in {"PS1", "PS2"}:
                 for path in target_paths:

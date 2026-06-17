@@ -76,14 +76,67 @@ _LETTER_DIGIT_BOUNDARY_RE = re.compile(
 _MSU_TRACK_RE = re.compile(r"^(.+)-(\d+)\.pcm$", re.IGNORECASE)
 
 _SPECIAL_TAG_RE = re.compile(
-    r"\((?:Beta\s*\d*|Proto\s*\d*|Demo|Sample)\)",
+    r"\((?:Beta\s*\d*|Proto\s*\d*|Demo|Sample|Unl|"
+    r"[A-Za-z0-9]+\s*Conversion|Conversion|"
+    r"Hack|Aftermarket|Homebrew|Pirate|Bootleg|Enhancement)\)",
     re.IGNORECASE,
 )
 
 
 def _has_special_tag(name: str) -> bool:
-    """Return True if name contains a Beta/Proto/Demo/Sample/Unl tag."""
+    """Return True if name contains a hack/conversion/special-release tag.
+
+    Covers Beta/Proto/Demo/Sample/Unl plus aftermarket/hack/conversion variants
+    like ``(NES Conversion)`` or ``(Aftermarket)`` so they don't win header
+    lookups for unrelated canonical games.
+    """
     return bool(_SPECIAL_TAG_RE.search(name))
+
+
+# Parenthetical tags that denote a compilation / re-release rather than a
+# distinct game.  These are the redundant suffixes No-Intro/Redump attach to the
+# representative cart of a title (e.g. "(SEGA Classic Collection)") that users
+# don't want appended to an otherwise-clean filename.
+_COSMETIC_TAG_RE = re.compile(
+    r"\s*\([^)]*\b(?:"
+    r"Classic|Classics|Collection|Compilation|Anthology|Selection|"
+    r"Virtual\s*Console|Switch\s*Online|e[-\s]?Shop|PSN|Steam|GameTap|"
+    r"GameCube|Wii\s*U|Wii|3DS|Mini|Sega\s*Ages|Namco\s*Museum|"
+    r"Greatest\s*Hits|Player's\s*Choice|Platinum|Reprint"
+    r")\b[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_known_ext(filename: str) -> str:
+    """Drop a single trailing ROM/file extension from *filename*."""
+    dot = filename.rfind(".")
+    if 0 < dot and len(filename) - dot - 1 <= 5 and filename[dot + 1 :].isalnum():
+        return filename[:dot]
+    return filename
+
+
+def prefer_source_name_over_cosmetic(source_filename: str, canonical: str) -> str:
+    """Keep the source's clean name when *canonical* only adds a cosmetic tag.
+
+    Name-based DAT matching (header/fuzzy/folder — not CRC/serial) snaps a file
+    to the representative DAT entry for its title, which may carry a redundant
+    compilation/re-release suffix like ``(SEGA Classic Collection)``.  When the
+    source file lacks any such tag and the canonical matches it apart from that
+    suffix, return the source's own (extension-stripped) name so we don't
+    "upgrade" a plain dump to a compilation variant.  Returns *canonical*
+    unchanged when no cosmetic-only difference is detected.
+    """
+    if not _COSMETIC_TAG_RE.search(canonical):
+        return canonical
+    src_stem = _strip_known_ext(source_filename)
+    if _COSMETIC_TAG_RE.search(src_stem):
+        return canonical  # source legitimately carries the tag — keep canonical
+    stripped = _COSMETIC_TAG_RE.sub("", canonical)
+    stripped = re.sub(r"\s{2,}", " ", stripped).strip()
+    if normalize_name(stripped) == normalize_name(src_stem):
+        return src_stem
+    return canonical
 
 
 _PATCH_SUFFIX_RE = re.compile(
@@ -306,6 +359,130 @@ def _crc32_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             crc = zlib.crc32(chunk, crc)
     return f"{crc & 0xFFFFFFFF:08X}"
+
+
+# ---------------------------------------------------------------------------
+# Sony disc-serial extraction (PS1 / PS2 / PSP / PS3)
+# ---------------------------------------------------------------------------
+
+# Systems that ship with a 4-letter + 5-digit Sony disc serial in their DAT
+# and whose ROM filenames commonly encode the serial.  Used to gate the
+# serial-based lookup so we don't waste cycles on, say, SNES files.
+_SERIAL_LOOKUP_SYSTEMS: frozenset[str] = frozenset({"PS1", "PS2", "PSP", "PS3"})
+
+# Every 4-letter prefix that the libretro PS1/PS2/PSP/PS3 DATs actually emit.
+# Kept here (rather than in systems.py) so the normalizer has zero run-time
+# deps on the config layer.
+_PS_DISC_SERIAL_PREFIXES: frozenset[str] = frozenset(
+    {
+        # PS1 / PS2 (Sony)
+        "SLUS", "SCUS", "SCED", "PAPX", "PBPX",
+        "SLES", "SCES",
+        "SLPS", "SLPM", "SCPS", "SCPM", "SLPN",
+        # Other-region Sony
+        "SCAJ", "SLAJ", "SLKA", "SCKA", "SLEJ",
+        # PSP UMD
+        "ULUS", "ULES", "ULJM", "ULJS", "UCUS", "UCES", "UCJS", "UCJM",
+        "UCKS", "UCAS", "ULKS", "ULAS",
+        # PSP / PSN downloadable
+        "NPUG", "NPEG", "NPJG", "NPUH", "NPEH", "NPJH",
+        # PS3 retail Blu-ray (BL** = retail, BC** = first-party Sony retail)
+        "BLUS", "BLES", "BLJM", "BLJS", "BLAS", "BLKS",
+        "BCUS", "BCES", "BCJS", "BCAS", "BCKS",
+        # PS3 PSN downloadable (NP*B*)
+        "NPUB", "NPEB", "NPJB", "NPHB", "NPIB",
+        # PS3 PSN demos / addons (less common but appear in DATs)
+        "NPUA", "NPEA", "NPJA", "NPHA", "NPIA",
+    }
+)
+
+# Matches a PlayStation disc serial embedded in a filename.
+#
+# Handles the three separator conventions seen in the wild:
+#     SCES_538.51.game name.iso   -> underscore + dot
+#     SCES-53851 - Foo.iso        -> bare hyphen
+#     SLUS20265 - Bar.iso         -> no separator
+#
+# The leading lookbehind prevents matching inside longer tokens (e.g. a CRC
+# like "ASLUS20265F").  The trailing lookahead keeps us from eating into
+# suffixes such as "SLUS-20265GH" – we match the 5-digit base and the lookup
+# table holds both the bare and suffixed variants.
+_PS_SERIAL_RE = re.compile(
+    r"(?:^|(?<=[^A-Za-z0-9]))"
+    r"([A-Za-z]{4})[-_ ]?(\d{3})[._\- ]?(\d{2})"
+    r"(?=$|[^0-9])",
+)
+
+
+def extract_ps_serial(filename: str) -> str | None:
+    """Extract a Sony PlayStation disc serial from a ROM filename.
+
+    Returns the canonical ``PREFIX-NNNNN`` form (matching the libretro DAT
+    representation), or None when no recognised serial is present.
+
+    Examples
+    --------
+    >>> extract_ps_serial("SCES_538.51.game name.iso")
+    'SCES-53851'
+    >>> extract_ps_serial("SLUS-20265 - Agent Under Fire.iso")
+    'SLUS-20265'
+    >>> extract_ps_serial("SLPM65002 - 0 Story.iso")
+    'SLPM-65002'
+    >>> extract_ps_serial("Super Mario 64.z64") is None
+    True
+    """
+    # Drop the extension so numeric extensions (e.g. ".z64") can't trip the
+    # digit portion of the match.
+    stem = Path(filename).stem
+    for match in _PS_SERIAL_RE.finditer(stem):
+        prefix = match.group(1).upper()
+        if prefix in _PS_DISC_SERIAL_PREFIXES:
+            return f"{prefix}-{match.group(2)}{match.group(3)}"
+    return None
+
+
+def supports_serial_lookup(system: str) -> bool:
+    """True when the given system code has a usable serial-based lookup."""
+    return (system or "").upper() in _SERIAL_LOOKUP_SYSTEMS
+
+
+def lookup_serial(serial: str, serial_map: dict[str, str]) -> str | None:
+    """Look up a serial in a libretro ``{serial: name}`` map.
+
+    Falls back to matching a variant with trailing region / disc index suffixes
+    when the bare serial is absent, e.g. ``SLUS-20265`` → ``SLUS-20265GH``.
+    """
+    if not serial or not serial_map:
+        return None
+    if serial in serial_map:
+        return serial_map[serial]
+    prefix = serial + "-"
+    prefix_slash = serial + "/"
+    for candidate, name in serial_map.items():
+        if candidate.startswith(prefix) or candidate.startswith(prefix_slash):
+            return name
+    # Some DATs pad the digit portion with a suffix letter (SLUS-20265GH).
+    # Accept that too.
+    for candidate, name in serial_map.items():
+        if candidate.startswith(serial) and len(candidate) > len(serial):
+            tail = candidate[len(serial) :]
+            if tail and not tail[0].isdigit():
+                return name
+    return None
+
+
+def load_serial_map(dat_path: Path) -> dict[str, str]:
+    """Return a ``{serial: canonical_name}`` map from ``dat_path``.
+
+    Thin wrapper over :func:`load_libretro_dat` kept for clarity at call
+    sites — libretro clrmamepro DATs carry explicit ``serial "..."`` fields,
+    while No-Intro XML DATs generally do not, so callers can rely on an empty
+    result being a real answer.
+    """
+    try:
+        return load_libretro_dat(dat_path)
+    except Exception:
+        return {}
 
 
 def load_no_intro_dat(dat_path: Path) -> dict[str, str]:
@@ -1295,12 +1472,66 @@ def find_region_preferred(
     return canonical
 
 
+# Captures the disc number from a ``(Disc 2)`` / ``(Disk 2)`` / ``(CD 2)`` tag.
+# Anchored on the opening paren so it never matches inside ``(Sega CD 32X)``.
+_DISC_NUM_RE = re.compile(r"\((?:Disc|Disk|CD)\s*(\d+)\)", re.IGNORECASE)
+
+
+def extract_disc_number(name: str) -> int | None:
+    """Return the disc number from a ``(Disc N)`` tag, or None if absent."""
+    m = _DISC_NUM_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def apply_source_disc(
+    canonical: str, no_intro: dict[str, str], source_filename: str
+) -> str:
+    """Correct a name-matched canonical to the disc the SOURCE file actually is.
+
+    Name matching uses a disc-agnostic index, so every disc of a multi-disc game
+    resolves to the same (disc 1) canonical.  When the source filename carries a
+    ``(Disc N)`` tag, return the real DAT entry for disc N of the same title —
+    preserving per-disc subtitles like ``(Juice)`` — or, if the DAT has no such
+    entry, rewrite the disc number on the canonical so discs stay distinct.
+    """
+    src_disc = extract_disc_number(_strip_known_ext(source_filename))
+    if src_disc is None:
+        return canonical  # source isn't a disc — leave canonical as-is
+    if extract_disc_number(canonical) == src_disc:
+        return canonical  # already the right disc
+
+    base = normalize_name(canonical)  # disc/region/subtitle stripped
+    can_regions = set(extract_region_hints(canonical))
+    best: tuple[int, str] | None = None
+    for cand in no_intro.values():
+        if extract_disc_number(cand) != src_disc:
+            continue
+        if normalize_name(cand) != base:
+            continue
+        cand_regions = set(extract_region_hints(cand))
+        region_score = (
+            0 if (can_regions and cand_regions and can_regions & cand_regions) else 1
+        )
+        if best is None or region_score < best[0]:
+            best = (region_score, cand)
+    if best is not None:
+        return best[1]
+
+    # DAT has no disc-N entry — rewrite the disc number to keep discs distinct.
+    if _DISC_NUM_RE.search(canonical):
+        return _DISC_NUM_RE.sub(f"(Disc {src_disc})", canonical, count=1)
+    return f"{canonical} (Disc {src_disc})"
+
+
 def find_companion_files(rom_path: Path, new_stem: str) -> list[tuple[Path, Path]]:
     """Return companion files that should be renamed alongside the given ROM.
 
     Handles:
-    - SNES MSU-1: ``{stem}.msu`` + ``{stem}-N.pcm`` audio tracks
-    - CUE/BIN:    ``{stem}.cue`` sheet alongside a ``{stem}.bin`` ROM
+    - SNES/Genesis MSU-1: when a ``{stem}.msu`` manifest sibling exists, the ROM
+      is treated as an MSU pack and EVERY sibling file whose name begins with
+      ``{stem}.`` or ``{stem}-`` is renamed (covers ``.msu``, ``.xml``, ``.bml``,
+      ``.txt``, plus ``-NNN.pcm`` audio tracks with arbitrary track numbers).
+    - CUE/BIN: ``{stem}.cue`` sheet alongside a ``{stem}.bin`` ROM.
 
     Returns a list of (old_path, new_path) pairs (only existing files).
     """
@@ -1309,22 +1540,25 @@ def find_companion_files(rom_path: Path, new_stem: str) -> list[tuple[Path, Path
     stem = rom_path.stem
     parent = rom_path.parent
 
-    if ext in (".sfc", ".smc"):
-        # MSU-1 manifest
+    if ext in (".sfc", ".smc", ".md", ".bin", ".gen", ".smd"):
         msu = parent / (stem + ".msu")
         if msu.exists():
-            companions.append((msu, parent / (new_stem + ".msu")))
-        # PCM audio tracks: stem-1.pcm, stem-2.pcm, …
-        try:
-            for f in sorted(parent.iterdir()):
-                m = _MSU_TRACK_RE.match(f.name)
-                if m and m.group(1) == stem:
-                    companions.append((f, parent / f"{new_stem}-{m.group(2)}.pcm"))
-        except OSError:
-            pass
+            try:
+                for f in sorted(parent.iterdir()):
+                    if not f.is_file() or f == rom_path:
+                        continue
+                    name = f.name
+                    if not name.startswith(stem):
+                        continue
+                    suffix = name[len(stem):]
+                    if not suffix or suffix[0] not in ".-":
+                        continue
+                    companions.append((f, parent / (new_stem + suffix)))
+            except OSError:
+                pass
+            return companions
 
-    elif ext == ".bin":
-        # CUE sheet that references this .bin
+    if ext == ".bin":
         cue = parent / (stem + ".cue")
         if cue.exists():
             companions.append((cue, parent / (new_stem + ".cue")))

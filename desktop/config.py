@@ -21,6 +21,8 @@ DEVICE_TYPES = [
     "SAROO",
     "EmuDeck",
     "MemCard Pro",
+    "MemCard Pro FTP",
+    "PSIO",
     "CD Folder",
 ]
 
@@ -72,6 +74,76 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def get_sd_card_location() -> str:
+    """Current drive/root where the removable SD card is mounted right now.
+
+    SD card readers get a different drive letter on each reconnect, so profiles
+    flagged ``is_sd_card`` store their paths against a fixed letter and have it
+    rewritten to this value at operation time. Empty = no remap.
+    """
+    return str(load_config().get("sd_card_location", "") or "").strip()
+
+
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def remap_sd_path(path: str, sd_location: str | None = None) -> str:
+    """Swap the leading drive letter of *path* for the SD card's current drive.
+
+    ``J:/MEGA/gamedata`` with sd_location ``K:`` -> ``K:/MEGA/gamedata``.
+    Paths without a drive letter, or an empty/invalid sd_location, are returned
+    unchanged. Only the drive letter of *sd_location* is used (any subpath in it
+    is ignored), so ``K:``, ``K:\\`` and ``K:\\foo`` all map drives to ``K:``.
+    """
+    if not path:
+        return path
+    if sd_location is None:
+        sd_location = get_sd_card_location()
+    m = _DRIVE_RE.match((sd_location or "").strip())
+    if not m:
+        return path
+    new_drive = m.group(0)
+    if _DRIVE_RE.match(path):
+        return new_drive + path[2:]
+    return path
+
+
+def resolve_profile_for_sd(profile: dict) -> dict:
+    """Return a profile copy with SD-card paths remapped to the current drive.
+
+    No-op (returns the original object) unless the profile is flagged
+    ``is_sd_card`` and a global ``sd_card_location`` is configured.
+    """
+    if not isinstance(profile, dict) or not profile.get("is_sd_card"):
+        return profile
+    sd = get_sd_card_location()
+    if not sd:
+        return profile
+    p = dict(profile)
+    for key in ("path", "save_folder", "dat_path"):
+        if p.get(key):
+            p[key] = remap_sd_path(p[key], sd)
+    if isinstance(p.get("systems"), list):
+        p["systems"] = [
+            {
+                **s,
+                **(
+                    {"save_folder": remap_sd_path(s["save_folder"], sd)}
+                    if s.get("save_folder")
+                    else {}
+                ),
+                **(
+                    {"rom_folder": remap_sd_path(s["rom_folder"], sd)}
+                    if s.get("rom_folder")
+                    else {}
+                ),
+            }
+            for s in p["systems"]
+            if isinstance(s, dict)
+        ]
+    return p
 
 
 def get_api_headers() -> dict:

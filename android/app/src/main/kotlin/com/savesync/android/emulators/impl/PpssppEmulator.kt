@@ -7,11 +7,43 @@ import java.io.File
 
 class PpssppEmulator(
     private val romScanDir: String = "",
-    private val romDirOverrides: Map<String, String> = emptyMap()
+    private val romDirOverrides: Map<String, String> = emptyMap(),
+    private val storageBaseDir: File? = null,
+    /**
+     * Optional explicit save folder override, configured in the Emulator
+     * Configuration screen.  Takes precedence over [storageBaseDir]'s
+     * ``PSP/SAVEDATA`` auto-detection when set.
+     */
+    private val saveDirOverride: String? = null
 ) : EmulatorBase() {
 
     override val name: String = "PPSSPP"
     override val systemPrefix: String = "PSP"
+
+    companion object {
+        /** Key used in [com.savesync.android.storage.Settings.saveDirOverrides]. */
+        const val EMULATOR_KEY = "PPSSPP"
+
+        fun findSaveDataDir(baseDir: File, allowNonExistent: Boolean = false): File? {
+            val candidates = listOf("PSP/SAVEDATA", "psp/SAVEDATA", "PSP/savedata")
+            val existing = candidates
+                .map { File(baseDir, it) }
+                .firstOrNull { it.exists() && it.isDirectory }
+            if (existing != null) return existing
+            return if (allowNonExistent) File(baseDir, "PSP/SAVEDATA") else null
+        }
+
+        /**
+         * Predicted SAVEDATA slot directory for a PSP title_id.  The server hands
+         * back the full slot name (e.g. "ULUS10567DATA"), so we use it verbatim
+         * as the directory name — matches what the PPSSPP scanner yields once a
+         * save actually exists on disk.
+         */
+        fun defaultSlotDir(baseDir: File, titleId: String): File? {
+            val root = findSaveDataDir(baseDir, allowNonExistent = true) ?: return null
+            return File(root, titleId)
+        }
+    }
 
     // PSP product code: 4 uppercase letters + 5 digits (e.g. ULUS10272)
     private val productCodeRegex = Regex("^[A-Z]{4}[0-9]{5}")
@@ -50,8 +82,15 @@ class PpssppEmulator(
     }
 
     private fun findSaveDataDir(allowNonExistent: Boolean = false): File? {
-        val primary = File(baseDir, "PSP/SAVEDATA")
-        val existing = firstExisting("PSP/SAVEDATA", "psp/SAVEDATA", "PSP/savedata")
+        // Explicit user override wins over storageBaseDir's auto-detection.
+        if (!saveDirOverride.isNullOrBlank()) {
+            val overrideDir = File(saveDirOverride)
+            if (overrideDir.exists() && overrideDir.isDirectory) return overrideDir
+            if (allowNonExistent) return overrideDir
+        }
+        val root = storageBaseDir ?: baseDir
+        val primary = File(root, "PSP/SAVEDATA")
+        val existing = findSaveDataDir(root, allowNonExistent = false)
         return when {
             existing != null -> existing
             allowNonExistent -> primary
@@ -74,7 +113,7 @@ class PpssppEmulator(
             "PSP/game",
             "psp/game"
         ).forEach { rel ->
-            val dir = File(baseDir, rel)
+            val dir = File(storageBaseDir ?: baseDir, rel)
             if (dir.exists() && dir.isDirectory) dirs.add(dir)
         }
 

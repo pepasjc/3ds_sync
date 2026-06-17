@@ -232,3 +232,43 @@ class GameListView(QListView):
     def page_down(self) -> None:
         step = self._viewport_rows()
         self.move_selection(step, QAbstractItemView.ScrollHint.PositionAtBottom)
+
+    def alphabet_jump(self, direction: int) -> None:
+        # Hold-to-accelerate ramp-up: when d-pad left/right is held long
+        # enough that we've already paged-scrolled at high speed for a
+        # second-plus, switch to jumping to the next display-name initial
+        # so the user can sweep through A → B → C … in a long list.
+        rows = self._model.rowCount()
+        if rows == 0:
+            return
+        cur = self.currentIndex()
+        cur_row = cur.row() if cur.isValid() else 0
+        cur_entry = self._model.entry_at(cur_row)
+        cur_letter = _first_letter(cur_entry.display_name if cur_entry else "")
+        step = 1 if direction > 0 else -1
+        target = None
+        row = cur_row + step
+        while 0 <= row < rows:
+            entry = self._model.entry_at(row)
+            if entry is not None:
+                letter = _first_letter(entry.display_name)
+                if letter and letter != cur_letter:
+                    target = row
+                    break
+            row += step
+        if target is None:
+            target = rows - 1 if direction > 0 else 0
+        new_idx = self._model.index(target, 0)
+        self.setCurrentIndex(new_idx)
+        hint = (QAbstractItemView.ScrollHint.PositionAtTop
+                if direction > 0 else
+                QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.scrollTo(new_idx, hint)
+
+
+def _first_letter(name: str) -> str:
+    """Uppercase first alphabetic character of *name*, '' if none."""
+    for ch in name:
+        if ch.isalpha():
+            return ch.upper()
+    return ""

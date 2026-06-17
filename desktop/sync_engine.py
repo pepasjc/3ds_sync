@@ -7,14 +7,19 @@ device sync workflow independent from the server package layout.
 from __future__ import annotations
 
 import hashlib
+import ftplib
+import io
 import json
 import os
+import posixpath
 import re
+import socket
 import struct
 import time
 import zipfile
 import zlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -87,8 +92,11 @@ def _reset_debug_scan_log() -> None:
     if not _scan_debug_enabled():
         return
     path = _scan_debug_log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("", encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _debug_scan(message: str) -> None:
@@ -97,9 +105,12 @@ def _debug_scan(message: str) -> None:
     line = f"[sync-debug] {message}"
     print(line)
     path = _scan_debug_log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def _extract_regions(stem: str) -> list[str]:
@@ -505,6 +516,669 @@ class SyncStatus:
     mapping_note: str = ""
 
 
+class SyncUserError(RuntimeError):
+    """Raised for profile/setup issues that should be shown without a traceback."""
+
+
+# ---------------------------------------------------------------------------
+# FTP-backed save paths
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FtpEntry:
+    name: str
+    path: str
+    is_dir: bool
+    size: int = 0
+    mtime: float = 0.0
+
+
+@dataclass(frozen=True)
+class FtpSavePath:
+    """Small path-like object for save files stored on a plain FTP server."""
+
+    host: str
+    port: int
+    username: str
+    password: str
+    remote_path: str
+    passive: bool = True
+    timeout: int = 30
+
+    @property
+    def name(self) -> str:
+        return posixpath.basename(self.remote_path.rstrip("/"))
+
+    @property
+    def stem(self) -> str:
+        return posixpath.splitext(self.name)[0]
+
+    @property
+    def suffix(self) -> str:
+        return posixpath.splitext(self.name)[1]
+
+    def __str__(self) -> str:
+        host = self.host or "unknown"
+        port = f":{self.port}" if self.port and self.port != 21 else ""
+        return f"ftp://{host}{port}{self.remote_path}"
+
+    def sync_key(self) -> str:
+        return str(self)
+
+    def exists(self) -> bool:
+        try:
+            with _ftp_connection(
+                self.host,
+                self.port,
+                self.username,
+                self.password,
+                self.passive,
+                self.timeout,
+            ) as ftp:
+                return _ftp_path_exists(ftp, self.remote_path)
+        except Exception:
+            return False
+
+    def is_file(self) -> bool:
+        return self.exists()
+
+    def is_dir(self) -> bool:
+        return False
+
+    def read_bytes(self) -> bytes:
+        with _ftp_connection(
+            self.host,
+            self.port,
+            self.username,
+            self.password,
+            self.passive,
+            self.timeout,
+        ) as ftp:
+            expected_size = _ftp_size(ftp, self.remote_path)
+            return _ftp_download_bytes(
+                ftp,
+                self.remote_path,
+                expected_size=expected_size if expected_size > 0 else None,
+            )
+
+    def write_bytes(self, data: bytes) -> None:
+        with _ftp_connection(
+            self.host,
+            self.port,
+            self.username,
+            self.password,
+            self.passive,
+            self.timeout,
+        ) as ftp:
+            _ftp_upload_bytes(ftp, self.remote_path, data)
+        _invalidate_remote_hash_path(self.remote_path)
+
+
+class _FtpSession:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        passive: bool,
+        timeout: int,
+    ):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.passive = passive
+        self.timeout = timeout
+        self.ftp: ftplib.FTP | None = None
+
+    def __enter__(self) -> ftplib.FTP:
+        ftp = ftplib.FTP()
+        try:
+            ftp.connect(self.host, self.port, timeout=self.timeout)
+            if self.username:
+                ftp.login(self.username, self.password)
+            else:
+                ftp.login()
+            ftp.set_pasv(self.passive)
+        except ftplib.error_perm as exc:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            message = str(exc)
+            if message.startswith("530"):
+                username = self.username or "(blank)"
+                raise SyncUserError(
+                    "MemCard Pro FTP login failed (530).\n\n"
+                    f"The desktop client sent username '{username}', but the "
+                    "MemCard Pro FTP server rejected the password. This usually "
+                    "means the credentials saved on the card are different from "
+                    "this profile, the FTP settings were saved but the card has "
+                    "not been power-cycled yet, or another FTP client is holding "
+                    "the card's single allowed connection.\n\n"
+                    "In the MemCard Pro WebUI, enable FTP Server, set a username "
+                    "and password, click Save, then manually power-cycle the "
+                    "console/card. Use the same username and password here. FTP "
+                    "settings should be plain FTP, passive mode, one connection."
+                ) from exc
+            raise SyncUserError(f"FTP login failed: {message}") from exc
+        except OSError as exc:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            raise SyncUserError(
+                f"Could not connect to FTP host {self.host}:{self.port}: {exc}"
+            ) from exc
+        self.ftp = ftp
+        return ftp
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.ftp is None:
+            return
+        try:
+            self.ftp.quit()
+        except Exception:
+            try:
+                self.ftp.close()
+            except Exception:
+                pass
+
+
+def _ftp_connection(
+    host: str,
+    port: int = 21,
+    username: str = "",
+    password: str = "",
+    passive: bool = True,
+    timeout: int = 30,
+) -> _FtpSession:
+    if not host:
+        raise OSError("FTP host is required.")
+    return _FtpSession(host, int(port or 21), username, password, passive, timeout)
+
+
+def _ftp_norm(path: str) -> str:
+    value = (path or "/").replace("\\", "/").strip()
+    if not value:
+        value = "/"
+    if not value.startswith("/"):
+        value = "/" + value
+    normalized = posixpath.normpath(value)
+    return "/" if normalized in {"", "."} else normalized
+
+
+def _ftp_join(base: str, *parts: str) -> str:
+    current = _ftp_norm(base)
+    for part in parts:
+        piece = str(part or "").strip("/")
+        if piece:
+            current = posixpath.join(current, piece)
+    return _ftp_norm(current)
+
+
+def _ftp_child_unless_named(base: str, child: str) -> str:
+    base = _ftp_norm(base)
+    if posixpath.basename(base).lower() == child.lower():
+        return base
+    return _ftp_join(base, child)
+
+
+def _ftp_parse_modify(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return (
+            datetime.strptime(value[:14], "%Y%m%d%H%M%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except ValueError:
+        return 0.0
+
+
+def _ftp_size(ftp: ftplib.FTP, path: str) -> int:
+    try:
+        ftp.voidcmd("TYPE I")
+    except Exception:
+        pass
+    try:
+        size = ftp.size(path)
+        return int(size or 0)
+    except Exception:
+        return 0
+
+
+def _ftp_mtime(ftp: ftplib.FTP, path: str) -> float:
+    try:
+        response = ftp.sendcmd(f"MDTM {path}")
+        if response.startswith("213 "):
+            return _ftp_parse_modify(response[4:].strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _ftp_is_dir(ftp: ftplib.FTP, path: str) -> bool:
+    try:
+        current = ftp.pwd()
+    except Exception:
+        current = ""
+    try:
+        ftp.cwd(path)
+        if current:
+            try:
+                ftp.cwd(current)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _ftp_dir_exists(ftp: ftplib.FTP, path: str) -> bool:
+    return _ftp_is_dir(ftp, _ftp_norm(path))
+
+
+def _ftp_path_exists(ftp: ftplib.FTP, path: str) -> bool:
+    path = _ftp_norm(path)
+    if _ftp_dir_exists(ftp, path):
+        return True
+    try:
+        ftp.voidcmd("TYPE I")
+    except Exception:
+        pass
+    try:
+        ftp.size(path)
+        return True
+    except Exception:
+        return False
+
+
+_FTP_PASV_RE = re.compile(
+    r"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)"
+)
+
+
+def _ftp_pasv_endpoint(ftp: ftplib.FTP) -> tuple[str, int]:
+    response = ftp.sendcmd("PASV")
+    match = _FTP_PASV_RE.search(response)
+    if not match:
+        raise ftplib.error_proto(response)
+    numbers = [int(part) for part in match.groups()]
+    host = ".".join(str(part) for part in numbers[:4])
+    port = numbers[4] * 256 + numbers[5]
+    return host, port
+
+
+def _ftp_transfer_bytes(
+    ftp: ftplib.FTP,
+    command: str,
+    expected_size: int | None = None,
+) -> bytes:
+    """Run a passive data-transfer command without ftplib's TYPE A/NLST path.
+
+    MemCard Pro's FTP server is intentionally tiny and can stall on the command
+    sequence Python's ``ftplib.nlst`` uses. This mirrors the sequence that works
+    reliably against the card: binary mode, PASV, open one data socket, command.
+    """
+    try:
+        ftp.voidcmd("TYPE I")
+        host, port = _ftp_pasv_endpoint(ftp)
+        timeout = None
+        sock = getattr(ftp, "sock", None)
+        if sock is not None:
+            timeout = sock.gettimeout()
+        with socket.create_connection((host, port), timeout=timeout) as data_sock:
+            response = ftp.sendcmd(command)
+            if not response.startswith(("125", "150")):
+                raise ftplib.error_reply(response)
+            chunks: list[bytes] = []
+            received = 0
+            while True:
+                chunk = data_sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+                if expected_size is not None and received >= expected_size:
+                    break
+        ftp.voidresp()
+        data = b"".join(chunks)
+        if expected_size is not None:
+            return data[:expected_size]
+        return data
+    except (TimeoutError, socket.timeout) as exc:
+        raise SyncUserError(
+            "MemCard Pro FTP data connection timed out.\n\n"
+            "Close FileZilla or any other FTP client, cancel any running scan, "
+            "then try again. The MemCard Pro FTP server supports only one "
+            "connection/transfer at a time and can require a card power-cycle "
+            "after a stalled transfer."
+        ) from exc
+
+
+def _ftp_store_transfer_bytes(ftp: ftplib.FTP, command: str, data: bytes) -> None:
+    try:
+        ftp.voidcmd("TYPE I")
+        host, port = _ftp_pasv_endpoint(ftp)
+        timeout = None
+        sock = getattr(ftp, "sock", None)
+        if sock is not None:
+            timeout = sock.gettimeout()
+        with socket.create_connection((host, port), timeout=timeout) as data_sock:
+            response = ftp.sendcmd(command)
+            if not response.startswith(("125", "150")):
+                raise ftplib.error_reply(response)
+            data_sock.sendall(data)
+        ftp.voidresp()
+    except TimeoutError as exc:
+        raise SyncUserError(
+            "MemCard Pro FTP upload timed out.\n\n"
+            "Close FileZilla or any other FTP client, cancel any running scan, "
+            "then try again. The MemCard Pro FTP server supports only one "
+            "connection/transfer at a time and can require a card power-cycle "
+            "after a stalled transfer."
+        ) from exc
+
+
+def _ftp_nlst(ftp: ftplib.FTP, path: str) -> list[str]:
+    path = _ftp_norm(path)
+    if not hasattr(ftp, "sock"):
+        try:
+            return [
+                name
+                for name, _facts in ftp.mlsd(path)
+                if name not in {".", ".."}
+            ]
+        except Exception:
+            return []
+    current = ""
+    try:
+        current = ftp.pwd()
+    except Exception:
+        pass
+    try:
+        ftp.cwd(path)
+        payload = _ftp_transfer_bytes(ftp, "NLST")
+    finally:
+        if current:
+            try:
+                ftp.cwd(current)
+            except Exception:
+                pass
+    text = payload.decode("utf-8", errors="replace")
+    names = [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
+    return names
+
+
+def _ftp_entries_from_names(path: str, names: list[str], is_dir: bool) -> list[FtpEntry]:
+    entries: list[FtpEntry] = []
+    for name in names:
+        clean_name = posixpath.basename(str(name).strip().rstrip("/"))
+        if not clean_name or clean_name in {".", ".."}:
+            continue
+        entries.append(
+            FtpEntry(
+                name=clean_name,
+                path=_ftp_join(path, clean_name),
+                is_dir=is_dir,
+            )
+        )
+    return sorted(entries, key=lambda item: item.name.lower())
+
+
+def _ftp_list_entries(ftp: ftplib.FTP, path: str) -> list[FtpEntry]:
+    path = _ftp_norm(path)
+    banner = getattr(ftp, "welcome", "") or ""
+    if "MemCardPRO FTP Server" not in banner:
+        try:
+            entries = []
+            for name, facts in ftp.mlsd(path):
+                if name in {".", ".."}:
+                    continue
+                full = _ftp_join(path, name)
+                entry_type = (facts.get("type") or "").lower()
+                is_dir = entry_type == "dir"
+                entries.append(
+                    FtpEntry(
+                        name=name,
+                        path=full,
+                        is_dir=is_dir,
+                        size=int(facts.get("size") or 0),
+                        mtime=_ftp_parse_modify(facts.get("modify")),
+                    )
+                )
+            return sorted(entries, key=lambda item: item.name.lower())
+        except Exception:
+            pass
+
+    try:
+        names = _ftp_nlst(ftp, path)
+    except SyncUserError:
+        raise
+    except Exception:
+        entries = []
+        try:
+            names = ftp.nlst(path)
+        except Exception:
+            return []
+
+    entries: list[FtpEntry] = []
+    for raw in names:
+        raw = str(raw).rstrip("/")
+        if not raw:
+            continue
+        if raw.startswith("/"):
+            full = _ftp_norm(raw)
+            name = posixpath.basename(full)
+        else:
+            name = posixpath.basename(raw)
+            full = _ftp_join(path, raw)
+        if name in {".", ".."}:
+            continue
+        is_dir = _ftp_is_dir(ftp, full)
+        entries.append(
+            FtpEntry(
+                name=name,
+                path=full,
+                is_dir=is_dir,
+                size=0 if is_dir else _ftp_size(ftp, full),
+                mtime=0.0 if is_dir else _ftp_mtime(ftp, full),
+            )
+        )
+    return sorted(entries, key=lambda item: item.name.lower())
+
+
+def _ftp_download_bytes(
+    ftp: ftplib.FTP,
+    path: str,
+    expected_size: int | None = None,
+) -> bytes:
+    if not hasattr(ftp, "sock"):
+        buffer = io.BytesIO()
+        ftp.retrbinary(f"RETR {_ftp_norm(path)}", buffer.write)
+        data = buffer.getvalue()
+        if expected_size is not None:
+            return data[:expected_size]
+        return data
+    return _ftp_transfer_bytes(
+        ftp,
+        f"RETR {_ftp_norm(path)}",
+        expected_size=expected_size,
+    )
+
+
+def _ftp_makedirs(ftp: ftplib.FTP, remote_dir: str) -> None:
+    remote_dir = _ftp_norm(remote_dir)
+    if remote_dir == "/":
+        return
+    current = ""
+    for part in remote_dir.strip("/").split("/"):
+        current = _ftp_join(current or "/", part)
+        if _ftp_dir_exists(ftp, current):
+            continue
+        try:
+            ftp.mkd(current)
+        except Exception:
+            pass
+
+
+def _ftp_upload_bytes(ftp: ftplib.FTP, path: str, data: bytes) -> None:
+    path = _ftp_norm(path)
+    parent = posixpath.dirname(path) or "/"
+    _ftp_makedirs(ftp, parent)
+    if not hasattr(ftp, "sock"):
+        ftp.storbinary(f"STOR {path}", io.BytesIO(data))
+        return
+    _ftp_store_transfer_bytes(ftp, f"STOR {path}", data)
+
+
+def _ftp_profile_root(profile: dict) -> str:
+    return _ftp_norm(profile.get("path", "/") or "/")
+
+
+def _ftp_profile_save_path(profile: dict, remote_path: str) -> FtpSavePath:
+    return FtpSavePath(
+        host=str(profile.get("ftp_host", "")).strip(),
+        port=int(profile.get("ftp_port", 21) or 21),
+        username=str(profile.get("ftp_username", "")),
+        password=str(profile.get("ftp_password", "")),
+        remote_path=_ftp_norm(remote_path),
+        passive=bool(profile.get("ftp_passive", True)),
+        timeout=int(profile.get("ftp_timeout", 30) or 30),
+    )
+
+
+def _ftp_existing_or_default_dir(
+    ftp: ftplib.FTP,
+    candidates: list[str],
+) -> str:
+    for candidate in candidates:
+        if _ftp_dir_exists(ftp, candidate):
+            return _ftp_norm(candidate)
+    return _ftp_norm(candidates[0] if candidates else "/")
+
+
+def _memcard_ftp_roots(root: str, system: str) -> list[str]:
+    system = system.upper()
+    root = _ftp_norm(root)
+    if system == "PS1":
+        return [_ftp_child_unless_named(root, "MemoryCards"), root]
+    if system == "PS2":
+        if posixpath.basename(root).lower() == "ps2":
+            return [root]
+        return [
+            _ftp_join(root, "PS2"),
+            _ftp_join(_ftp_child_unless_named(root, "MemoryCards"), "PS2"),
+            root,
+        ]
+    if system == "GC":
+        if posixpath.basename(root).lower() in {"gc", "gamecube"}:
+            return [root]
+        return [
+            _ftp_join(root, "GC"),
+            _ftp_join(_ftp_child_unless_named(root, "MemoryCards"), "GC"),
+            root,
+        ]
+    return [root]
+
+
+def is_ftp_save_path(path: object) -> bool:
+    return isinstance(path, FtpSavePath)
+
+
+def build_memcard_pro_ftp_path(
+    profile: dict,
+    title_id: str,
+    system: str,
+) -> FtpSavePath | None:
+    """Resolve the remote MemCard Pro FTP destination for a server-only save."""
+    system = (system or "").upper()
+    root = _ftp_profile_root(profile)
+    if system not in {"PS1", "PS2", "GC"}:
+        return None
+
+    with _ftp_connection(
+        str(profile.get("ftp_host", "")).strip(),
+        int(profile.get("ftp_port", 21) or 21),
+        str(profile.get("ftp_username", "")),
+        str(profile.get("ftp_password", "")),
+        bool(profile.get("ftp_passive", True)),
+        int(profile.get("ftp_timeout", 30) or 30),
+    ) as ftp:
+        base_dir = _ftp_existing_or_default_dir(
+            ftp, _memcard_ftp_roots(root, system)
+        )
+        if system in {"PS1", "PS2"}:
+            serial_dir = _memcard_serial_dirname(title_id)
+            ext = ".mcd" if system == "PS1" else ".mc2"
+            remote = _ftp_join(base_dir, serial_dir, f"{serial_dir}-1{ext}")
+            return _ftp_profile_save_path(profile, remote)
+
+        gc_code = title_id[3:].upper() if title_id.upper().startswith("GC_") else ""
+        if len(gc_code) != 4:
+            return None
+        existing = next(
+            (
+                entry
+                for entry in _ftp_list_entries(ftp, base_dir)
+                if entry.is_dir
+                and entry.name.upper().startswith(f"DL-DOL-{gc_code}-")
+            ),
+            None,
+        )
+        folder_name = existing.name if existing else f"DL-DOL-{gc_code}-USA"
+        remote = _ftp_join(base_dir, folder_name, f"{folder_name}-1.raw")
+        return _ftp_profile_save_path(profile, remote)
+
+
+def finalize_memcard_pro_download(path: object, game_name: str) -> None:
+    """Write MemCard Pro companion metadata for local or FTP card downloads."""
+    if isinstance(path, FtpSavePath):
+        remote_dir = posixpath.dirname(path.remote_path)
+        serial_dir = posixpath.basename(remote_dir)
+        if not serial_dir:
+            return
+        if path.suffix.lower() == ".mc2":
+            txt_remote = _ftp_join(remote_dir, "name.txt")
+        else:
+            safe_name = (
+                re.sub(r'[<>:"/\\|?*]', "_", (game_name or "").strip())
+                or serial_dir
+            )
+            txt_remote = _ftp_join(remote_dir, f"{safe_name}.txt")
+        meta_path = _ftp_profile_save_path(
+            {
+                "ftp_host": path.host,
+                "ftp_port": path.port,
+                "ftp_username": path.username,
+                "ftp_password": path.password,
+                "ftp_passive": path.passive,
+                "ftp_timeout": path.timeout,
+            },
+            txt_remote,
+        )
+        meta_path.write_bytes(((game_name or serial_dir).strip() + "\n").encode())
+        return
+
+    local_path = Path(path)
+    serial_dir = local_path.parent.name
+    if not serial_dir:
+        return
+    if local_path.suffix.lower() == ".mc2":
+        txt_path = local_path.parent / "name.txt"
+    else:
+        txt_name = (
+            re.sub(r'[<>:"/\\|?*]', "_", (game_name or "").strip()) or serial_dir
+        )
+        txt_path = local_path.parent / f"{txt_name}.txt"
+    txt_path.parent.mkdir(parents=True, exist_ok=True)
+    txt_path.write_text((game_name or serial_dir).strip() + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # State file (tracks last-synced hash per title, like 3DS client's state/)
 # ---------------------------------------------------------------------------
@@ -513,12 +1187,15 @@ STATE_FILE = Path(__file__).parent / ".sync_state.json"
 SCAN_CACHE_FILE = Path(__file__).parent / ".scan_cache.json"
 SLOT_MAPPING_FILE = Path(__file__).parent / ".slot_mappings.json"
 SATURN_ARCHIVE_STATE_FILE = Path(__file__).parent / ".saturn_archives.json"
+REMOTE_HASH_CACHE_FILE = Path(__file__).parent / ".remote_hash_cache.json"
 _SCAN_CACHE: dict[str, dict[str, object]] | None = None
 _SCAN_CACHE_DIRTY = False
 _SLOT_MAPPINGS: dict[str, dict[str, str]] | None = None
 _SLOT_MAPPINGS_DIRTY = False
 _SATURN_ARCHIVE_STATE: dict[str, list[str]] | None = None
 _SATURN_ARCHIVE_STATE_DIRTY = False
+_REMOTE_HASH_CACHE: dict[str, dict[str, object]] | None = None
+_REMOTE_HASH_CACHE_DIRTY = False
 
 # Per-title Saroo metadata populated by _scan_saroo().
 # Keys are title_id strings; values are dicts with:
@@ -649,6 +1326,216 @@ def _flush_scan_cache() -> None:
     _SCAN_CACHE_DIRTY = False
 
 
+def _load_remote_hash_cache() -> dict[str, dict[str, object]]:
+    global _REMOTE_HASH_CACHE
+    if _REMOTE_HASH_CACHE is not None:
+        return _REMOTE_HASH_CACHE
+    if REMOTE_HASH_CACHE_FILE.exists():
+        try:
+            data = json.loads(REMOTE_HASH_CACHE_FILE.read_text(encoding="utf-8"))
+            entries = data.get("entries", {})
+            if isinstance(entries, dict):
+                _REMOTE_HASH_CACHE = entries
+                return _REMOTE_HASH_CACHE
+        except Exception:
+            pass
+    _REMOTE_HASH_CACHE = {}
+    return _REMOTE_HASH_CACHE
+
+
+def _mark_remote_hash_cache_dirty() -> None:
+    global _REMOTE_HASH_CACHE_DIRTY
+    _REMOTE_HASH_CACHE_DIRTY = True
+
+
+def _flush_remote_hash_cache() -> None:
+    global _REMOTE_HASH_CACHE_DIRTY
+    if not _REMOTE_HASH_CACHE_DIRTY:
+        return
+    cache = _load_remote_hash_cache()
+    REMOTE_HASH_CACHE_FILE.write_text(
+        json.dumps({"entries": cache}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    _REMOTE_HASH_CACHE_DIRTY = False
+
+
+def _remote_hash_cache_key(profile_scope: str, remote_path: str) -> str:
+    return f"ftp|{profile_scope}|{_ftp_norm(remote_path)}"
+
+
+def _memcard_slot_id_from_name(name: str) -> str:
+    stem = posixpath.splitext(str(name or ""))[0]
+    match = re.search(r"[-_](\d+)$", stem)
+    if not match:
+        return "slot1"
+    try:
+        return f"slot{int(match.group(1))}"
+    except ValueError:
+        return "slot1"
+
+
+def _memcard_hash_cache_key(system: str, title_id: str, card_name: str) -> str | None:
+    system = (system or "").upper()
+    suffix = posixpath.splitext(str(card_name or ""))[1].lower()
+    if system in {"PS1", "PS2"}:
+        normalized_title = _normalize_ps1_serial(title_id or "")
+        mode = "card"
+    elif system == "GC":
+        normalized_title = re.sub(
+            r"^GC[_-]?", "", str(title_id or "").upper()
+        )
+        mode = "gci"
+    else:
+        return None
+    if not normalized_title:
+        return None
+    slot_id = _memcard_slot_id_from_name(card_name)
+    return f"memcard-pro|{system}|{normalized_title}|{slot_id}|{suffix}|{mode}"
+
+
+def _memcard_hash_cache_key_from_path(
+    path: str | Path,
+    system: str | None = None,
+    title_id: str | None = None,
+) -> str | None:
+    path_text = str(path).replace("\\", "/")
+    name = posixpath.basename(path_text)
+    suffix = posixpath.splitext(name)[1].lower()
+    parent = posixpath.basename(posixpath.dirname(path_text))
+    resolved_system = (system or "").upper()
+    resolved_title = title_id or ""
+
+    if not resolved_system:
+        if suffix in {".mc2", ".ps2"}:
+            resolved_system = "PS2"
+        elif suffix in {".mcd", ".mcr"}:
+            resolved_system = "PS1"
+        elif suffix == ".raw":
+            resolved_system = "GC"
+
+    if not resolved_title:
+        if resolved_system == "GC":
+            gc_code = _gc_code_from_folder(parent)
+            resolved_title = f"GC_{gc_code.lower()}" if gc_code else ""
+        else:
+            resolved_title = parent
+
+    return _memcard_hash_cache_key(resolved_system, resolved_title, name)
+
+
+def _get_cached_hash_for_key(
+    cache_key: str | None,
+    size: int,
+    mtime: float,
+) -> str | None:
+    if not cache_key or mtime <= 0:
+        return None
+    entry = _load_remote_hash_cache().get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    hash_val = str(entry.get("hash") or "")
+    if not hash_val:
+        return None
+    try:
+        cached_size = int(entry.get("size", -1))
+        cached_mtime = float(entry.get("mtime", 0))
+    except (TypeError, ValueError):
+        return None
+    if cached_size != int(size):
+        return None
+    if abs(cached_mtime - float(mtime)) > 0.001:
+        return None
+    return hash_val
+
+
+def _set_cached_hash_for_key(
+    cache_key: str | None,
+    size: int,
+    mtime: float,
+    hash_val: str,
+) -> None:
+    if not cache_key or not hash_val or mtime <= 0:
+        return
+    cache = _load_remote_hash_cache()
+    cache[cache_key] = {
+        "hash": hash_val,
+        "size": int(size),
+        "mtime": float(mtime),
+        "updated_at": time.time(),
+    }
+    _mark_remote_hash_cache_dirty()
+
+
+def _get_cached_remote_hash(
+    profile_scope: str,
+    remote_path: str,
+    size: int,
+    mtime: float,
+) -> str | None:
+    return _get_cached_hash_for_key(
+        _remote_hash_cache_key(profile_scope, remote_path),
+        size,
+        mtime,
+    )
+
+
+def _set_cached_remote_hash(
+    profile_scope: str,
+    remote_path: str,
+    size: int,
+    mtime: float,
+    hash_val: str,
+) -> None:
+    _set_cached_hash_for_key(
+        _remote_hash_cache_key(profile_scope, remote_path),
+        size,
+        mtime,
+        hash_val,
+    )
+
+
+def _invalidate_remote_hash_path(remote_path: str) -> None:
+    normalized = _ftp_norm(remote_path)
+    memcard_key = _memcard_hash_cache_key_from_path(normalized)
+    cache = _load_remote_hash_cache()
+    stale_keys = [
+        key
+        for key in cache
+        if key.endswith("|" + normalized) or (memcard_key and key == memcard_key)
+    ]
+    if not stale_keys:
+        return
+    for key in stale_keys:
+        cache.pop(key, None)
+    _mark_remote_hash_cache_dirty()
+
+
+def _invalidate_memcard_hash_path(
+    path: str | Path,
+    system: str | None = None,
+    title_id: str | None = None,
+) -> None:
+    memcard_key = _memcard_hash_cache_key_from_path(path, system, title_id)
+    if not memcard_key:
+        return
+    cache = _load_remote_hash_cache()
+    if memcard_key not in cache:
+        return
+    cache.pop(memcard_key, None)
+    _mark_remote_hash_cache_dirty()
+
+
+def _clear_remote_hash_cache() -> None:
+    global _REMOTE_HASH_CACHE, _REMOTE_HASH_CACHE_DIRTY
+    _REMOTE_HASH_CACHE = {}
+    _REMOTE_HASH_CACHE_DIRTY = False
+    try:
+        REMOTE_HASH_CACHE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _load_slot_mappings() -> dict[str, dict[str, str]]:
     global _SLOT_MAPPINGS
     if _SLOT_MAPPINGS is not None:
@@ -703,6 +1590,7 @@ def clear_scan_cache() -> None:
         SCAN_CACHE_FILE.unlink(missing_ok=True)
     except Exception:
         pass
+    _clear_remote_hash_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -882,11 +1770,23 @@ def _clear_dir_contents(path: Path) -> None:
             fp.rmdir()
 
 
+def _is_unsafe_bundle_path(rel_path: str) -> bool:
+    """True if a server-supplied bundle member would escape its dest dir."""
+    p = rel_path.replace("\\", "/")
+    return (
+        p.startswith("/")
+        or ".." in Path(p).parts
+        or (len(p) >= 2 and p[1] == ":")  # drive-letter absolute (Windows)
+    )
+
+
 def _extract_bundle_to_dir(data: bytes, dest_dir: Path) -> None:
     files = _parse_dir_bundle(data)
     dest_dir.mkdir(parents=True, exist_ok=True)
     _clear_dir_contents(dest_dir)
     for rel_path, content in files:
+        if _is_unsafe_bundle_path(rel_path):
+            raise RuntimeError(f"Refusing unsafe bundle member: {rel_path}")
         target = dest_dir / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
@@ -965,6 +1865,9 @@ def _profile_scope_key(profile: dict) -> str:
         "save_ext": profile.get("save_ext", ""),
         "systems": profile.get("systems", []),
         "systems_filter": profile.get("systems_filter", []),
+        "ftp_host": profile.get("ftp_host", ""),
+        "ftp_port": profile.get("ftp_port", ""),
+        "ftp_username": profile.get("ftp_username", ""),
     }
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
@@ -1062,10 +1965,30 @@ def scan_profile(
     # Empty dict means "no filter / no overrides".
     systems_config = _parse_systems_config(profile)
     enabled_systems = list(systems_config.keys())
+    profile_scope = _profile_runtime_scope(profile)
+
+    if device_type == "MemCard Pro FTP":
+        if system_override in {"PS1", "PS2", "GC"}:
+            results = _scan_memcard_pro_ftp(
+                profile,
+                system_override,
+                progress_callback=progress_callback,
+                profile_scope=profile_scope,
+            )
+        else:
+            results = []
+        _flush_scan_cache()
+        _flush_remote_hash_cache()
+        _emit_progress(
+            progress_callback,
+            f"Found {len(results)} remote save entries.",
+            len(results),
+            len(results),
+        )
+        return _dedup_saves(results)
 
     save_folder = Path(save_folder_str) if save_folder_str else None
     rom_folder = Path(rom_folder_str) if rom_folder_str else None
-    profile_scope = _profile_runtime_scope(profile)
     # Convenience: the "active" folder for legacy save-based scanners
     folder = (
         save_folder
@@ -1302,6 +2225,7 @@ def scan_profile(
         results = [r for r in results if r.system.upper() in systems_config]
 
     _flush_scan_cache()
+    _flush_remote_hash_cache()
     _emit_progress(
         progress_callback,
         f"Found {len(results)} local save entries.",
@@ -1379,6 +2303,8 @@ def _build_save_file(
 def _slot_mapping_key(save: SaveFile) -> str | None:
     if save.path is None:
         return None
+    if hasattr(save.path, "sync_key"):
+        return f"{save.profile_scope}|{save.path.sync_key()}"
     try:
         resolved_path = str(save.path.resolve())
     except OSError:
@@ -2640,6 +3566,14 @@ def _normalize_ps1_serial(stem: str) -> str | None:
     return code if _PS1_SERIAL_RE.match(code) else None
 
 
+def _memcard_serial_dirname(title_id: str) -> str:
+    """Convert compact PS1/PS2 title IDs like ``SLUS00594`` to ``SLUS-00594``."""
+    compact = re.sub(r"[^A-Z0-9]", "", (title_id or "").upper())
+    if _PS1_SERIAL_RE.match(compact):
+        return f"{compact[:4]}-{compact[4:]}"
+    return compact or "UNKNOWN"
+
+
 # ---------------------------------------------------------------------------
 # GC memory card helpers (MemCard Pro ↔ Dolphin .gci conversion)
 # ---------------------------------------------------------------------------
@@ -3269,6 +4203,335 @@ def _scan_emudeck(
     return results
 
 
+def _hash_memcard_file_cached(path: Path, system: str, title_id: str) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return _hash_file(path)
+    cache_key = _memcard_hash_cache_key(system, title_id, path.name)
+    cached = _get_cached_hash_for_key(cache_key, stat.st_size, stat.st_mtime)
+    if cached:
+        return cached
+    save_hash = _hash_file(path)
+    _set_cached_hash_for_key(cache_key, stat.st_size, stat.st_mtime, save_hash)
+    return save_hash
+
+
+def _hash_memcard_gc_file_cached(path: Path, gc_code: str) -> str:
+    title_id = f"GC_{gc_code.lower()}"
+    try:
+        stat = path.stat()
+    except OSError:
+        stat = None
+    cache_key = _memcard_hash_cache_key("GC", title_id, path.name)
+    if stat is not None:
+        cached = _get_cached_hash_for_key(cache_key, stat.st_size, stat.st_mtime)
+        if cached:
+            return cached
+    try:
+        card_bytes = path.read_bytes()
+        gci_bytes = gc_extract_gci(card_bytes, gc_code)
+    except OSError:
+        gci_bytes = None
+    if gci_bytes is not None:
+        save_hash = hashlib.sha256(gci_bytes).hexdigest()
+    else:
+        save_hash = _hash_file(path)
+    if stat is not None:
+        _set_cached_hash_for_key(cache_key, stat.st_size, stat.st_mtime, save_hash)
+    return save_hash
+
+
+def _select_ftp_slot_file(
+    entries: list[FtpEntry],
+    preferred_stem: str,
+    suffixes: set[str],
+) -> FtpEntry | None:
+    fallback: FtpEntry | None = None
+    for entry in entries:
+        if entry.is_dir:
+            continue
+        suffix = posixpath.splitext(entry.name)[1].lower()
+        if suffix not in suffixes:
+            continue
+        stem = posixpath.splitext(entry.name)[0]
+        if stem == preferred_stem:
+            return entry
+        if stem.endswith("-1") and fallback is None:
+            fallback = entry
+    return fallback
+
+
+def _ftp_file_with_metadata(ftp: ftplib.FTP, entry: FtpEntry) -> FtpEntry:
+    size = entry.size if entry.size > 0 else _ftp_size(ftp, entry.path)
+    mtime = entry.mtime if entry.mtime > 0 else _ftp_mtime(ftp, entry.path)
+    return FtpEntry(
+        name=entry.name,
+        path=entry.path,
+        is_dir=entry.is_dir,
+        size=size,
+        mtime=mtime,
+    )
+
+
+def _hash_ftp_card_bytes_cached(
+    ftp: ftplib.FTP,
+    entry: FtpEntry,
+    profile_scope: str,
+    system: str,
+    title_id: str,
+) -> str:
+    entry = _ftp_file_with_metadata(ftp, entry)
+    cache_keys = [
+        _remote_hash_cache_key(profile_scope, entry.path),
+        _memcard_hash_cache_key(system, title_id, entry.name),
+    ]
+    for cache_key in cache_keys:
+        cached = _get_cached_hash_for_key(cache_key, entry.size, entry.mtime)
+        if cached:
+            for hydrate_key in cache_keys:
+                if hydrate_key != cache_key:
+                    _set_cached_hash_for_key(
+                        hydrate_key, entry.size, entry.mtime, cached
+                    )
+            return cached
+    data = _ftp_download_bytes(
+        ftp,
+        entry.path,
+        expected_size=entry.size if entry.size > 0 else None,
+    )
+    save_hash = hashlib.sha256(data).hexdigest()
+    for cache_key in cache_keys:
+        _set_cached_hash_for_key(
+            cache_key, entry.size or len(data), entry.mtime, save_hash
+        )
+    return save_hash
+
+
+def _hash_ftp_gc_card_cached(
+    ftp: ftplib.FTP,
+    entry: FtpEntry,
+    gc_code: str,
+    profile_scope: str,
+) -> str:
+    entry = _ftp_file_with_metadata(ftp, entry)
+    title_id = f"GC_{gc_code.lower()}"
+    cache_keys = [
+        _remote_hash_cache_key(profile_scope, entry.path),
+        _memcard_hash_cache_key("GC", title_id, entry.name),
+    ]
+    for cache_key in cache_keys:
+        cached = _get_cached_hash_for_key(cache_key, entry.size, entry.mtime)
+        if cached:
+            for hydrate_key in cache_keys:
+                if hydrate_key != cache_key:
+                    _set_cached_hash_for_key(
+                        hydrate_key, entry.size, entry.mtime, cached
+                    )
+            return cached
+    card_bytes = _ftp_download_bytes(
+        ftp,
+        entry.path,
+        expected_size=entry.size if entry.size > 0 else None,
+    )
+    gci_bytes = gc_extract_gci(card_bytes, gc_code)
+    save_hash = hashlib.sha256(gci_bytes or card_bytes).hexdigest()
+    for cache_key in cache_keys:
+        _set_cached_hash_for_key(
+            cache_key, entry.size or len(card_bytes), entry.mtime, save_hash
+        )
+    return save_hash
+
+
+def _scan_memcard_pro_ftp(
+    profile: dict,
+    system: str = "PS1",
+    progress_callback=None,
+    profile_scope: str = "",
+) -> list[SaveFile]:
+    """Scan PS1/PS2/GC MemCard Pro card images through the device FTP server."""
+    system = (system or "").upper()
+    if system not in {"PS1", "PS2", "GC"}:
+        return []
+
+    host = str(profile.get("ftp_host", "")).strip()
+    port = int(profile.get("ftp_port", 21) or 21)
+    username = str(profile.get("ftp_username", ""))
+    password = str(profile.get("ftp_password", ""))
+    passive = bool(profile.get("ftp_passive", True))
+    timeout = int(profile.get("ftp_timeout", 30) or 30)
+    root = _ftp_profile_root(profile)
+    results: list[SaveFile] = []
+
+    _emit_progress(progress_callback, f"Connecting to MemCard Pro FTP {host}…", 0, 0)
+    with _ftp_connection(host, port, username, password, passive, timeout) as ftp:
+        _emit_progress(progress_callback, f"Connected to MemCard Pro FTP {host}.", 0, 0)
+        base_dir = _ftp_existing_or_default_dir(
+            ftp, _memcard_ftp_roots(root, system)
+        )
+        _emit_progress(
+            progress_callback,
+            f"Listing {system} MemCard Pro FTP folder {base_dir}…",
+            0,
+            0,
+        )
+
+        if system == "GC":
+            disc_dirs = _ftp_entries_from_names(
+                base_dir,
+                _ftp_nlst(ftp, base_dir),
+                is_dir=True,
+            )
+            total = len(disc_dirs)
+            for idx, disc_dir in enumerate(disc_dirs, start=1):
+                if idx == 1 or idx % 5 == 0 or idx == total:
+                    _emit_progress(
+                        progress_callback,
+                        f"Checking GC MemCard Pro FTP folders. {idx}/{total}",
+                        idx,
+                        total,
+                    )
+                gc_code = _gc_code_from_folder(disc_dir.name)
+                if not gc_code:
+                    continue
+                files = _ftp_entries_from_names(
+                    disc_dir.path,
+                    _ftp_nlst(ftp, disc_dir.path),
+                    is_dir=False,
+                )
+                slot1 = _select_ftp_slot_file(
+                    files,
+                    f"{disc_dir.name}-1",
+                    {".raw"},
+                )
+                if slot1 is None:
+                    continue
+                remote_path = _ftp_profile_save_path(profile, slot1.path)
+                try:
+                    _emit_progress(
+                        progress_callback,
+                        f"Hashing GC MemCard Pro FTP card {idx}/{total}: {disc_dir.name}",
+                        idx,
+                        total,
+                    )
+                    save_hash = _hash_ftp_gc_card_cached(
+                        ftp, slot1, gc_code, profile_scope
+                    )
+                except SyncUserError:
+                    raise
+                except Exception:
+                    save_hash = ""
+                results.append(
+                    SaveFile(
+                        title_id=f"GC_{gc_code.lower()}",
+                        path=remote_path,
+                        hash=save_hash,
+                        mtime=slot1.mtime or time.time(),
+                        system="GC",
+                        game_name=disc_dir.name,
+                        profile_scope=profile_scope,
+                    )
+                )
+                if idx == 1 or idx % 10 == 0 or idx == total:
+                    _emit_progress(
+                        progress_callback,
+                        f"Scanning GC MemCard Pro FTP folders. {idx}/{total}",
+                        idx,
+                        total,
+                    )
+            return results
+
+        card_dirs = _ftp_entries_from_names(
+            base_dir,
+            _ftp_nlst(ftp, base_dir),
+            is_dir=True,
+        )
+        total = len(card_dirs)
+        suffixes = {".mcd", ".mcr"} if system == "PS1" else {".mc2", ".ps2"}
+        for idx, serial_dir in enumerate(card_dirs, start=1):
+            if idx == 1 or idx % 5 == 0 or idx == total:
+                _emit_progress(
+                    progress_callback,
+                    f"Checking {system} MemCard Pro FTP folders. {idx}/{total}",
+                    idx,
+                    total,
+                )
+            serial = _normalize_ps1_serial(serial_dir.name)
+            if not serial:
+                continue
+            files = _ftp_entries_from_names(
+                serial_dir.path,
+                _ftp_nlst(ftp, serial_dir.path),
+                is_dir=False,
+            )
+            slot1 = _select_ftp_slot_file(
+                files,
+                f"{serial_dir.name}-1",
+                suffixes,
+            )
+            if slot1 is None:
+                continue
+
+            game_name = serial_dir.name
+            if system == "PS2":
+                name_entry = next(
+                    (e for e in files if not e.is_dir and e.name.lower() == "name.txt"),
+                    None,
+                )
+                if name_entry is not None:
+                    try:
+                        name_entry = _ftp_file_with_metadata(ftp, name_entry)
+                        text = _ftp_download_bytes(
+                            ftp,
+                            name_entry.path,
+                            expected_size=(
+                                name_entry.size if name_entry.size > 0 else None
+                            ),
+                        ).decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+                        game_name = text.strip() or game_name
+                    except Exception:
+                        pass
+
+            remote_path = _ftp_profile_save_path(profile, slot1.path)
+            try:
+                _emit_progress(
+                    progress_callback,
+                    f"Hashing {system} MemCard Pro FTP card {idx}/{total}: {serial_dir.name}",
+                    idx,
+                    total,
+                )
+                save_hash = _hash_ftp_card_bytes_cached(
+                    ftp, slot1, profile_scope, system, serial
+                )
+            except SyncUserError:
+                raise
+            except Exception:
+                save_hash = ""
+            results.append(
+                SaveFile(
+                    title_id=serial,
+                    path=remote_path,
+                    hash=save_hash,
+                    mtime=slot1.mtime or time.time(),
+                    system=system,
+                    game_name=game_name,
+                    profile_scope=profile_scope,
+                )
+            )
+            if idx == 1 or idx % 10 == 0 or idx == total:
+                _emit_progress(
+                    progress_callback,
+                    f"Scanning {system} MemCard Pro FTP folders. {idx}/{total}",
+                    idx,
+                    total,
+                )
+
+    return results
+
+
 def _scan_memcard_pro(
     root: Path,
     system: str = "PS1",
@@ -3329,15 +4592,7 @@ def _scan_memcard_pro(
             title_id = f"GC_{gc_code.lower()}"
             # Hash only the extracted GCI bytes so the hash matches what
             # we actually upload to the server (and what Dolphin stores).
-            try:
-                card_bytes = slot1.read_bytes()
-                gci_bytes = gc_extract_gci(card_bytes, gc_code)
-            except OSError:
-                gci_bytes = None
-            if gci_bytes is not None:
-                save_hash = hashlib.sha256(gci_bytes).hexdigest()
-            else:
-                save_hash = _hash_file(slot1)
+            save_hash = _hash_memcard_gc_file_cached(slot1, gc_code)
             results.append(
                 SaveFile(
                     title_id=title_id,
@@ -3404,7 +4659,7 @@ def _scan_memcard_pro(
                 SaveFile(
                     title_id=serial,
                     path=slot1,
-                    hash=_hash_file(slot1),
+                    hash=_hash_memcard_file_cached(slot1, "PS2", serial),
                     mtime=slot1.stat().st_mtime,
                     system="PS2",
                     game_name=game_name,
@@ -3451,7 +4706,7 @@ def _scan_memcard_pro(
                 SaveFile(
                     title_id=serial,
                     path=slot1,
-                    hash=_hash_file(slot1),
+                    hash=_hash_memcard_file_cached(slot1, "PS1", serial),
                     mtime=slot1.stat().st_mtime,
                     system="PS1",
                     game_name=serial_dir.name,
@@ -3490,7 +4745,7 @@ def _scan_memcard_pro(
                 SaveFile(
                     title_id=title_id,
                     path=mcd_file,
-                    hash=_hash_file(mcd_file),
+                    hash=_hash_memcard_file_cached(mcd_file, "PS1", title_id),
                     mtime=mcd_file.stat().st_mtime,
                     system="PS1",
                     game_name=serial_dir.name,
@@ -3513,12 +4768,12 @@ def _scan_memcard_pro(
         flat_seen.add(title_id)
         results.append(
             SaveFile(
-                title_id=title_id,
-                path=mcd_file,
-                hash=_hash_file(mcd_file),
-                mtime=mcd_file.stat().st_mtime,
-                system="PS1",
-                game_name=stem,
+            title_id=title_id,
+            path=mcd_file,
+            hash=_hash_memcard_file_cached(mcd_file, "PS1", title_id),
+            mtime=mcd_file.stat().st_mtime,
+            system="PS1",
+            game_name=stem,
                 profile_scope=profile_scope,
             )
         )
@@ -4027,6 +5282,14 @@ def download_save(
             timeout=timeout,
         )
     resp.raise_for_status()
+    if isinstance(dest_path, FtpSavePath):
+        dest_path.write_bytes(resp.content)
+        headers_obj = getattr(resp, "headers", {}) or {}
+        server_hash = headers_obj.get(
+            "X-Save-Hash", hashlib.sha256(resp.content).hexdigest()
+        )
+        _update_state(title_id, server_hash)
+        return server_hash
     if (system or "").upper() == "PS3":
         _extract_bundle_to_dir(resp.content, dest_path)
         server_hash = resp.headers.get("X-Save-Hash", _hash_ps3_dir_files(dest_path))
@@ -4059,6 +5322,7 @@ def download_save(
                 )
         else:
             dest_path.write_bytes(resp.content)
+        _invalidate_memcard_hash_path(dest_path, system, title_id)
         server_hash = resp.headers.get(
             "X-Save-Hash", hashlib.sha256(resp.content).hexdigest()
         )

@@ -27,7 +27,7 @@ class RomEntryDownloadPolicyTest {
         val entry = rom(
             system = "3DS",
             extractFormat = "3ds",
-            extractFormats = listOf("cia", "decrypted_cia", "decrypted_cci"),
+            extractFormats = listOf("cia", "decrypted_cci"),
         )
 
         assertEquals("decrypted_cci", entry.preferredDownloadExtractFormat())
@@ -36,18 +36,39 @@ class RomEntryDownloadPolicyTest {
     @Test
     fun `3DS does not fall back to CIA outputs`() {
         assertNull(
-            rom(system = "3DS", extractFormats = listOf("cia", "decrypted_cia"))
-                .preferredDownloadExtractFormat(),
-        )
-        assertNull(
             rom(system = "3DS", extractFormats = listOf("cia"))
                 .preferredDownloadExtractFormat(),
         )
     }
 
     @Test
-    fun `non-3DS systems ignore server extract hints`() {
+    fun `non-3DS non-Xbox systems ignore server extract hints`() {
         val entry = rom(system = "PS1", extractFormat = "cue")
         assertNull(entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `Xbox always requests ISO for xemu compatibility`() {
+        val entry = rom(
+            system = "XBOX",
+            extractFormat = "xbox",
+            extractFormats = listOf("cci", "iso", "folder"),
+        )
+        assertEquals("iso", entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `Xbox requests ISO even without extract_formats advertised`() {
+        val entry = rom(system = "XBOX")
+        assertEquals("iso", entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `X360 also requests ISO`() {
+        val entry = rom(
+            system = "X360",
+            extractFormats = listOf("cci", "iso", "folder"),
+        )
+        assertEquals("iso", entry.preferredDownloadExtractFormat())
     }
 }

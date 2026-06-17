@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 
 #include <pspkernel.h>
@@ -16,9 +17,11 @@
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
 #include <pspnet_resolver.h>
+#include <pspiofilemgr.h>
 #include <psputility.h>
 #include <psputility_netmodules.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -242,6 +245,14 @@ static int tcp_connect(const char *host, int port) {
     int sock = sceNetInetSocket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
+    /* Don't tune SO_RCVBUF/SO_SNDBUF — the PSP TCP stack misbehaves
+     * with non-default values (128 KB locks the connection mid-stream;
+     * 32 KB causes throughput to wobble worse than the default).
+     * Sticking with the kernel default 16 KB recv buffer gives the
+     * most stable ~650 KB/s on a clean 802.11g link to a LAN server.
+     * The CPU clock bump in main.c (333/333/166 MHz) is what gets us
+     * most of the throughput win without touching the socket layer. */
+
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -264,6 +275,28 @@ static int tcp_send_all(int sock, const uint8_t *data, int len) {
         sent += r;
     }
     return 0;
+}
+
+/* Case-insensitive search for an HTTP header value within a header block.
+ * Starlette/Uvicorn emit lowercase header names ("content-length: ..."),
+ * other servers use Title-Case — RFC 7230 says names are case-insensitive,
+ * so a strict strstr("Content-Length: ") miss would silently wreck the
+ * download progress / total-bytes accounting. Returns a pointer just past
+ * the ": " separator (start of the value), or NULL when not present. */
+static const char *find_header_value(const char *headers, const char *name) {
+    size_t nlen = strlen(name);
+    const char *p = headers;
+    while (*p) {
+        if (strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            const char *v = p + nlen + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            return v;
+        }
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return NULL;
 }
 
 /* Receive HTTP response. Returns response body length, or negative on error.
@@ -290,9 +323,9 @@ static int http_receive_response(int sock, int *status_out,
     if (sscanf(header_buf, "HTTP/1.%*d %d", status_out) != 1)
         *status_out = 200;
 
-    /* Parse Content-Length */
-    char *cl = strstr(header_buf, "Content-Length: ");
-    if (cl) content_length = atoi(cl + 16);
+    /* Parse Content-Length (case-insensitive — see find_header_value note). */
+    const char *cl = find_header_value(header_buf, "Content-Length");
+    if (cl) content_length = atoi(cl);
 
     /* Body starts after \r\n\r\n */
     uint8_t *body_start = (uint8_t *)(hdr_end + 4);
@@ -673,18 +706,62 @@ static void add_server_title(SyncState *state, const char *game_id, const char *
 }
 
 /* Merge the server title catalog into the local list so PSP/PS1 saves remain
- * visible and downloadable even when there is no local save directory yet. */
-void network_merge_server_titles(SyncState *state) {
-    if (!state) return;
+ * visible and downloadable even when there is no local save directory yet.
+ *
+ * Filters server-side via ?console_type so the response stays small
+ * (avoids the 256 KB buffer truncating tail entries on a server with
+ * many non-PSP/PS1 saves) and so we don't waste cycles parsing 3DS /
+ * NDS / MiSTer rows that ``saves_is_valid_game_id`` would reject. */
+int network_merge_server_titles(SyncState *state,
+                                int *out_added, int *out_seen) {
+    if (out_added) *out_added = 0;
+    if (out_seen)  *out_seen  = 0;
+    if (!state) return -1;
 
-    static uint8_t resp[256 * 1024];
-    int r = network_http_get(state, "/api/v1/titles", resp, sizeof(resp) - 1);
-    if (r <= 0) return;
+    /* 512 KB resp buffer — saves response with PSP+PS1 filter rarely
+     * exceeds 64 KB, but oversize so future growth doesn't silently
+     * truncate the tail (which is exactly how new uploads vanish from
+     * the merge). */
+    static uint8_t resp[512 * 1024];
+    int r = network_http_get(state,
+                             "/api/v1/titles?console_type=PSP&console_type=PSX&console_type=PS1",
+                             resp, sizeof(resp) - 1);
+    if (r <= 0) return -1;
     resp[r] = '\0';
+
+    int seen = 0;
+    int before_count = state->num_titles;
 
     char *p = (char *)resp;
     while ((p = strstr(p, "\"title_id\"")) != NULL) {
-        char *object_end = strchr(p, '}');
+        /* Find the enclosing object's bounds.  Walk forward from the
+         * key, balancing { / } across nested arrays so a stray '}'
+         * inside a string value doesn't cut us off early. */
+        char *object_end = NULL;
+        {
+            int depth = 1;
+            char *q = p;
+            /* Backtrack to find object opener. */
+            while (q > (char *)resp && *q != '{') q--;
+            if (*q != '{') break;
+            char *scan = q + 1;
+            bool in_string = false;
+            while (*scan) {
+                if (in_string) {
+                    if (*scan == '\\' && scan[1]) { scan += 2; continue; }
+                    if (*scan == '"') in_string = false;
+                } else {
+                    if (*scan == '"') in_string = true;
+                    else if (*scan == '{') depth++;
+                    else if (*scan == '}') {
+                        depth--;
+                        if (depth == 0) { object_end = scan; break; }
+                    }
+                }
+                scan++;
+            }
+        }
+
         p = strchr(p, ':');
         if (!p) break;
         p++;
@@ -718,6 +795,333 @@ void network_merge_server_titles(SyncState *state) {
             }
         }
 
+        seen++;
         add_server_title(state, game_id, console_type);
     }
+
+    if (out_seen)  *out_seen  = seen;
+    if (out_added) *out_added = state->num_titles - before_count;
+    return 0;
+}
+
+/* ============================================================
+ * ROM catalog + streaming download (Range-resumable)
+ * ============================================================ */
+
+static NetProgress64Fn g_progress64_cb = NULL;
+
+void network_set_progress64_cb(NetProgress64Fn cb) { g_progress64_cb = cb; }
+
+int network_fetch_rom_catalog(const SyncState *state,
+                              const char *system_code,
+                              int offset, int limit,
+                              char *out, uint32_t out_size,
+                              int *status_out) {
+    if (!state || !out || out_size < 2) return -1;
+    if (offset < 0) offset = 0;
+    if (limit  < 0) limit  = 0;
+
+    char path[256];
+    int  pos = 0;
+    pos += snprintf(path + pos, sizeof(path) - pos, "/api/v1/roms?");
+    if (system_code && system_code[0]) {
+        pos += snprintf(path + pos, sizeof(path) - pos, "system=%s&", system_code);
+    }
+    if (limit > 0) {
+        pos += snprintf(path + pos, sizeof(path) - pos, "limit=%d&", limit);
+    }
+    pos += snprintf(path + pos, sizeof(path) - pos, "offset=%d", offset);
+
+    int status = 0;
+    int n = http_request(state, "GET", path,
+                         NULL, NULL, 0,
+                         (uint8_t *)out, out_size, &status);
+    if (status_out) *status_out = status;
+    if (n < 0 || status != 200) {
+        return n < 0 ? n : -1;
+    }
+    return n;
+}
+
+int network_fetch_rom_manifest(const SyncState *state,
+                               const char *rom_id,
+                               char *out, uint32_t out_size,
+                               int *status_out) {
+    if (!state || !rom_id || !out || out_size < 2) return -1;
+    char path[256];
+    snprintf(path, sizeof(path), "/api/v1/roms/%s/manifest", rom_id);
+
+    int status = 0;
+    int n = http_request(state, "GET", path,
+                         NULL, NULL, 0,
+                         (uint8_t *)out, out_size, &status);
+    if (status_out) *status_out = status;
+    if (n < 0 || status != 200) {
+        return n < 0 ? n : -1;
+    }
+    return n;
+}
+
+int network_trigger_rom_scan(const SyncState *state, int *count_out) {
+    if (count_out) *count_out = -1;
+    if (!state) return -1;
+    static uint8_t resp[4096];
+    int status = 0;
+    int n = http_request(state, "GET", "/api/v1/roms/scan",
+                         NULL, NULL, 0, resp, sizeof(resp), &status);
+    if (n < 0 || status != 200) return n < 0 ? n : -1;
+    if (count_out) {
+        const char *p = strstr((const char *)resp, "\"count\"");
+        if (p) {
+            const char *colon = strchr(p, ':');
+            if (colon) *count_out = atoi(colon + 1);
+        }
+    }
+    return 0;
+}
+
+/* Carry-over body bytes that arrived alongside the response headers.
+ * Lives at file scope so the streaming recv helper can find them. */
+static uint8_t *g_stream_carry     = NULL;
+static int      g_stream_carry_len = 0;
+static int      g_stream_carry_pos = 0;
+
+/* Internal: open a TCP connection, send GET with optional Range, leave
+ * the socket positioned at the start of the response body so the
+ * caller can stream it.  Returns socket fd on success or -1 on error. */
+static int http_open_get_stream(const SyncState *state,
+                                const char *api_path,
+                                uint64_t range_start,
+                                int *status_out,
+                                int64_t *content_len_out) {
+    char host[256];
+    int port;
+    char url_path[256];
+    char full_url[512];
+    snprintf(full_url, sizeof(full_url), "%s%s", state->server_url, api_path);
+    if (parse_url(full_url, host, sizeof(host), &port,
+                  url_path, sizeof(url_path)) < 0) {
+        return -1;
+    }
+
+    int sock = tcp_connect(host, port);
+    if (sock < 0) return -1;
+
+    char hdr[1024];
+    int  hlen;
+    if (range_start > 0) {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s:%d\r\n"
+            "X-API-Key: %s\r\n"
+            "X-Console-ID: %s\r\n"
+            "Range: bytes=%llu-\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            url_path, host, port,
+            state->api_key, state->console_id,
+            (unsigned long long)range_start);
+    } else {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s:%d\r\n"
+            "X-API-Key: %s\r\n"
+            "X-Console-ID: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            url_path, host, port,
+            state->api_key, state->console_id);
+    }
+
+    if (tcp_send_all(sock, (uint8_t *)hdr, hlen) < 0) {
+        sceNetInetClose(sock);
+        return -1;
+    }
+
+    /* Walk headers byte-by-byte until \r\n\r\n.  Same trick as
+     * http_receive_response but we keep the socket open and don't
+     * pre-read body bytes into a buffer. */
+    static char header_buf[HTTP_BUF_SIZE];
+    int header_len = 0;
+    char *hdr_end = NULL;
+    while (!hdr_end && header_len < (int)sizeof(header_buf) - 1) {
+        int r = sceNetInetRecv(sock, header_buf + header_len,
+                               sizeof(header_buf) - header_len - 1, 0);
+        if (r <= 0) { sceNetInetClose(sock); return -1; }
+        header_len += r;
+        header_buf[header_len] = '\0';
+        hdr_end = strstr(header_buf, "\r\n\r\n");
+    }
+    if (!hdr_end) { sceNetInetClose(sock); return -1; }
+
+    int status = 200;
+    if (sscanf(header_buf, "HTTP/1.%*d %d", &status) != 1) status = 200;
+    if (status_out) *status_out = status;
+
+    int64_t content_length = -1;
+    const char *cl = find_header_value(header_buf, "Content-Length");
+    if (cl) content_length = strtoll(cl, NULL, 10);
+    if (content_len_out) *content_len_out = content_length;
+
+    if (status != 200 && status != 206) {
+        sceNetInetClose(sock);
+        return -1;
+    }
+
+    /* Some bytes of body may already be in header_buf past \r\n\r\n —
+     * we have to keep them.  Stash a pointer + length pair so the
+     * streamer drains them before the next sceNetInetRecv. */
+    g_stream_carry_pos = 0;
+    g_stream_carry_len = (int)(header_buf + header_len - (hdr_end + 4));
+    if (g_stream_carry_len > 0) {
+        g_stream_carry = (uint8_t *)(hdr_end + 4);
+    } else {
+        g_stream_carry = NULL;
+        g_stream_carry_len = 0;
+    }
+
+    return sock;
+}
+
+static int stream_recv(int sock, uint8_t *buf, int max) {
+    /* First drain any carry-over body bytes from the header read. */
+    if (g_stream_carry && g_stream_carry_pos < g_stream_carry_len) {
+        int avail = g_stream_carry_len - g_stream_carry_pos;
+        int copy = avail < max ? avail : max;
+        memcpy(buf, g_stream_carry + g_stream_carry_pos, copy);
+        g_stream_carry_pos += copy;
+        if (g_stream_carry_pos >= g_stream_carry_len) {
+            g_stream_carry = NULL;
+            g_stream_carry_len = g_stream_carry_pos = 0;
+        }
+        return copy;
+    }
+    return sceNetInetRecv(sock, buf, max, 0);
+}
+
+/* Shared streaming core — used by single-file ROM and per-bundle-file
+ * downloads.  Caller provides the absolute API path (with any query
+ * string already appended). */
+static int download_stream_to_file(const SyncState *state,
+                                   const char *api_path,
+                                   const char *target_path,
+                                   uint64_t start_offset,
+                                   uint64_t *total_out) {
+    int status = 0;
+    int64_t content_length = -1;
+    int sock = http_open_get_stream(state, api_path,
+                                    start_offset, &status, &content_length);
+    if (sock < 0) {
+        if (status == 416 || status == 404) return -3;
+        return -1;
+    }
+
+    bool resumed = (status == 206);
+    uint64_t written = resumed ? start_offset : 0;
+    uint64_t expected_total =
+        (content_length >= 0)
+            ? ((uint64_t)content_length + (resumed ? start_offset : 0))
+            : 0;
+    if (total_out) *total_out = expected_total;
+
+    char part_path[512];
+    snprintf(part_path, sizeof(part_path), "%s.part", target_path);
+
+    FILE *fp = fopen(part_path, resumed ? "ab" : "wb");
+    if (!fp) {
+        sceNetInetClose(sock);
+        return -2;
+    }
+
+    static uint8_t chunk[65536];
+    int rc = 0;
+    while (1) {
+        int n = stream_recv(sock, chunk, sizeof(chunk));
+        if (n > 0) {
+            size_t w = fwrite(chunk, 1, (size_t)n, fp);
+            if (w != (size_t)n) { rc = -2; break; }
+            written += (uint64_t)n;
+            if (g_progress64_cb &&
+                g_progress64_cb(written, expected_total))
+            {
+                rc = 1;
+                break;
+            }
+            if (expected_total > 0 && written >= expected_total) break;
+        } else if (n == 0) {
+            break;
+        } else {
+            rc = -1;
+            break;
+        }
+    }
+
+    fclose(fp);
+    sceNetInetClose(sock);
+
+    if (rc != 0) return rc;
+
+    if (expected_total > 0 && written < expected_total) {
+        return 1;
+    }
+
+    /* Atomic rename via sceIoRename — libc rename() on PSP is mapped
+     * onto FAT operations that have been observed to return success
+     * while leaving the source ``.part`` in place (the entry shows up
+     * under the target name but the .part file is not unlinked).
+     * sceIoRename is the underlying syscall and is reliable; we still
+     * unlink the target first to handle the "already exists" case
+     * since FAT rename refuses to overwrite. */
+    sceIoRemove(target_path);
+    int ren = sceIoRename(part_path, target_path);
+    if (ren < 0) {
+        /* Fallback to libc rename in case sceIoRename is unavailable
+         * or refuses for some other reason. */
+        if (rename(part_path, target_path) != 0) return -2;
+    }
+
+    /* Belt-and-braces: if either rename path silently kept the
+     * source file (FAT driver bug we've seen before), nuke it now so
+     * the user doesn't see a stray .part next to the final file. */
+    {
+        struct stat st;
+        if (stat(part_path, &st) == 0) {
+            sceIoRemove(part_path);
+        }
+    }
+
+    if (total_out) *total_out = written;
+    return 0;
+}
+
+int network_download_rom_resumable(const SyncState *state,
+                                   const char *rom_id,
+                                   const char *extract_fmt,
+                                   const char *target_path,
+                                   uint64_t start_offset,
+                                   uint64_t *total_out) {
+    if (!state || !rom_id || !target_path) return -1;
+    char api_path[512];
+    if (extract_fmt && extract_fmt[0]) {
+        snprintf(api_path, sizeof(api_path),
+                 "/api/v1/roms/%s?extract=%s", rom_id, extract_fmt);
+    } else {
+        snprintf(api_path, sizeof(api_path), "/api/v1/roms/%s", rom_id);
+    }
+    return download_stream_to_file(state, api_path, target_path,
+                                   start_offset, total_out);
+}
+
+int network_download_bundle_file_resumable(const SyncState *state,
+                                           const char *rom_id,
+                                           const char *bundle_file,
+                                           const char *target_path,
+                                           uint64_t start_offset,
+                                           uint64_t *total_out) {
+    if (!state || !rom_id || !bundle_file || !target_path) return -1;
+    char api_path[768];
+    snprintf(api_path, sizeof(api_path),
+             "/api/v1/roms/%s/file/%s", rom_id, bundle_file);
+    return download_stream_to_file(state, api_path, target_path,
+                                   start_offset, total_out);
 }

@@ -46,10 +46,12 @@
 #define WEBMAN_PORT             80
 #define WEBMAN_FAKE_USB_PATH    "/dev_hdd0/tmp/fakeusb"
 
-static bool         g_initialized  = false;
-static NetProgressFn g_progress_cb = NULL;
+static bool             g_initialized   = false;
+static NetProgressFn    g_progress_cb   = NULL;
+static NetProgress64Fn  g_progress64_cb = NULL;
 
-void network_set_progress_cb(NetProgressFn cb) { g_progress_cb = cb; }
+void network_set_progress_cb(NetProgressFn cb)     { g_progress_cb   = cb; }
+void network_set_progress64_cb(NetProgress64Fn cb) { g_progress64_cb = cb; }
 
 /* ---- URL parsing ---- */
 
@@ -106,6 +108,14 @@ static int tcp_connect(const char *host, int port) {
     int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s < 0) { debug_log("net: socket() failed %d", s); return -1; }
 
+    /* Enlarge socket buffers — PS3 defaults are tiny (likely 8-16 KB)
+     * which limits TCP window size and tanks throughput on wired LAN.
+     * 256 KB each lets the kernel pipeline enough data to keep wired
+     * 100 Mbit saturated without the sender stalling on window pressure. */
+    int bufsize = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
     /* Set send timeout so blocking connect doesn't hang indefinitely.
      * On LAN, ENETUNREACH comes back immediately anyway; this covers the
      * rare case where a SYN is dropped with no RST. */
@@ -134,7 +144,7 @@ static int tcp_connect(const char *host, int port) {
 
 /* ---- Send all bytes (with callback pumping) ----
  *
- * Sends in 64KB chunks.  Between chunks (and on SO_SNDTIMEO timeouts)
+ * Sends in 128KB chunks.  Between chunks (and on SO_SNDTIMEO timeouts)
  * the progress callback is invoked so sysUtilCheckCallback() gets called.
  * On real PS3 firmware, failing to pump sysutil for several seconds while
  * blocking in send() makes the system consider the app frozen — this does
@@ -144,7 +154,7 @@ static bool send_all(int s, const uint8_t *buf, uint32_t size) {
     uint32_t sent = 0;
     while (sent < size) {
         uint32_t chunk = size - sent;
-        if (chunk > 65536) chunk = 65536;
+        if (chunk > 131072) chunk = 131072;
 
         int n = (int)send(s, buf + sent, chunk, 0);
         if (n > 0) {
@@ -165,16 +175,41 @@ static bool send_all(int s, const uint8_t *buf, uint32_t size) {
     return true;
 }
 
-/* ---- Read one line (strips \r\n) ---- */
-
+/* ---- Read one line (strips \r\n) ----
+ *
+ * recv() inherits the socket's 1-second SO_RCVTIMEO so the body loop can
+ * pump sysutil between chunks.  But the same timeout fires here too: if
+ * the server takes longer than 1 s to start sending (slow endpoints like
+ * /api/v1/roms which iterate the catalog before responding), the very
+ * first recv returns EAGAIN and the old implementation bailed with an
+ * empty status line — leading to ``HTTP 0`` even though bytes arrived
+ * later.
+ *
+ * Retry on EAGAIN/EWOULDBLOCK/ETIMEDOUT, pumping the progress callback
+ * each iteration so sysutil stays alive, and only bail after a hard
+ * error or a long total wait (60 retries * 1 s = 60 s — generous enough
+ * to cover catalog cold starts on a Pi). */
 static int read_line(int s, char *buf, int max) {
     int len = 0;
-    while (len < max - 1) {
+    int retries = 60;
+    while (len < max - 1 && retries > 0) {
         char c;
         int n = (int)recv(s, &c, 1, 0);
-        if (n <= 0) break;
-        if (c == '\n') break;
-        if (c != '\r') buf[len++] = c;
+        if (n > 0) {
+            if (c == '\n') break;
+            if (c != '\r') buf[len++] = c;
+            continue;
+        }
+        if (n == 0) break;  /* server closed */
+
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
+            break;
+        }
+        /* Soft timeout — pump sysutil and try again. */
+        if (g_progress_cb) {
+            if (g_progress_cb(0, -1)) break;  /* abort requested */
+        }
+        retries--;
     }
     buf[len] = '\0';
     return len;
@@ -238,10 +273,14 @@ static int http_request(const SyncState *state,
     }
 
     if (!send_all(s, (const uint8_t *)hdr, (uint32_t)hlen)) {
+        debug_log("net: send_all hdr failed for %s %s errno=%d",
+                  method, api_path, errno);
         NET_CLOSE(s); return -1;
     }
     if (body && body_size > 0) {
         if (!send_all(s, body, body_size)) {
+            debug_log("net: send_all body failed for %s %s errno=%d",
+                      method, api_path, errno);
             NET_CLOSE(s); return -1;
         }
     }
@@ -283,7 +322,7 @@ static int http_request(const SyncState *state,
 
         while ((uint32_t)total < want) {
             uint32_t chunk = want - (uint32_t)total;
-            if (chunk > 65536) chunk = 65536;
+            if (chunk > 262144) chunk = 262144;
             int n = (int)recv(s, resp_buf + total, chunk, 0);
             if (n > 0) {
                 total += n;
@@ -968,4 +1007,411 @@ int network_get_sync_plan(const SyncState *state, NetworkSyncPlan *plan) {
         plan->conflict_count += parse_id_array(resp_str, "conflict",
                                    plan->conflict + plan->conflict_count, room);
     return 0;
+}
+
+/* ============================================================
+ * ROM catalog + streaming download (Range-resumable)
+ * ============================================================
+ *
+ * The save bundle path uses an in-RAM 8 MB scratch buffer.  ROM downloads
+ * can be 4–8 GB so they take a separate code path: header parsing without
+ * the body buffer, then a chunked stream straight to a .part file with
+ * fwrite(), pumping sysutil between chunks. */
+
+int network_trigger_rom_scan(const SyncState *state, int *count_out) {
+    if (count_out) *count_out = -1;
+    if (!state) return -1;
+
+    /* Response body is small JSON: {"status": "ok", "count": N}.
+     * 4 KB is plenty even with whitespace + future fields. */
+    static char resp[4096];
+    int status = 0;
+    debug_log("net: trigger_rom_scan");
+    int n = http_request(state, "GET", "/api/v1/roms/scan",
+                         NULL, NULL, 0,
+                         (uint8_t *)resp, sizeof(resp), &status);
+    if (n < 0 || status != 200) {
+        debug_log("net: trigger_rom_scan failed status=%d n=%d", status, n);
+        return n < 0 ? n : -1;
+    }
+    /* Best-effort count parse — failure isn't fatal, the caller still
+     * gets a 0 return code so it knows the rescan completed. */
+    if (count_out) {
+        const char *p = strstr(resp, "\"count\"");
+        if (p) {
+            const char *colon = strchr(p, ':');
+            if (colon) *count_out = atoi(colon + 1);
+        }
+    }
+    debug_log("net: trigger_rom_scan OK count=%d",
+              count_out ? *count_out : -1);
+    return 0;
+}
+
+int network_fetch_rom_catalog(const SyncState *state,
+                              const char *system_code,
+                              int offset, int limit,
+                              char *out, uint32_t out_size,
+                              int *status_out) {
+    if (!state || !out || out_size < 2) return -1;
+    if (offset < 0) offset = 0;
+    if (limit  < 0) limit  = 0;
+
+    char path[256];
+    int  pos = 0;
+    pos += snprintf(path + pos, sizeof(path) - pos, "/api/v1/roms?");
+    if (system_code && system_code[0]) {
+        pos += snprintf(path + pos, sizeof(path) - pos,
+                        "system=%s&", system_code);
+    }
+    if (limit > 0) {
+        pos += snprintf(path + pos, sizeof(path) - pos,
+                        "limit=%d&", limit);
+    }
+    pos += snprintf(path + pos, sizeof(path) - pos, "offset=%d", offset);
+
+    debug_log("net: fetch_rom_catalog GET %s server=%s out_size=%u",
+              path, state->server_url, (unsigned)out_size);
+
+    int status = 0;
+    int n = http_request(state, "GET", path,
+                         NULL, NULL, 0,
+                         (uint8_t *)out, out_size, &status);
+    if (status_out) *status_out = status;
+    if (n < 0 || status != 200) {
+        debug_log("net: fetch_rom_catalog (%s, offset=%d) failed status=%d n=%d",
+                  system_code ? system_code : "all", offset, status, n);
+        return n < 0 ? n : -1;
+    }
+    debug_log("net: fetch_rom_catalog OK offset=%d n=%d status=%d",
+              offset, n, status);
+    return n;
+}
+
+/* Internal: open a TCP connection, send a GET with optional Range header,
+ * and read the status line + header block.  Leaves the socket positioned
+ * at the start of the response body so the caller can stream it.
+ *
+ * Returns the connected socket on success (caller must NET_CLOSE it).
+ * On error returns -1 and sets *status_out to the parsed code (or 0 if no
+ * status line was received).
+ *
+ * On 200/206 *content_len_out is filled with the body length advertised by
+ * Content-Length (or -1 if absent — then the caller streams until close).
+ */
+static int http_open_get_stream(const SyncState *state,
+                                const char *api_path,
+                                uint64_t range_start,
+                                int *status_out,
+                                int64_t *content_len_out) {
+    char host[128];
+    int  port;
+    char base_path[512];
+
+    if (!parse_url(state->server_url, host, sizeof(host), &port,
+                   base_path, sizeof(base_path))) {
+        debug_log("net: bad server_url: %s", state->server_url);
+        return -1;
+    }
+
+    int s = tcp_connect(host, port);
+    if (s < 0) return -1;
+
+    char hdr[1024];
+    int  hlen;
+    if (range_start > 0) {
+        /* Open-ended range: bytes=N- so the server sends everything from N
+         * to EOF in one go.  Tested against the FastAPI catalog endpoint
+         * which honors this exactly (see server/app/routes/roms.py). */
+        hlen = snprintf(hdr, sizeof(hdr),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s:%d\r\n"
+            "X-API-Key: %s\r\n"
+            "X-Console-ID: %s\r\n"
+            "Range: bytes=%llu-\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            api_path, host, port,
+            state->api_key, state->console_id,
+            (unsigned long long)range_start);
+    } else {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s:%d\r\n"
+            "X-API-Key: %s\r\n"
+            "X-Console-ID: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            api_path, host, port,
+            state->api_key, state->console_id);
+    }
+
+    if (!send_all(s, (const uint8_t *)hdr, (uint32_t)hlen)) {
+        NET_CLOSE(s); return -1;
+    }
+
+    char line[512];
+    read_line(s, line, sizeof(line));
+    if (g_progress_cb) g_progress_cb(0, -1);
+
+    int status = 0;
+    const char *sp = strchr(line, ' ');
+    if (sp) status = atoi(sp + 1);
+    if (status_out) *status_out = status;
+    debug_log("net: stream GET %s (range_start=%llu) -> HTTP %d",
+              api_path, (unsigned long long)range_start, status);
+
+    int64_t content_length = -1;
+    while (1) {
+        int n = read_line(s, line, sizeof(line));
+        if (n == 0) break;
+        if (strncasecmp(line, "Content-Length:", 15) == 0)
+            content_length = (int64_t)strtoull(line + 15, NULL, 10);
+        if (g_progress_cb) g_progress_cb(0, -1);
+    }
+    if (content_len_out) *content_len_out = content_length;
+
+    if (status != 200 && status != 206) {
+        NET_CLOSE(s);
+        return -1;
+    }
+
+    return s;
+}
+
+/* Internal shared streamer used by both the single-file ROM path and the
+ * per-bundle-file path.  Caller provides the absolute API path so we
+ * don't have to teach the streamer which endpoint to talk to. */
+static int download_stream_to_file(const SyncState *state,
+                                   const char *api_path,
+                                   const char *target_path,
+                                   uint64_t start_offset,
+                                   uint64_t *total_out) {
+    int status = 0;
+    int64_t content_length = -1;
+    int s = http_open_get_stream(state, api_path,
+                                 start_offset, &status, &content_length);
+    if (s < 0) {
+        debug_log("net: download_rom_resumable open failed status=%d", status);
+        if (status == 416) return -3;  /* range past EOF — caller retries from 0 */
+        if (status == 404) return -3;
+        return -1;
+    }
+
+    /* Servers that don't honor Range will respond 200 with the full body.
+     * Truncate the .part file in that case so we restart from offset 0. */
+    bool resumed = (status == 206);
+    uint64_t written = resumed ? start_offset : 0;
+    uint64_t expected_total =
+        (content_length >= 0)
+            ? ((uint64_t)content_length + (resumed ? start_offset : 0))
+            : 0;
+    if (total_out) *total_out = expected_total;
+
+    /* Open the .part file.  resumed=true → append.  resumed=false → trunc. */
+    char part_path[PATH_LEN + 8];
+    snprintf(part_path, sizeof(part_path), "%s.part", target_path);
+
+    FILE *fp = fopen(part_path, resumed ? "ab" : "wb");
+    if (!fp) {
+        debug_log("net: cannot open %s", part_path);
+        NET_CLOSE(s);
+        return -2;
+    }
+
+    /* 256 KB recv chunk — larger than the old 64 KB to reduce syscall
+     * overhead on wired LAN.  Still well within PS3's BSS budget and
+     * the 1-second SO_RCVTIMEO ensures sysutil gets pumped regularly. */
+    static uint8_t chunk[262144];
+    int rc = 0;
+    while (1) {
+        int n = (int)recv(s, chunk, sizeof(chunk), 0);
+        if (n > 0) {
+            size_t w = fwrite(chunk, 1, (size_t)n, fp);
+            if (w != (size_t)n) {
+                debug_log("net: fwrite short (%u != %d) errno=%d",
+                          (unsigned)w, n, errno);
+                rc = -2;
+                break;
+            }
+            written += (uint64_t)n;
+            if (g_progress64_cb) {
+                if (g_progress64_cb(written, expected_total)) {
+                    /* Cancellation requested — keep .part on disk for
+                     * resume next session. */
+                    rc = 1;
+                    break;
+                }
+            } else if (g_progress_cb) {
+                /* Fallback: 32-bit clamp.  Truncates progress for >4 GB
+                 * downloads but still pumps sysutil. */
+                uint32_t w32 = (uint32_t)(written & 0xFFFFFFFFULL);
+                int total32 =
+                    (expected_total > 0xFFFFFFFFULL) ? -1
+                                                     : (int)expected_total;
+                if (g_progress_cb(w32, total32)) {
+                    rc = 1;
+                    break;
+                }
+            }
+            /* Done? */
+            if (expected_total > 0 && written >= expected_total)
+                break;
+        } else if (n == 0) {
+            /* Server closed — done if we got everything, else error. */
+            break;
+        } else {
+            /* SO_RCVTIMEO fired or hard error.  Pump sysutil and retry. */
+            if (g_progress64_cb) {
+                if (g_progress64_cb(written, expected_total)) { rc = 1; break; }
+            } else if (g_progress_cb) {
+                if (g_progress_cb(0, -1)) { rc = 1; break; }
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
+                debug_log("net: recv error errno=%d", errno);
+                rc = -1;
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+    NET_CLOSE(s);
+
+    if (rc != 0) {
+        /* Either paused (1), or error (-1/-2).  Leave .part for resume. */
+        return rc;
+    }
+
+    /* Sanity check: did we actually receive the expected bytes? */
+    if (expected_total > 0 && written < expected_total) {
+        debug_log("net: short download %llu/%llu — keep .part for resume",
+                  (unsigned long long)written,
+                  (unsigned long long)expected_total);
+        return 1;  /* treat as paused so user can retry */
+    }
+
+    /* Atomic rename .part → target.  rename() may fail if target already
+     * exists on some FS — try unlink-then-rename as a fallback. */
+    if (rename(part_path, target_path) != 0) {
+        debug_log("net: rename %s -> %s failed errno=%d, retrying",
+                  part_path, target_path, errno);
+        unlink(target_path);
+        if (rename(part_path, target_path) != 0) {
+            debug_log("net: rename retry failed errno=%d", errno);
+            return -2;
+        }
+    }
+
+    if (total_out) *total_out = written;
+    return 0;
+}
+
+static bool is_url_path_safe(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~' ||
+           c == '/';
+}
+
+static bool url_encode_path(const char *in, char *out, size_t out_size) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+
+    if (!in || !out || out_size == 0) return false;
+
+    for (size_t i = 0; in[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (is_url_path_safe(c)) {
+            if (j + 1 >= out_size) return false;
+            out[j++] = (char)c;
+            continue;
+        }
+
+        if (j + 3 >= out_size) return false;
+        out[j++] = '%';
+        out[j++] = hex[(c >> 4) & 0x0F];
+        out[j++] = hex[c & 0x0F];
+    }
+
+    out[j] = '\0';
+    return true;
+}
+
+/* Public wrappers for the two endpoints clients hit. */
+
+int network_download_rom_resumable(const SyncState *state,
+                                   const char *rom_id,
+                                   const char *target_path,
+                                   uint64_t start_offset,
+                                   uint64_t *total_out) {
+    return network_download_rom_resumable_ex(state, rom_id, NULL,
+                                             target_path, start_offset,
+                                             total_out);
+}
+
+int network_download_rom_resumable_ex(const SyncState *state,
+                                      const char *rom_id,
+                                      const char *extract_format,
+                                      const char *target_path,
+                                      uint64_t start_offset,
+                                      uint64_t *total_out) {
+    if (!state || !rom_id || !target_path) return -1;
+    char api_path[512];
+    if (extract_format && extract_format[0]) {
+        snprintf(api_path, sizeof(api_path),
+                 "/api/v1/roms/%s?extract=%s", rom_id, extract_format);
+    } else {
+        snprintf(api_path, sizeof(api_path), "/api/v1/roms/%s", rom_id);
+    }
+    return download_stream_to_file(state, api_path, target_path,
+                                   start_offset, total_out);
+}
+
+int network_download_bundle_file_resumable(const SyncState *state,
+                                           const char *rom_id,
+                                           const char *bundle_file,
+                                           const char *target_path,
+                                           uint64_t start_offset,
+                                           uint64_t *total_out) {
+    if (!state || !rom_id || !bundle_file || !target_path) return -1;
+    /* Relative paths inside the bundle commonly contain spaces,
+     * parentheses, brackets, and translation tags.  These must be escaped
+     * before they are placed in the HTTP request line; otherwise the
+     * server rejects the request as malformed before it reaches FastAPI. */
+    char encoded_file[512];
+    if (!url_encode_path(bundle_file, encoded_file, sizeof(encoded_file))) {
+        debug_log("net: bundle file path too long to URL-encode: %s",
+                  bundle_file);
+        return -1;
+    }
+
+    char api_path[768];
+    snprintf(api_path, sizeof(api_path),
+             "/api/v1/roms/%s/file/%s", rom_id, encoded_file);
+    return download_stream_to_file(state, api_path, target_path,
+                                   start_offset, total_out);
+}
+
+int network_fetch_rom_manifest_http(const SyncState *state,
+                                    const char *rom_id,
+                                    char *out, uint32_t out_size,
+                                    int *status_out) {
+    if (!state || !rom_id || !out || out_size < 2) return -1;
+
+    char path[256];
+    snprintf(path, sizeof(path), "/api/v1/roms/%s/manifest", rom_id);
+
+    int status = 0;
+    int n = http_request(state, "GET", path,
+                         NULL, NULL, 0,
+                         (uint8_t *)out, out_size, &status);
+    if (status_out) *status_out = status;
+    if (n < 0 || status != 200) {
+        debug_log("net: fetch_rom_manifest %s -> status=%d n=%d",
+                  rom_id, status, n);
+        return n < 0 ? n : -1;
+    }
+    return n;
 }

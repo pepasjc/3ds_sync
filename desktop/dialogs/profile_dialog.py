@@ -3,6 +3,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -14,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
@@ -23,6 +25,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from config import DEVICE_TYPES, SYSTEM_CHOICES
+from rom_installer import ROM_FORMAT_LABELS, ROM_FORMAT_OPTIONS
 from systems import SAVE_EXT_CHOICES, SYSTEM_DEFAULT_SAVE_EXT
 
 
@@ -36,9 +39,12 @@ SINGLE_SYSTEM_DEVICES = {
     "MEGA EverDrive",
     "SAROO",
     "MemCard Pro",
+    "MemCard Pro FTP",
+    "PSIO",
     "CD Folder",
 }
 MEMCARD_PRO_SYSTEMS = ["PS1", "PS2", "GC", "DC"]
+MEMCARD_PRO_FTP_SYSTEMS = ["PS1", "PS2", "GC"]
 
 # Relevant systems per multi-system device type (ordered by popularity)
 DEVICE_SYSTEMS: dict[str, list[str]] = {
@@ -273,6 +279,22 @@ class SaveExtDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+class RomFormatDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        combo.addItems([label for _value, label in ROM_FORMAT_OPTIONS])
+        return combo
+
+    def setEditorData(self, editor, index):
+        editor.setCurrentText(index.data() or "Auto")
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText().strip() or "Auto")
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
 # ---------------------------------------------------------------------------
 # Main dialog
 # ---------------------------------------------------------------------------
@@ -321,17 +343,49 @@ class ProfileDialog(QDialog):
         self.device_combo.currentTextChanged.connect(self._on_device_changed)
         form.addRow("Device Type:", self.device_combo)
 
+        self.ftp_host_edit = QLineEdit()
+        self.ftp_host_edit.setPlaceholderText("MemCard PRO IP address or hostname")
+        self._ftp_host_label = QLabel("FTP Host:")
+        form.addRow(self._ftp_host_label, self.ftp_host_edit)
+
+        self.ftp_port_spin = QSpinBox()
+        self.ftp_port_spin.setRange(1, 65535)
+        self.ftp_port_spin.setValue(21)
+        self._ftp_port_label = QLabel("FTP Port:")
+        form.addRow(self._ftp_port_label, self.ftp_port_spin)
+
+        self.ftp_username_edit = QLineEdit()
+        self.ftp_username_edit.setPlaceholderText("Required — set in MemCard PRO WebUI")
+        self._ftp_username_label = QLabel("FTP Username:")
+        form.addRow(self._ftp_username_label, self.ftp_username_edit)
+
+        self.ftp_password_edit = QLineEdit()
+        self.ftp_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ftp_password_edit.setPlaceholderText("Required — set in MemCard PRO WebUI")
+        self._ftp_password_label = QLabel("FTP Password:")
+        form.addRow(self._ftp_password_label, self.ftp_password_edit)
+
         game_row = QWidget()
         game_layout = QHBoxLayout(game_row)
         game_layout.setContentsMargins(0, 0, 0, 0)
         self.game_folder_edit = QLineEdit()
         self.game_folder_edit.setPlaceholderText("Root game / ROM folder...")
-        browse_game_btn = QPushButton("Browse...")
-        browse_game_btn.clicked.connect(self._browse_game_folder)
+        self.browse_game_btn = QPushButton("Browse...")
+        self.browse_game_btn.clicked.connect(self._browse_game_folder)
         game_layout.addWidget(self.game_folder_edit)
-        game_layout.addWidget(browse_game_btn)
+        game_layout.addWidget(self.browse_game_btn)
         self._game_folder_label = QLabel("Game Folder:")
         form.addRow(self._game_folder_label, game_row)
+
+        self.sd_card_check = QCheckBox("This is an SD card (remap drive letter)")
+        self.sd_card_check.setToolTip(
+            "When checked, the drive letter of every path in this profile is\n"
+            "rewritten to the \"Current SD Card Drive\" set in Server Configuration\n"
+            "at sync/install time. Use this when your card reader gets a different\n"
+            "drive letter on each reconnect."
+        )
+        self._sd_card_label = QLabel("Removable:")
+        form.addRow(self._sd_card_label, self.sd_card_check)
 
         # ── Single-system section (Generic / Everdrive) ────────────────
         self._single_widget = QWidget()
@@ -368,6 +422,11 @@ class ProfileDialog(QDialog):
         self.save_ext_combo.setCurrentText(".sav")
         layout.addRow("Save Extension:", self.save_ext_combo)
 
+        self.rom_format_combo = QComboBox()
+        self.rom_format_combo.addItems([label for _value, label in ROM_FORMAT_OPTIONS])
+        self.rom_format_combo.setCurrentText("Auto")
+        layout.addRow("ROM Install Format:", self.rom_format_combo)
+
         # Separate save folder (optional)
         sep_row = QWidget()
         sep_layout = QHBoxLayout(sep_row)
@@ -383,7 +442,9 @@ class ProfileDialog(QDialog):
         sep_layout.addWidget(self.single_save_folder_edit)
         sep_layout.addWidget(browse_save_btn)
         sep_layout.addWidget(clear_save_btn)
-        layout.addRow("Save Folder:", sep_row)
+        self._single_save_row_label = QLabel("Save Folder:")
+        self._single_save_row_widget = sep_row
+        layout.addRow(self._single_save_row_label, self._single_save_row_widget)
 
         # Redump DAT file (optional, only shown for CD Folder profiles)
         dat_row = QWidget()
@@ -440,20 +501,30 @@ class ProfileDialog(QDialog):
         layout.addLayout(table_hdr_row)
 
         # Systems table
-        self.systems_table = QTableWidget(0, 5)
+        self.systems_table = QTableWidget(0, 6)
         self.systems_table.setHorizontalHeaderLabels(
-            ["", "System", "Save Format", "Save Folder Override", "ROM Folder Override"]
+            [
+                "",
+                "System",
+                "Save Format",
+                "ROM Format",
+                "Save Folder Override",
+                "ROM Folder Override",
+            ]
         )
         hdr = self.systems_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.systems_table.setColumnWidth(0, 28)
         self.systems_table.setColumnWidth(1, 90)
         self.systems_table.setColumnWidth(2, 170)
+        self.systems_table.setColumnWidth(3, 150)
         self.systems_table.setItemDelegateForColumn(2, SaveExtDelegate(self, self))
+        self.systems_table.setItemDelegateForColumn(3, RomFormatDelegate(self))
         self.systems_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -504,21 +575,53 @@ class ProfileDialog(QDialog):
         self._multi_widget.setVisible(not is_single)
 
         is_memcard = device_type == "MemCard Pro"
+        is_memcard_ftp = device_type == "MemCard Pro FTP"
+        is_psio = device_type == "PSIO"
         is_saroo = device_type == "SAROO"
         self._set_single_system_choices(device_type)
+        for widget in (
+            self._ftp_host_label,
+            self.ftp_host_edit,
+            self._ftp_port_label,
+            self.ftp_port_spin,
+            self._ftp_username_label,
+            self.ftp_username_edit,
+            self._ftp_password_label,
+            self.ftp_password_edit,
+        ):
+            widget.setVisible(is_memcard_ftp)
+        self.browse_game_btn.setVisible(not is_memcard_ftp)
+        self._sd_card_label.setVisible(not is_memcard_ftp)
+        self.sd_card_check.setVisible(not is_memcard_ftp)
         # Show Redump DAT field only for CD Folder profiles
         is_cd = device_type == "CD Folder"
         self._dat_row_label.setVisible(is_cd)
         self._dat_row_widget.setVisible(is_cd)
-        self._game_folder_label.setText(
-            "Root Folder:" if is_memcard else "Game Folder:"
-        )
-        if is_memcard:
+        folder_label = "Game Folder:"
+        if is_memcard_ftp:
+            folder_label = "Remote Root:"
+        elif is_memcard:
+            folder_label = "Root Folder:"
+        elif is_psio:
+            folder_label = "SD Card Root:"
+        self._game_folder_label.setText(folder_label)
+        self._single_save_row_label.setVisible(not is_memcard_ftp)
+        self._single_save_row_widget.setVisible(not is_memcard_ftp)
+        if is_memcard_ftp:
+            self.game_folder_edit.setPlaceholderText(
+                "/, /MemoryCards, /PS2, or a system-specific remote folder"
+            )
+        elif is_memcard:
             self.game_folder_edit.setPlaceholderText(
                 "MemCard Pro root folder or MemoryCards folder..."
             )
             self.single_save_folder_edit.setPlaceholderText(
                 "Leave empty — not used for MemCard Pro"
+            )
+        elif is_psio:
+            self.game_folder_edit.setPlaceholderText("PSIO SD card root folder...")
+            self.single_save_folder_edit.setPlaceholderText(
+                "Memory card folder (optional)"
             )
         elif is_saroo:
             self.game_folder_edit.setPlaceholderText(
@@ -534,8 +637,13 @@ class ProfileDialog(QDialog):
             )
 
         # Card-manager and CD-folder profiles default to PS1 + .mcd.
-        if (is_cd or is_memcard) and not self._loading:
+        if (is_cd or is_memcard or is_memcard_ftp or is_psio) and not self._loading:
             self._apply_single_system_defaults("PS1")
+            if is_psio:
+                fmt_label = ROM_FORMAT_LABELS.get("psio", "PSIO BIN/CU2")
+                idx = self.rom_format_combo.findText(fmt_label)
+                if idx >= 0:
+                    self.rom_format_combo.setCurrentIndex(idx)
 
         # SAROO is always SAT; lock system and hide save-ext picker
         if is_saroo and not self._loading:
@@ -550,6 +658,7 @@ class ProfileDialog(QDialog):
                     "",
                     "System",
                     "Core" if device_type == "RetroArch" else "Save Format",
+                    "ROM Format",
                     "Save Folder Override",
                     "ROM Folder Override",
                 ]
@@ -560,9 +669,14 @@ class ProfileDialog(QDialog):
     def _set_single_system_choices(self, device_type: str) -> None:
         """Restrict the system picker for device-specific single-system profiles."""
         current = self.system_combo.currentText()
-        choices = (
-            MEMCARD_PRO_SYSTEMS if device_type == "MemCard Pro" else SYSTEM_CHOICES
-        )
+        if device_type == "MemCard Pro FTP":
+            choices = MEMCARD_PRO_FTP_SYSTEMS
+        elif device_type == "MemCard Pro":
+            choices = MEMCARD_PRO_SYSTEMS
+        elif device_type == "PSIO":
+            choices = ["PS1"]
+        else:
+            choices = SYSTEM_CHOICES
         self.system_combo.blockSignals(True)
         self.system_combo.clear()
         self.system_combo.addItems(choices)
@@ -664,14 +778,24 @@ class ProfileDialog(QDialog):
                 )
             self.systems_table.setItem(row, 2, ext_item)
 
-            # Col 3 — save folder override (editable text, empty = use global)
+            # Col 3 — ROM install format
+            rom_format = str(info.get("rom_format", "auto") or "auto").lower()
+            fmt_item = QTableWidgetItem(ROM_FORMAT_LABELS.get(rom_format, "Auto"))
+            fmt_item.setFlags(ro_flags | Qt.ItemFlag.ItemIsEditable)
+            fmt_item.setToolTip(
+                "Format requested when installing ROMs from the server catalog.\n"
+                "Auto uses the built-in default for this profile and system."
+            )
+            self.systems_table.setItem(row, 3, fmt_item)
+
+            # Col 4 — save folder override (editable text, empty = use global)
             folder_item = QTableWidgetItem(info.get("save_folder", ""))
             folder_item.setFlags(ro_flags | Qt.ItemFlag.ItemIsEditable)
             folder_item.setToolTip(
                 "Override save folder for this specific system.\n"
                 "Leave empty to auto-compute from the save root above."
             )
-            self.systems_table.setItem(row, 3, folder_item)
+            self.systems_table.setItem(row, 4, folder_item)
 
             rom_folder_item = QTableWidgetItem(info.get("rom_folder", ""))
             rom_folder_item.setFlags(ro_flags | Qt.ItemFlag.ItemIsEditable)
@@ -679,7 +803,7 @@ class ProfileDialog(QDialog):
                 "Optional ROM folder override for this specific system.\n"
                 "Leave empty to use the profile's global Game Folder."
             )
-            self.systems_table.setItem(row, 4, rom_folder_item)
+            self.systems_table.setItem(row, 5, rom_folder_item)
 
     def _set_all_enabled(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
@@ -703,7 +827,7 @@ class ProfileDialog(QDialog):
         )
         if folder:
             self._last_save_override_folder = Path(folder)
-            item = self.systems_table.item(row, 3)
+            item = self.systems_table.item(row, 4)
             if item:
                 item.setText(folder)
 
@@ -711,7 +835,7 @@ class ProfileDialog(QDialog):
         row = self._selected_row()
         if row < 0:
             return
-        item = self.systems_table.item(row, 3)
+        item = self.systems_table.item(row, 4)
         if item:
             item.setText("")
 
@@ -726,7 +850,7 @@ class ProfileDialog(QDialog):
         )
         if folder:
             self._last_rom_override_folder = Path(folder)
-            item = self.systems_table.item(row, 4)
+            item = self.systems_table.item(row, 5)
             if item:
                 item.setText(folder)
 
@@ -734,7 +858,7 @@ class ProfileDialog(QDialog):
         row = self._selected_row()
         if row < 0:
             return
-        item = self.systems_table.item(row, 4)
+        item = self.systems_table.item(row, 5)
         if item:
             item.setText("")
 
@@ -797,6 +921,11 @@ class ProfileDialog(QDialog):
                 self.device_combo.setCurrentIndex(idx)
 
             self.game_folder_edit.setText(profile.get("path", ""))
+            self.sd_card_check.setChecked(bool(profile.get("is_sd_card", False)))
+            self.ftp_host_edit.setText(profile.get("ftp_host", ""))
+            self.ftp_port_spin.setValue(int(profile.get("ftp_port", 21) or 21))
+            self.ftp_username_edit.setText(profile.get("ftp_username", ""))
+            self.ftp_password_edit.setText(profile.get("ftp_password", ""))
 
             device_type = profile.get("device_type", "Generic")
 
@@ -805,6 +934,10 @@ class ProfileDialog(QDialog):
                 if idx >= 0:
                     self.system_combo.setCurrentIndex(idx)
                 self.save_ext_combo.setCurrentText(profile.get("save_ext", ".sav"))
+                rom_format = str(profile.get("rom_format", "auto") or "auto").lower()
+                self.rom_format_combo.setCurrentText(
+                    ROM_FORMAT_LABELS.get(rom_format, "Auto")
+                )
                 self.single_save_folder_edit.setText(profile.get("save_folder", ""))
                 if device_type == "CD Folder":
                     self.dat_file_edit.setText(profile.get("dat_path", ""))
@@ -837,8 +970,22 @@ class ProfileDialog(QDialog):
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "Validation", "Profile name is required.")
             return
+        device_type = self.device_combo.currentText()
+        if device_type == "MemCard Pro FTP":
+            if not self.ftp_host_edit.text().strip():
+                QMessageBox.warning(self, "Validation", "FTP host is required.")
+                return
+            if not self.ftp_username_edit.text().strip():
+                QMessageBox.warning(self, "Validation", "FTP username is required.")
+                return
+            if not self.ftp_password_edit.text():
+                QMessageBox.warning(self, "Validation", "FTP password is required.")
+                return
+            if not self.game_folder_edit.text().strip():
+                self.game_folder_edit.setText("/")
+            self.accept()
+            return
         if not self.game_folder_edit.text().strip():
-            device_type = self.device_combo.currentText()
             message = (
                 "Root folder path is required."
                 if device_type == "MemCard Pro"
@@ -848,14 +995,34 @@ class ProfileDialog(QDialog):
             return
         self.accept()
 
+    def _rom_format_value(self, label_or_value: str) -> str:
+        text = (label_or_value or "Auto").strip()
+        for value, label in ROM_FORMAT_OPTIONS:
+            if text == label or text.lower() == value:
+                return value
+        return "auto"
+
     def get_profile(self) -> dict:
         device_type = self.device_combo.currentText()
 
         base = {
             "name": self.name_edit.text().strip(),
             "device_type": device_type,
-            "path": self.game_folder_edit.text().strip(),
+            "path": self.game_folder_edit.text().strip()
+            or ("/" if device_type == "MemCard Pro FTP" else ""),
         }
+        if device_type != "MemCard Pro FTP" and self.sd_card_check.isChecked():
+            base["is_sd_card"] = True
+        if device_type == "MemCard Pro FTP":
+            base.update(
+                {
+                    "ftp_host": self.ftp_host_edit.text().strip(),
+                    "ftp_port": self.ftp_port_spin.value(),
+                    "ftp_username": self.ftp_username_edit.text().strip(),
+                    "ftp_password": self.ftp_password_edit.text(),
+                    "ftp_passive": True,
+                }
+            )
 
         if device_type in SINGLE_SYSTEM_DEVICES:
             ext = self.save_ext_combo.currentText().strip()
@@ -866,6 +1033,9 @@ class ProfileDialog(QDialog):
                 "save_folder": self.single_save_folder_edit.text().strip(),
                 "system": self.system_combo.currentText(),
                 "save_ext": ext or ".sav",
+                "rom_format": self._rom_format_value(
+                    self.rom_format_combo.currentText()
+                ),
             }
             if device_type == "CD Folder":
                 dat_path = self.dat_file_edit.text().strip()
@@ -878,8 +1048,9 @@ class ProfileDialog(QDialog):
                 cb = self.systems_table.item(row, 0)
                 sys = self.systems_table.item(row, 1)
                 ext = self.systems_table.item(row, 2)
-                fld = self.systems_table.item(row, 3)
-                rom_fld = self.systems_table.item(row, 4)
+                rom_fmt = self.systems_table.item(row, 3)
+                fld = self.systems_table.item(row, 4)
+                rom_fld = self.systems_table.item(row, 5)
                 if not sys:
                     continue
                 ext_text = (ext.text().strip() if ext else ".sav") or ".sav"
@@ -912,6 +1083,9 @@ class ProfileDialog(QDialog):
                         if cb
                         else True,
                         "save_ext": ext_val,
+                        "rom_format": self._rom_format_value(
+                            rom_fmt.text().strip() if rom_fmt else "Auto"
+                        ),
                         "save_folder": folder_val,
                         "rom_folder": rom_folder_val,
                         "core": core_val,

@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 
-from config import load_config, SYSTEM_CHOICES
+from config import load_config, resolve_profile_for_sd, SYSTEM_CHOICES
 from systems import CD_ALL_EXTENSIONS, CD_DATA_EXTENSIONS, CD_FOLDER_SYSTEMS
 
 
@@ -100,6 +100,7 @@ class NormalizeScanWorker(QThread):
         device_type: str = "",
         normalize_fallback: bool = False,
         use_crc: bool = True,
+        serial_map: dict | None = None,
     ):
         super().__init__()
         self.folder = folder
@@ -109,12 +110,21 @@ class NormalizeScanWorker(QThread):
         self.device_type = device_type
         self.normalize_fallback = normalize_fallback
         self.use_crc = use_crc
+        # Optional {serial: canonical_name} map — only populated for systems
+        # whose DAT carries Sony disc serials (PS1 / PS2 / PSP).
+        self.serial_map = serial_map or {}
 
     def run(self):
         import rom_normalizer as rn
 
         # Build name-based index for header matching (patched ROMs)
         name_index = rn.build_name_index(self.no_intro) if self.no_intro else {}
+
+        # Serial-based lookup applies only to Sony disc systems.  When the
+        # DAT didn't include serial info we simply skip the step.
+        use_serial_lookup = bool(self.serial_map) and rn.supports_serial_lookup(
+            self.system
+        )
 
         is_mega_everdrive = self.device_type == "MEGA EverDrive"
         is_cd_folder = self.device_type == "CD Folder"
@@ -167,6 +177,17 @@ class NormalizeScanWorker(QThread):
                                     source = "No-Intro"
                             except Exception:
                                 pass
+
+                    # Step 1b: Sony disc serial embedded in the folder name
+                    # (e.g. "SCES_538.51.007 Agent Under Fire").  Most reliable
+                    # signal for PS2 Redump collections.
+                    if source == "filename" and use_serial_lookup:
+                        serial = rn.extract_ps_serial(game_dir.name)
+                        if serial:
+                            canonical = rn.lookup_serial(serial, self.serial_map)
+                            if canonical:
+                                new_stem = canonical
+                                source = "Serial"
 
                     # Step 2: fuzzy folder-name match (fallback)
                     if source == "filename":
@@ -258,6 +279,16 @@ class NormalizeScanWorker(QThread):
                         except Exception:
                             canonical = None
 
+                    # Sony disc-serial match — great for PS2 ROMs named like
+                    # "SCES_538.51.game name.iso".
+                    if source == "filename" and use_serial_lookup:
+                        serial = rn.extract_ps_serial(rom.name)
+                        if serial:
+                            canonical = rn.lookup_serial(serial, self.serial_map)
+                            if canonical:
+                                new_stem = canonical
+                                source = "Serial"
+
                     if source == "filename":
                         header_title = rn.read_rom_header_title(rom, self.system)
                         if header_title:
@@ -278,6 +309,9 @@ class NormalizeScanWorker(QThread):
                             new_stem = rn.find_region_preferred(
                                 new_stem, self.no_intro, region_hint
                             )
+                        new_stem = rn.apply_source_disc(
+                            new_stem, self.no_intro, rom.name
+                        )
 
                     if source == "filename" and self.normalize_fallback:
                         bracket_idx = rom.stem.find("[")
@@ -333,23 +367,53 @@ class NormalizeScanWorker(QThread):
                     new_stem = canonical  # e.g. "Bahamut Lagoon (Japan)"
                     source = "No-Intro"
                 else:
-                    # Step 2: read ROM header, match via No-Intro index
-                    # Handles translated ROMs ("Bahamut Lagoon Eng v31" → "bahamut_lagoon")
-                    # and roman/arabic mismatches ("FINAL FANTASY 5" → "Final Fantasy V")
+                    # Step 1b: Sony disc serial embedded in the filename.
+                    # Runs before header-matching because it's both faster
+                    # (no disc I/O) and more reliable for PS2 ISOs where
+                    # the filename looks like "SCES_538.51.game.iso".
+                    if use_serial_lookup:
+                        serial = rn.extract_ps_serial(rom.name)
+                        if serial:
+                            canonical = rn.lookup_serial(serial, self.serial_map)
+                            if canonical:
+                                new_stem = canonical
+                                source = "Serial"
+                if source == "filename" and self.no_intro:
+                    # Step 2 / 3: try BOTH header-based and fuzzy-filename matching,
+                    # then prefer the more-specific canonical (one with more slug
+                    # segments).  Cartridge headers (SNES, GBA, GB, MD) are truncated
+                    # to ~21 chars and lose subtitles ("THE LEGEND OF ZELDA" cannot
+                    # distinguish Zelda 1 from A Link to the Past), so when the
+                    # filename slug has more words the filename wins.
+                    header_canonical: str | None = None
                     header_title = rn.read_rom_header_title(rom, self.system)
                     if header_title:
-                        canonical = rn.lookup_header_in_index(header_title, name_index)
-                        if canonical:
-                            new_stem = canonical  # e.g. "Final Fantasy V (Japan)"
+                        header_canonical = rn.lookup_header_in_index(
+                            header_title, name_index
+                        )
+                    fuzzy_canonical = rn.fuzzy_filename_search(rom.name, name_index)
+
+                    def _slug_segments(name: str) -> int:
+                        return len(rn.normalize_name(name).split("_"))
+
+                    if header_canonical and fuzzy_canonical:
+                        if header_canonical == fuzzy_canonical:
+                            new_stem = header_canonical
                             source = "Header"
-                    # Step 3: fuzzy filename prefix search — finds games like
-                    # "Chaos Seed.sfc" → "Chaos Seed - Fuusui Kairoki (Japan)"
-                    # when the filename slug is a unique prefix of a No-Intro key.
-                    if source == "filename":
-                        canonical = rn.fuzzy_filename_search(rom.name, name_index)
-                        if canonical:
-                            new_stem = canonical
+                        elif _slug_segments(fuzzy_canonical) >= _slug_segments(
+                            header_canonical
+                        ):
+                            new_stem = fuzzy_canonical
                             source = "Fuzzy"
+                        else:
+                            new_stem = header_canonical
+                            source = "Header"
+                    elif header_canonical:
+                        new_stem = header_canonical
+                        source = "Header"
+                    elif fuzzy_canonical:
+                        new_stem = fuzzy_canonical
+                        source = "Fuzzy"
                     # Step 4: normalize fallback (opt-in) — only if "Enable Normalize ROMs"
                     # is checked. Prefers bracket-trim over full slug normalization.
                     if source == "filename" and self.normalize_fallback:
@@ -384,6 +448,11 @@ class NormalizeScanWorker(QThread):
                             new_stem = rn.find_region_preferred(
                                 new_stem, self.no_intro, region_hint
                             )
+                        # Multi-disc: name matching is disc-agnostic, so correct
+                        # the canonical to the disc this source file actually is.
+                        new_stem = rn.apply_source_disc(
+                            new_stem, self.no_intro, rom.name
+                        )
 
             new_rom = rom.parent / (new_stem + ext)
             subfolder = (
@@ -479,6 +548,7 @@ class RomNormalizerTab(QWidget):
         super().__init__()
         self._renames: list[dict] = []
         self._no_intro: dict = {}
+        self._serial_map: dict = {}
         self._worker = None
         self._loaded_dat_path: Path | None = None
         self._device_type: str = ""
@@ -600,6 +670,7 @@ class RomNormalizerTab(QWidget):
             [
                 "All",
                 "No-Intro",
+                "Serial",
                 "Header",
                 "Fuzzy",
                 "Folder",
@@ -648,7 +719,7 @@ class RomNormalizerTab(QWidget):
             self.folder_edit.setText(folder)
 
     def _load_from_profile(self):
-        profiles = load_config().get("profiles", [])
+        profiles = [resolve_profile_for_sd(p) for p in load_config().get("profiles", [])]
         if not profiles:
             QMessageBox.information(
                 self,
@@ -762,9 +833,17 @@ class RomNormalizerTab(QWidget):
         import rom_normalizer as rn
 
         self._no_intro = rn.load_no_intro_dat(path)
+        # Libretro clrmamepro DATs (PS1 / PS2 / PSP) carry Sony serials.
+        # Failures are silent so systems with no serial info just skip the step.
+        self._serial_map = rn.load_serial_map(path)
         self._loaded_dat_path = path
         count = len(self._no_intro)
-        self.dat_label.setText(f"{path.name}  ({count:,} entries)")
+        serial_count = len(self._serial_map)
+        label = f"{path.name}  ({count:,} entries"
+        if serial_count:
+            label += f", {serial_count:,} serials"
+        label += ")"
+        self.dat_label.setText(label)
         self.dat_label.setStyleSheet("color: green;" if count > 0 else "color: red;")
 
     def _scan(self):
@@ -791,6 +870,7 @@ class RomNormalizerTab(QWidget):
             self.device_combo.currentText(),
             self.normalize_fallback_check.isChecked(),
             self.crc_check.isChecked(),
+            serial_map=self._serial_map,
         )
         self._worker.finished.connect(self._on_scan_done)
         self._worker.progress.connect(self.status_label.setText)
@@ -803,6 +883,7 @@ class RomNormalizerTab(QWidget):
         roms_only = [r for r in renames if r["source"] != "Save"]
         saves_only = [r for r in renames if r["source"] == "Save"]
         nointro = sum(1 for r in roms_only if r["source"] == "No-Intro")
+        serial = sum(1 for r in roms_only if r["source"] == "Serial")
         header = sum(1 for r in roms_only if r["source"] == "Header")
         fuzzy = sum(1 for r in roms_only if r["source"] == "Fuzzy")
         folder = sum(1 for r in roms_only if r["source"] == "Folder")
@@ -812,6 +893,7 @@ class RomNormalizerTab(QWidget):
 
         SOURCE_COLORS = {
             "No-Intro": QColor(0, 200, 0),
+            "Serial": QColor(0, 200, 160),
             "Header": QColor(80, 160, 255),
             "Fuzzy": QColor(200, 100, 255),
             "Folder": QColor(255, 160, 50),
@@ -870,6 +952,8 @@ class RomNormalizerTab(QWidget):
             parts = []
             if nointro:
                 parts.append(f"{nointro} No-Intro CRC")
+            if serial:
+                parts.append(f"{serial} PS serial match")
             if header:
                 parts.append(f"{header} header match")
             if fuzzy:
@@ -905,6 +989,7 @@ class RomNormalizerTab(QWidget):
         """Grey out non-No-Intro rows when 'No-Intro only' is checked."""
         SOURCE_COLORS = {
             "No-Intro": QColor(0, 200, 0),
+            "Serial": QColor(0, 200, 160),
             "Header": QColor(80, 160, 255),
             "Fuzzy": QColor(200, 100, 255),
             "Folder": QColor(255, 160, 50),
@@ -921,6 +1006,7 @@ class RomNormalizerTab(QWidget):
             source = src_item.text()
             excluded = nointro_only and source not in (
                 "No-Intro",
+                "Serial",
                 "Header",
                 "Fuzzy",
                 "Folder",
@@ -1027,6 +1113,7 @@ class RomNormalizerTab(QWidget):
                 continue
             if nointro_only and r["source"] not in (
                 "No-Intro",
+                "Serial",
                 "Header",
                 "Fuzzy",
                 "Folder",

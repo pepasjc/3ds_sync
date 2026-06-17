@@ -5,6 +5,7 @@ import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.Headers
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -148,6 +149,17 @@ interface SaveSyncApi {
         @Body request: SaturnArchiveLookupRequest
     ): SaturnArchiveLookupResponse
 
+    /**
+     * Resolve emulator-style title_ids (SYSTEM_slug) to canonical No-Intro /
+     * DAT names by joining against the server's ROM catalog.  Used when
+     * synthesising save filenames for server-only entries so the path
+     * matches what the emulator writes to disk.
+     */
+    @POST("api/v1/titles/canonical-names")
+    suspend fun lookupCanonicalNames(
+        @Body request: CanonicalNamesRequest
+    ): CanonicalNamesResponse
+
     // ── ROM catalog ──────────────────────────────────────────────────────
 
     @GET("api/v1/roms")
@@ -165,5 +177,9 @@ interface SaveSyncApi {
     suspend fun downloadRom(
         @Path("rom_id") romId: String,
         @Query("extract") extract: String? = null,
+        // Optional Range header for resumable downloads.  When supplied the
+        // server returns HTTP 206 with the requested byte range; the
+        // DownloadManager appends those bytes to the existing .part file.
+        @Header("Range") range: String? = null,
     ): Response<ResponseBody>
 }

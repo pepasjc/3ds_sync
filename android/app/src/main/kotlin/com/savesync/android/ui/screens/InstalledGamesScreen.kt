@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -55,11 +56,18 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.savesync.android.MainActivity
+import com.savesync.android.findComponentActivity
 import com.savesync.android.installed.InstalledRom
 import com.savesync.android.installed.InstalledRomsScanner
 import com.savesync.android.ui.MainViewModel
+import com.savesync.android.ui.SaveDetailState
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
+import com.savesync.android.ui.components.firstLetter
+import com.savesync.android.ui.components.handleHorizontalHoldKeyEvent
+import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 
 /**
@@ -84,6 +92,9 @@ fun InstalledGamesScreen(
     val loading by viewModel.installedRomsLoading.collectAsState()
     val loaded by viewModel.installedRomsLoaded.collectAsState()
     val deleteState by viewModel.deleteInstalledState.collectAsState()
+    // Shared with SaveDetailScreen — emits Working/Success/Error during a
+    // save sync triggered from the per-rom dialog below.
+    val saveDetailState by viewModel.saveDetailState.collectAsState()
 
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -96,6 +107,8 @@ fun InstalledGamesScreen(
     // ── Gamepad navigation state ────────────────────────────────────────
     var selectedIndex by remember { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
+    // Hold-to-accelerate state for d-pad left/right (page → alphabet jump).
+    val holdNav = rememberHoldNavState()
     val listFocusRequester = remember { FocusRequester() }
     val searchFocusRequester = remember { FocusRequester() }
 
@@ -136,6 +149,25 @@ fun InstalledGamesScreen(
         }
     }
 
+    // Surface the result of a sync triggered from this tab as a snackbar
+    // and clear the shared SaveDetailState afterwards so navigating to
+    // SaveDetailScreen later doesn't re-show a stale message.  We don't
+    // observe the Working state here — the dialog already closed; a
+    // snackbar that says "Syncing…" then disappears would be noisy.
+    LaunchedEffect(saveDetailState) {
+        when (val s = saveDetailState) {
+            is SaveDetailState.Success -> {
+                scope.launch { snackbarHostState.showSnackbar(s.message) }
+                viewModel.resetDetailState()
+            }
+            is SaveDetailState.Error -> {
+                scope.launch { snackbarHostState.showSnackbar(s.message) }
+                viewModel.resetDetailState()
+            }
+            else -> Unit
+        }
+    }
+
     val filtered = remember(roms, query, systemFilter) {
         filterInstalled(roms, query, systemFilter)
     }
@@ -155,6 +187,14 @@ fun InstalledGamesScreen(
         val idx = all.indexOf(systemFilter).let { if (it < 0) 0 else it }
         val next = (idx + delta + all.size) % all.size
         systemFilter = all[next]
+    }
+
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the toolbar chip
+    // stays in sync.
+    val activity = LocalContext.current.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, systems, systemFilter) {
+        activity?.systemCycleEvents?.collect { delta -> cycleSystem(delta) }
     }
 
     Scaffold(
@@ -200,6 +240,39 @@ fun InstalledGamesScreen(
                 .focusRequester(listFocusRequester)
                 .focusable()
                 .onPreviewKeyEvent { event ->
+                    if (holdNav.handleHorizontalHoldKeyEvent(
+                            event,
+                            scope,
+                            onPage = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val page = listState.layoutInfo.visibleItemsInfo.size
+                                        .coerceAtLeast(1)
+                                    selectedIndex = (selectedIndex + d * page)
+                                        .coerceIn(0, filtered.size - 1)
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                            onAlphabet = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val cur = selectedIndex.coerceIn(0, filtered.size - 1)
+                                    val curLetter = firstLetter(filtered[cur].displayName)
+                                    val step = if (d > 0) 1 else -1
+                                    var row = cur + step
+                                    var found = -1
+                                    while (row in filtered.indices) {
+                                        val ltr = firstLetter(filtered[row].displayName)
+                                        if (ltr.isNotEmpty() && ltr != curLetter) {
+                                            found = row; break
+                                        }
+                                        row += step
+                                    }
+                                    selectedIndex = if (found >= 0) found
+                                        else if (d > 0) filtered.size - 1 else 0
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                        )
+                    ) return@onPreviewKeyEvent true
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
                         Key.DirectionDown -> {
@@ -212,29 +285,6 @@ fun InstalledGamesScreen(
                         Key.DirectionUp -> {
                             if (filtered.isNotEmpty()) {
                                 selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
-                            true
-                        }
-                        // D-pad / stick left/right → cycle system filter
-                        Key.DirectionLeft -> { cycleSystem(-1); true }
-                        Key.DirectionRight -> { cycleSystem(1); true }
-                        // L1 / R1 → page-scroll the list (Steam Deck parity).
-                        Key.ButtonL1 -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
-                            true
-                        }
-                        Key.ButtonR1 -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex + page)
-                                    .coerceAtMost(filtered.size - 1)
                                 scope.launch { listState.animateScrollToItem(selectedIndex) }
                             }
                             true
@@ -264,7 +314,8 @@ fun InstalledGamesScreen(
                             viewModel.scanInstalledRoms(force = true)
                             true
                         }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (system cycle) and L2/R2 (tab cycle) are
+                        // intercepted at the Activity level — never reach here.
                         else -> false
                     }
                 }
@@ -339,15 +390,17 @@ fun InstalledGamesScreen(
         val wholeFolder = InstalledRomsScanner.wouldRemoveWholeFolder(rom)
         AlertDialog(
             onDismissRequest = { confirmTarget = null },
-            title = { Text("Delete ROM?") },
+            // Title shows the game name so the dialog reads as a per-rom
+            // action sheet instead of just "Delete ROM?" (which was
+            // misleading once we added the Sync Saves action below).
+            title = { Text(rom.displayName, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    Text(rom.displayName, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(6.dp))
                     Text("System: ${rom.system}")
+                    Spacer(Modifier.height(6.dp))
                     if (wholeFolder) {
                         Text(
-                            "Removes the whole folder (and every file inside it):",
+                            "Folder: ${rom.path.parentFile?.name ?: "?"}",
                         )
                         Text(
                             rom.path.parentFile?.absolutePath ?: rom.path.absolutePath,
@@ -366,23 +419,52 @@ fun InstalledGamesScreen(
                         )
                     }
                     Spacer(Modifier.height(6.dp))
-                    Text("Frees: ${formatBytes(rom.size)}")
-                    Spacer(Modifier.height(8.dp))
+                    Text("Size: ${formatBytes(rom.size)}")
+                    Spacer(Modifier.height(12.dp))
                     Text(
-                        "This removes the data permanently and cannot be undone.",
+                        "Sync Saves uploads / downloads this game's save against the server. Delete removes the ROM data permanently — this can't be undone.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             },
+            // confirmButton hosts the primary (non-destructive) Sync action.
+            // Material3 AlertDialog only exposes confirm + dismiss slots, so
+            // the destructive Delete moves into the dismiss slot beside
+            // Cancel as a Row — matches the visual convention "destructive
+            // buttons live on the left, primary on the right."
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.deleteInstalledRom(rom)
+                    viewModel.syncInstalledRomSaves(rom)
                     confirmTarget = null
-                }) { Text("Delete") }
+                }) {
+                    Icon(
+                        Icons.Filled.CloudSync,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.size(6.dp))
+                    Text("Sync Saves")
+                }
             },
             dismissButton = {
-                TextButton(onClick = { confirmTarget = null }) { Text("Cancel") }
+                Row {
+                    TextButton(onClick = {
+                        viewModel.deleteInstalledRom(rom)
+                        confirmTarget = null
+                    }) {
+                        Icon(
+                            Icons.Filled.Delete,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(Modifier.size(6.dp))
+                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                    }
+                    Spacer(Modifier.size(4.dp))
+                    TextButton(onClick = { confirmTarget = null }) { Text("Cancel") }
+                }
             }
         )
     }

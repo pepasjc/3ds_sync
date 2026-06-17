@@ -14,9 +14,45 @@ Folder layout (EmuDeck / RetroDeck standard):
 
 The folder name is mapped to a system code and filenames are matched against
 the DAT slug index. CRC32 is skipped by default (ROMs are pre-normalized).
+
+PS3 bundles
+-----------
+The PS3 system has a special layout because PSN packages typically ship as
+multi-file sets (e.g. one ``.pkg`` plus a matching ``.rap`` activation
+file).  Anything inside ``<rom_dir>/ps3/<subfolder>/`` containing at least
+one ``.pkg`` is collapsed into a *single* catalog entry whose ``name`` is
+the subfolder name.  Loose ``.pkg`` files at ``<rom_dir>/ps3/`` are skipped
+on purpose — operators must drop PSN content into a per-game folder so the
+client knows what to display and where each file should land.
+
+Top-level ``.iso`` files at ``<rom_dir>/ps3/`` continue to scan as
+individual entries (one per ISO).
+
+PS1 bundles
+-----------
+PS1 subfolders are bundled too — webMAN's PS1 emulator on real PS3
+hardware expects each game at ``/dev_hdd0/PSXISO/<game>/<files>``, so the
+PS3 client downloads them as bundles and lays the files out under that
+per-game directory.  Any subfolder of ``<rom_dir>/psx/`` that contains a
+PS1 ROM file (``.cue``/``.bin``/``.chd``/``.iso``/``.pbp``) becomes a
+single bundle entry whose ``name`` is the subfolder name.  Top-level PS1
+files (loose ``.chd`` etc) are still scanned as individual entries —
+unlike PS3 we don't reject them, because per-disc-format PS1 layouts at
+the top level are common in existing libraries.
+
+Xbox bundles
+------------
+Xbox releases are stored as per-game subfolders because the disc image
+often travels with one or more launcher files.  Any subfolder of
+``<rom_dir>/xbox/`` containing a ``.cci``, or a ``default.xbe`` alongside
+a ``.iso``, is collapsed into one catalog entry.  By default the bundle is
+served as a ZIP; clients can request ``?extract=iso`` to get just the disc
+image (converted from CCI or streamed directly if already ISO).  Loose
+top-level ``.iso`` files remain single-file entries.
 """
 
 import binascii
+import json
 import logging
 import re
 from collections import Counter
@@ -36,6 +72,47 @@ logger = logging.getLogger(__name__)
 SKIP_NAMES = frozenset({"metadata.txt", "systeminfo.txt"})
 _ARCHIVE_EXTENSIONS = frozenset({".zip", ".7z", ".rar"})
 
+# Directory names that should never be walked as part of a rom catalog,
+# regardless of where they appear under ``rom_dir``.  The conversion cache
+# (``_conversion_cache``) is the practical case: when an operator sets
+# ``tmp_dir`` to a path nested inside ``rom_dir`` the scanner would otherwise
+# index hashed cache outputs (e.g. ``Foo_fda7066b29d259e8.cso``) as legit
+# catalog entries, which then leak the cache hash into client-side filenames.
+SKIP_DIR_NAMES = frozenset({"_conversion_cache"})
+
+
+def _is_inside_skipped_dir(file_path: Path) -> bool:
+    return any(part in SKIP_DIR_NAMES for part in file_path.parts)
+
+# Extensions that join a PS3 bundle even though they aren't ROM_EXTENSIONS
+# in their own right — .rap files are PSN activation tickets the PS3 needs
+# alongside the .pkg, and they always travel together.
+_PS3_BUNDLE_COMPANION_EXTS = frozenset({".rap", ".edat"})
+
+# Extensions that mark a PS1 subfolder as a bundle target.  Only one of
+# these has to be present for the whole subfolder to graduate to a
+# catalog entry; companion files (.bin, .sub, .ccd, .toc) come along for
+# the ride via the keep-list below.
+_PS1_BUNDLE_TRIGGER_EXTS = frozenset({
+    ".cue", ".chd", ".iso", ".pbp", ".bin", ".img", ".ccd",
+})
+
+# Companion extensions kept inside a PS1 bundle even when not in
+# ROM_EXTENSIONS.  Multi-track CD images use .sub/.ccd/.toc/.sbi as
+# sidecars; we ship them so the PS1 emulator on the client can mount the
+# disc the same way it lives on the server.
+_PS1_BUNDLE_COMPANION_EXTS = frozenset({
+    ".sub", ".ccd", ".toc", ".sbi", ".m3u",
+})
+
+# Xbox bundles preserve their whole per-game directory because attach
+# launchers and emulator helper files do not have one stable extension across
+# every library.  The scanner still ignores the same metadata sidecars as the
+# other bundle paths.
+_XBOX_BUNDLE_TRIGGER_EXTS = frozenset({".cci"})
+_XBOX_BUNDLE_XBE_NAME = "default.xbe"
+_XBOX_FILE_EXTS = frozenset({".iso", ".cci"})
+
 
 class RomEntry:
     __slots__ = (
@@ -48,6 +125,8 @@ class RomEntry:
         "size",
         "crc32",
         "source",
+        "is_bundle",
+        "bundle_files",
     )
 
     def __init__(
@@ -61,6 +140,8 @@ class RomEntry:
         size: int,
         crc32: str = "",
         source: str = "filename",
+        is_bundle: bool = False,
+        bundle_files: Optional[list[dict]] = None,
     ):
         self.rom_id = rom_id
         self.title_id = title_id
@@ -71,9 +152,14 @@ class RomEntry:
         self.size = size
         self.crc32 = crc32
         self.source = source
+        self.is_bundle = bool(is_bundle)
+        # bundle_files is the parsed list of {"name": str, "size": int}
+        # dicts.  None and [] are both treated as "not a bundle" so the
+        # client doesn't have to handle two empty representations.
+        self.bundle_files = bundle_files or []
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "rom_id": self.rom_id,
             "title_id": self.title_id,
             "system": self.system,
@@ -83,10 +169,29 @@ class RomEntry:
             "size": self.size,
             "crc32": self.crc32,
             "source": self.source,
+            "is_bundle": self.is_bundle,
         }
+        if self.is_bundle:
+            d["file_count"] = len(self.bundle_files)
+            d["files"] = self.bundle_files
+        return d
 
     @classmethod
     def from_row(cls, row: dict) -> "RomEntry":
+        bundle_files: list[dict] = []
+        raw = row.get("bundle_files", "") or ""
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    bundle_files = parsed
+            except (TypeError, ValueError):
+                # Corrupt JSON — treat as not-a-bundle so the catalog stays
+                # serviceable.  A rescan will rewrite the row correctly.
+                logger.warning(
+                    "[rom_scanner] bundle_files JSON parse failed for %s",
+                    row.get("rom_id"),
+                )
         return cls(
             rom_id=row.get("rom_id", row["title_id"]),
             title_id=row["title_id"],
@@ -97,6 +202,8 @@ class RomEntry:
             size=row["size"],
             crc32=row.get("crc32", ""),
             source=row.get("source", "filename"),
+            is_bundle=bool(row.get("is_bundle", 0)),
+            bundle_files=bundle_files,
         )
 
 
@@ -300,6 +407,19 @@ class RomCatalog:
             rom_id = _make_rom_id(raw_entry, title_counts, used_rom_ids)
             used_rom_ids.add(rom_id)
 
+            bundle_raw = raw_entry.get("bundle_files", "")
+            parsed_files: list[dict] = []
+            if bundle_raw:
+                try:
+                    parsed = json.loads(bundle_raw)
+                    if isinstance(parsed, list):
+                        parsed_files = parsed
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[rom_scanner] dropped malformed bundle_files for %s",
+                        raw_entry.get("title_id"),
+                    )
+
             entry = RomEntry(
                 rom_id=rom_id,
                 title_id=raw_entry["title_id"],
@@ -310,9 +430,19 @@ class RomCatalog:
                 size=raw_entry["size"],
                 crc32=raw_entry["crc32"],
                 source=raw_entry["source"],
+                is_bundle=bool(raw_entry.get("is_bundle", 0)),
+                bundle_files=parsed_files,
             )
             self._add(entry)
-            batch.append(entry.to_dict())
+            # Keep the JSON-encoded shape for SQLite (the upsert helper
+            # passes ``bundle_files`` straight through to the column).
+            db_row = entry.to_dict()
+            db_row["is_bundle"] = 1 if entry.is_bundle else 0
+            db_row["bundle_files"] = bundle_raw
+            db_row["files"] = None  # not a column; .pop avoids strict-keys
+            db_row.pop("files", None)
+            db_row.pop("file_count", None)
+            batch.append(db_row)
 
         rom_db.upsert(batch)
 
@@ -333,8 +463,22 @@ class RomCatalog:
         use_crc32: bool,
         scanned: list[dict],
     ) -> None:
+        if system.upper() == "PS3":
+            self._scan_ps3_folder(folder, norm, rom_dir, use_crc32, scanned)
+            return
+
+        if system.upper() == "XBOX":
+            self._scan_xbox_folder(folder, norm, rom_dir, use_crc32, scanned)
+            return
+
+        if system.upper() == "PS1":
+            self._scan_ps1_folder(folder, norm, rom_dir, use_crc32, scanned)
+            return
+
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
                 continue
             if file_path.name.lower() in SKIP_NAMES:
                 continue
@@ -363,6 +507,440 @@ class RomCatalog:
                     "size": size,
                     "crc32": crc32,
                     "source": source,
+                    "is_bundle": 0,
+                    "bundle_files": "",
+                }
+            )
+
+    def _scan_xbox_folder(
+        self,
+        folder: Path,
+        norm: Optional[object],
+        rom_dir: Path,
+        use_crc32: bool,
+        scanned: list[dict],
+    ) -> None:
+        """Xbox-specific scan with bundle detection.
+
+        A subfolder is treated as a bundle when it contains either:
+          * a ``.cci`` file (compressed disc image + launcher), OR
+          * a ``default.xbe`` alongside a ``.iso`` (extracted disc with
+            XBE launcher — functionally identical to CCI for emulators).
+
+        ISO files that are standalone (not inside a bundle directory) are
+        indexed as individual catalog entries.
+        """
+        system = "XBOX"
+
+        bundle_dirs: list[Path] = []
+        bundled_paths: set[Path] = set()
+
+        for sub in sorted(folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
+            has_cci = any(
+                f.is_file() and f.suffix.lower() in _XBOX_BUNDLE_TRIGGER_EXTS
+                for f in sub.rglob("*")
+            )
+            # Also treat as bundle: subfolder with default.xbe + .iso
+            has_xbe_iso = False
+            if not has_cci:
+                sub_files = [f for f in sub.rglob("*") if f.is_file()]
+                has_xbe = any(
+                    f.name.lower() == _XBOX_BUNDLE_XBE_NAME for f in sub_files
+                )
+                has_iso = any(f.suffix.lower() == ".iso" for f in sub_files)
+                has_xbe_iso = has_xbe and has_iso
+
+            if has_cci or has_xbe_iso:
+                bundle_dirs.append(sub)
+                for f in sub.rglob("*"):
+                    if f.is_file():
+                        bundled_paths.add(f.resolve())
+
+        # ── Pass 1: CCI bundles ───────────────────────────────────────
+        for bundle_dir in bundle_dirs:
+            files: list[tuple[str, int]] = []
+            total_size = 0
+            for f in sorted(bundle_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.lower() in SKIP_NAMES:
+                    continue
+                rel = f.relative_to(bundle_dir).as_posix()
+                size = f.stat().st_size
+                files.append((rel, size))
+                total_size += size
+
+            if not files:
+                continue
+
+            display_name = bundle_dir.name
+            slug = normalize_rom_name(display_name)
+            serial = game_names.lookup_disc_serial(system, display_name)
+            title_id = serial if serial else f"XBOX_BUNDLE_{slug}"
+            rel_dir = str(bundle_dir.relative_to(rom_dir).as_posix())
+
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": display_name,
+                    "filename": f"{display_name}.zip",
+                    "path": rel_dir,
+                    "size": total_size,
+                    "crc32": "",
+                    "source": "bundle",
+                    "is_bundle": 1,
+                    "bundle_files": json.dumps(
+                        [{"name": rel, "size": sz} for rel, sz in files]
+                    ),
+                }
+            )
+
+        # ── Pass 2: ISO files outside CCI bundles ─────────────────────
+        for file_path in sorted(folder.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
+                continue
+            if file_path.resolve() in bundled_paths:
+                continue
+            if file_path.name.lower() in SKIP_NAMES:
+                continue
+
+            ext = file_path.suffix.lower()
+            if ext not in _XBOX_FILE_EXTS:
+                continue
+
+            if ext == ".cci":
+                logger.info(
+                    "[rom_scanner] Xbox: skipping loose .cci outside a "
+                    "bundle subfolder: %s", file_path.name
+                )
+                continue
+
+            crc32 = ""
+            if use_crc32:
+                title_id, canonical_name, source, crc32 = _identify_rom_crc32(
+                    system, file_path, norm
+                )
+            else:
+                title_id, canonical_name, source = _identify_rom_slug(
+                    system, file_path, norm
+                )
+
+            rel_path = str(file_path.relative_to(rom_dir).as_posix())
+            size = file_path.stat().st_size
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": canonical_name,
+                    "filename": file_path.name,
+                    "path": rel_path,
+                    "size": size,
+                    "crc32": crc32,
+                    "source": source,
+                    "is_bundle": 0,
+                    "bundle_files": "",
+                }
+            )
+
+    def _scan_ps3_folder(
+        self,
+        folder: Path,
+        norm: Optional[object],
+        rom_dir: Path,
+        use_crc32: bool,
+        scanned: list[dict],
+    ) -> None:
+        """PS3-specific scan with bundle detection.
+
+        Two passes over the tree:
+          1. Walk every immediate subfolder of ``folder``.  If it contains
+             at least one ``.pkg``, treat the whole subfolder as a bundle
+             entry — name = subfolder, files = every regular file inside
+             (recursively).  Each .pkg's neighbours come along for the ride
+             so .rap activations and similar companions stay grouped.
+          2. Walk the top level for individual ``.iso`` files (the legacy
+             path); skip any loose ``.pkg`` because the client has nowhere
+             to put it without a containing game name.
+
+        Files inside a recognised bundle subfolder are NOT emitted as
+        separate entries — they're owned by the bundle.  Files inside a
+        non-PKG subfolder fall through to the legacy per-file behaviour
+        (matches the previous rglob-based scanner).
+        """
+        system = "PS3"
+
+        bundle_dirs: list[Path] = []
+        # Subdirectory inventory keyed by the resolved Path so the second
+        # pass can answer "is this file inside a bundle dir?" in O(depth).
+        bundled_paths: set[Path] = set()
+
+        for sub in sorted(folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
+            # Walk the subfolder; if any descendant is a .pkg the whole
+            # subfolder graduates to bundle status.
+            has_pkg = any(
+                f.is_file() and f.suffix.lower() == ".pkg"
+                for f in sub.rglob("*")
+            )
+            if has_pkg:
+                bundle_dirs.append(sub)
+                for f in sub.rglob("*"):
+                    if f.is_file():
+                        bundled_paths.add(f.resolve())
+
+        # ── Pass 1: bundles ───────────────────────────────────────────
+        for bundle_dir in bundle_dirs:
+            files: list[tuple[str, int]] = []
+            total_size = 0
+            for f in sorted(bundle_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.lower() in SKIP_NAMES:
+                    continue
+                ext = f.suffix.lower()
+                # Keep .pkg + .rap + any ROM_EXTENSIONS member.  Reject
+                # obvious junk (.txt readmes, .nfo) so the bundle size /
+                # file count match what the client actually downloads.
+                keep = (
+                    ext == ".pkg"
+                    or ext in _PS3_BUNDLE_COMPANION_EXTS
+                    or ext in ROM_EXTENSIONS
+                )
+                if not keep:
+                    continue
+                rel = f.relative_to(bundle_dir).as_posix()
+                size = f.stat().st_size
+                files.append((rel, size))
+                total_size += size
+
+            if not files:
+                # All-junk subfolder somehow — skip rather than emit an
+                # empty bundle.
+                continue
+
+            display_name = bundle_dir.name
+            slug = normalize_rom_name(display_name)
+            # PS3 bundles use a dedicated title_id namespace so they can
+            # never collide with file-based PS3 ROMs (which use their
+            # disc-serial).  Doing so also lets the desktop / steamdeck
+            # clients tell at a glance that an entry is a bundle without
+            # having to parse `is_bundle`.
+            serial = game_names.lookup_disc_serial(system, display_name)
+            title_id = serial if serial else f"PS3_BUNDLE_{slug}"
+            rel_dir = str(bundle_dir.relative_to(rom_dir).as_posix())
+
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": display_name,
+                    # Filename is the .zip the bundle endpoint will serve;
+                    # the client uses this to derive the local download
+                    # filename when no extract format is requested.
+                    "filename": f"{display_name}.zip",
+                    "path": rel_dir,
+                    "size": total_size,
+                    "crc32": "",
+                    "source": "bundle",
+                    "is_bundle": 1,
+                    "bundle_files": json.dumps(
+                        [{"name": rel, "size": sz} for rel, sz in files]
+                    ),
+                }
+            )
+
+        # ── Pass 2: top-level files (loose ISOs, etc.) ────────────────
+        for file_path in sorted(folder.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
+                continue
+            if file_path.resolve() in bundled_paths:
+                continue
+            if file_path.name.lower() in SKIP_NAMES:
+                continue
+
+            ext = file_path.suffix.lower()
+            if ext not in ROM_EXTENSIONS:
+                continue
+
+            # Loose .pkg outside a bundle → skip per the operator spec
+            # ("only accept .pkg from subfolders").  Better to drop them
+            # silently than confuse the client with an entry that has no
+            # game name.
+            if ext == ".pkg":
+                logger.info(
+                    "[rom_scanner] PS3: skipping loose .pkg outside a "
+                    "bundle subfolder: %s", file_path.name
+                )
+                continue
+
+            crc32 = ""
+            if use_crc32:
+                title_id, canonical_name, source, crc32 = _identify_rom_crc32(
+                    system, file_path, norm
+                )
+            else:
+                title_id, canonical_name, source = _identify_rom_slug(
+                    system, file_path, norm
+                )
+
+            rel_path = str(file_path.relative_to(rom_dir).as_posix())
+            size = file_path.stat().st_size
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": canonical_name,
+                    "filename": file_path.name,
+                    "path": rel_path,
+                    "size": size,
+                    "crc32": crc32,
+                    "source": source,
+                    "is_bundle": 0,
+                    "bundle_files": "",
+                }
+            )
+
+    def _scan_ps1_folder(
+        self,
+        folder: Path,
+        norm: Optional[object],
+        rom_dir: Path,
+        use_crc32: bool,
+        scanned: list[dict],
+    ) -> None:
+        """PS1-specific scan with subfolder bundle detection.
+
+        Mirror of :meth:`_scan_ps3_folder` with two differences:
+
+          1. The bundle trigger is any PS1 ROM extension
+             (``_PS1_BUNDLE_TRIGGER_EXTS``), not just ``.pkg``.
+          2. Loose top-level files are NOT rejected — single-disc PS1
+             games at ``<rom_dir>/psx/foo.chd`` are common in existing
+             libraries and we want to keep cataloging them.
+
+        The bundle path mirrors the layout the webMAN PS1 emulator on
+        real PS3 hardware expects (``/dev_hdd0/PSXISO/<game>/<files>``);
+        the PS3 client uses the bundle name to derive that target dir.
+        """
+        system = "PS1"
+
+        bundle_dirs: list[Path] = []
+        bundled_paths: set[Path] = set()
+
+        for sub in sorted(folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
+            has_trigger = any(
+                f.is_file() and f.suffix.lower() in _PS1_BUNDLE_TRIGGER_EXTS
+                for f in sub.rglob("*")
+            )
+            if has_trigger:
+                bundle_dirs.append(sub)
+                for f in sub.rglob("*"):
+                    if f.is_file():
+                        bundled_paths.add(f.resolve())
+
+        # ── Pass 1: bundles ───────────────────────────────────────────
+        for bundle_dir in bundle_dirs:
+            files: list[tuple[str, int]] = []
+            total_size = 0
+            for f in sorted(bundle_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.lower() in SKIP_NAMES:
+                    continue
+                ext = f.suffix.lower()
+                keep = (
+                    ext in _PS1_BUNDLE_TRIGGER_EXTS
+                    or ext in _PS1_BUNDLE_COMPANION_EXTS
+                    or ext in ROM_EXTENSIONS
+                )
+                if not keep:
+                    continue
+                rel = f.relative_to(bundle_dir).as_posix()
+                size = f.stat().st_size
+                files.append((rel, size))
+                total_size += size
+
+            if not files:
+                continue
+
+            display_name = bundle_dir.name
+            slug = normalize_rom_name(display_name)
+            serial = game_names.lookup_disc_serial(system, display_name)
+            title_id = serial if serial else f"PS1_BUNDLE_{slug}"
+            rel_dir = str(bundle_dir.relative_to(rom_dir).as_posix())
+
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": display_name,
+                    "filename": f"{display_name}.zip",
+                    "path": rel_dir,
+                    "size": total_size,
+                    "crc32": "",
+                    "source": "bundle",
+                    "is_bundle": 1,
+                    "bundle_files": json.dumps(
+                        [{"name": rel, "size": sz} for rel, sz in files]
+                    ),
+                }
+            )
+
+        # ── Pass 2: top-level files ───────────────────────────────────
+        for file_path in sorted(folder.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
+                continue
+            if file_path.resolve() in bundled_paths:
+                continue
+            if file_path.name.lower() in SKIP_NAMES:
+                continue
+
+            ext = file_path.suffix.lower()
+            if ext not in ROM_EXTENSIONS:
+                continue
+
+            crc32 = ""
+            if use_crc32:
+                title_id, canonical_name, source, crc32 = _identify_rom_crc32(
+                    system, file_path, norm
+                )
+            else:
+                title_id, canonical_name, source = _identify_rom_slug(
+                    system, file_path, norm
+                )
+
+            rel_path = str(file_path.relative_to(rom_dir).as_posix())
+            size = file_path.stat().st_size
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": canonical_name,
+                    "filename": file_path.name,
+                    "path": rel_path,
+                    "size": size,
+                    "crc32": crc32,
+                    "source": source,
+                    "is_bundle": 0,
+                    "bundle_files": "",
                 }
             )
 
@@ -408,6 +986,55 @@ def rescan(use_crc32: bool = False) -> Optional[RomCatalog]:
         _catalog = RomCatalog()
     _catalog.scan(settings.rom_dir, use_crc32=use_crc32)
     return _catalog
+
+
+def cleanup_missing() -> int:
+    """Drop catalog rows whose backing file is gone from disk.
+
+    Lightweight alternative to a full rescan: walks the in-memory
+    catalog (which mirrors ``roms.db``), stats each entry's path under
+    ``settings.rom_dir``, and deletes any row whose file no longer
+    exists.  Doesn't traverse the ROM tree, doesn't touch DAT lookups,
+    doesn't recompute CRC32s — just stat() per row.
+
+    Returns the number of rows removed (0 when everything still
+    exists or when there's no catalog yet).
+    """
+    from app.config import settings
+
+    if _catalog is None:
+        return 0
+    rom_dir = settings.rom_dir
+    if not rom_dir or not rom_dir.is_dir():
+        return 0
+
+    to_remove: list[str] = []
+    # ``list(...)`` snapshot — we mutate ``_entries`` below, so iterating
+    # the live dict would raise.
+    for entry in list(_catalog.list_all()):
+        full = rom_dir / entry.path
+        try:
+            # Bundle rows store ``path`` as the bundle *directory*, not a
+            # file, so ``is_file()`` would (wrongly) flag every bundle as
+            # missing. Check existence by the right kind.
+            exists = full.is_dir() if entry.is_bundle else full.is_file()
+            if not exists:
+                to_remove.append(entry.rom_id)
+        except OSError:
+            # Permission/IO issue — leave the row alone rather than
+            # nuke entries the OS just can't stat right now.
+            continue
+
+    if not to_remove:
+        return 0
+
+    for rom_id in to_remove:
+        rom_db.delete(rom_id)
+        _catalog._entries.pop(rom_id, None)
+    _catalog._rebuild_index()
+
+    logger.info("[rom_scanner] cleanup_missing: removed %d row(s)", len(to_remove))
+    return len(to_remove)
 
 
 def _save_dir() -> Path:

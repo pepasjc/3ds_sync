@@ -32,10 +32,12 @@ from app.services.ps2_cards import (
 )
 from app.services.gc_cards import (
     canonical_card_name as gc_canonical_card_name,
+    gc_card_from_gci,
     gc_code_from_title_id,
     gc_extract_gci,
     gc_insert_gci,
     get_card_from_files as gc_get_card_from_files,
+    get_full_card_from_files as gc_get_full_card_from_files,
     get_gci_from_files as gc_get_gci_from_files,
     is_gc_card_image,
 )
@@ -456,7 +458,9 @@ async def download_gc_card(
         _, content = match
         filename = "card.gci"
     else:
-        match = gc_get_card_from_files(files)
+        # MemCard Pro always expects a full card image; synthesize one if the
+        # server only holds a bare GCI (Dolphin/Android uploaded before desktop).
+        match = gc_get_full_card_from_files(files)
         if match is None:
             raise HTTPException(status_code=404, detail="No GC save found for this title")
         _, content = match
@@ -515,7 +519,14 @@ async def upload_gc_card(
             store_data = body
             store_name = "card.gci"
     else:
-        store_data = body
+        # format=raw is meant for full card images. If a client sends a bare
+        # GCI here (e.g. a legacy mis-formatted .raw), wrap it into a real card
+        # so storage never holds a GCI masquerading as card.raw.
+        if not is_gc_card_image(body):
+            wrapped = gc_card_from_gci(body)
+            store_data = wrapped if wrapped is not None else body
+        else:
+            store_data = body
         store_name = gc_canonical_card_name()
 
     bundle = SaveBundle(

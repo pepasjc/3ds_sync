@@ -44,6 +44,10 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.drop
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,12 +60,19 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.savesync.android.MainActivity
 import com.savesync.android.api.RomEntry
 import com.savesync.android.api.preferredDownloadExtractFormat
+import com.savesync.android.api.preferredDownloadFilename
 import com.savesync.android.catalog.RomCatalogFilter
+import com.savesync.android.findComponentActivity
 import com.savesync.android.ui.MainViewModel
 import com.savesync.android.ui.components.SystemFilterChip
 import com.savesync.android.ui.components.TabSwitchBar
+import com.savesync.android.ui.components.firstLetter
+import com.savesync.android.ui.components.handleHorizontalHoldKeyEvent
+import com.savesync.android.ui.components.rememberHoldNavState
 import kotlinx.coroutines.launch
 
 /**
@@ -95,18 +106,64 @@ fun RomCatalogScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    var query by remember { mutableStateOf("") }
-    var systemFilter by remember { mutableStateOf<String?>(null) }
+    // Filter state uses rememberSaveable so the user's place in the catalog
+    // (selected system + search query + whether the search bar is open)
+    // survives tab switching.  NavHost preserves the destination's
+    // SavedState bundle across tab pops with saveState=true /
+    // restoreState=true, and rememberSaveable rides on top of that — so
+    // queueing a download then bouncing between Catalog ↔ Downloads
+    // doesn't reset the filter back to the default system.
+    var query by rememberSaveable { mutableStateOf("") }
+    var systemFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var searchVisible by rememberSaveable { mutableStateOf(false) }
+    // confirmTarget intentionally stays as plain remember — re-showing the
+    // download confirmation dialog after the user navigated away is creepy
+    // (they'd come back to a modal they didn't open).
     var confirmTarget by remember { mutableStateOf<RomEntry?>(null) }
-    var searchVisible by remember { mutableStateOf(false) }
 
     // ── Gamepad navigation state ────────────────────────────────────────
     // We drive selection ourselves so D-pad / analog stick scrolls the
     // rom grid without focus leaking up to the search field.
     var selectedIndex by remember { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
+    // Hold-to-accelerate state for d-pad left/right (page → alphabet jump).
+    val holdNav = rememberHoldNavState()
     val listFocusRequester = remember { FocusRequester() }
     val searchFocusRequester = remember { FocusRequester() }
+
+    // ── Per-system scroll memory ────────────────────────────────────────
+    // The same LazyListState is reused as the user cycles through systems
+    // (because the LazyColumn always renders the actively-filtered list),
+    // so without this map a system-filter change would either keep the
+    // user at the previous system's scroll offset (now pointing at a
+    // totally unrelated game) or — depending on filtered.size — clamp them
+    // back to the top.  Map: system code (or "ALL" for no filter) →
+    // firstVisibleItemIndex when the user last left that system.  We
+    // store just the index (no offset) — close enough that the user
+    // recognises their place; saving offset too would mostly add noise.
+    //
+    // listSaver flattens the map to a [k, v, k, v, ...] list which the
+    // SavedState bundle handles natively, so this state survives both
+    // tab switching (via NavHost saveState=true) and configuration
+    // changes (rotation, theme switch).
+    val scrollPositions: MutableMap<String, Int> = rememberSaveable(
+        saver = listSaver(
+            save = { map -> map.flatMap { listOf(it.key, it.value) } },
+            restore = { entries ->
+                mutableMapOf<String, Int>().apply {
+                    var i = 0
+                    while (i + 1 < entries.size) {
+                        val k = entries[i] as? String ?: ""
+                        val v = entries[i + 1] as? Int ?: 0
+                        if (k.isNotEmpty()) put(k, v)
+                        i += 2
+                    }
+                }
+            }
+        )
+    ) { mutableMapOf() }
+    // Stable map key for the active filter — null filter == "ALL".
+    val systemKey = systemFilter ?: "ALL"
 
     // Lazy first-load when the tab is opened.
     LaunchedEffect(Unit) {
@@ -125,10 +182,23 @@ fun RomCatalogScreen(
         if (searchVisible) runCatching { searchFocusRequester.requestFocus() }
     }
 
-    // Surface download outcomes as snackbars.
+    // Surface enqueue outcomes as snackbars.  The Downloads tab now owns
+    // progress + final-status display; these snackbars only confirm that
+    // the request was accepted (or rejected before it left the device).
     LaunchedEffect(downloadState) {
         when (val s = downloadState) {
+            is MainViewModel.RomDownloadState.Downloading -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(
+                        "Queued ${s.name} — see Downloads tab for progress"
+                    )
+                    viewModel.resetRomDownloadState()
+                }
+            }
             is MainViewModel.RomDownloadState.Success -> {
+                // Legacy state — preserved for any caller that still uses
+                // the synchronous path (e.g. unit tests).  The DownloadManager
+                // never emits this directly.
                 scope.launch {
                     snackbarHostState.showSnackbar("Downloaded ${s.file.name}")
                     viewModel.resetRomDownloadState()
@@ -158,14 +228,56 @@ fun RomCatalogScreen(
         }
     }
 
-    // Helper that cycles the system filter (null = all systems), used by
-    // both L1/R1 and D-pad left/right.
+    // Continuously snapshot the active system's scroll position into the
+    // per-system map, so flipping back to a previously-visited system
+    // restores where you were instead of dumping you at the top.
+    //
+    // ``drop(1)`` is critical: snapshotFlow always emits the current value
+    // immediately on subscription, but when ``systemKey`` changes the
+    // restore effect below fires concurrently and we don't want this saver
+    // to overwrite the new system's saved position with the previous
+    // (stale) listState value before the restore lands.  Skipping the
+    // initial emission means we only persist values that came from real
+    // scroll events, not from coroutine restart.
+    LaunchedEffect(listState, systemKey) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .drop(1)
+            .collect { idx -> scrollPositions[systemKey] = idx }
+    }
+
+    // Restore saved scroll position when the user switches systems.  We
+    // gate on ``lastRestoredKey`` so subsequent filter updates within
+    // the same system (e.g. typing in the search box) don't re-scroll
+    // the list — only an actual system change triggers a restore.
+    var lastRestoredKey by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(systemKey, filtered.size) {
+        if (lastRestoredKey == systemKey) return@LaunchedEffect
+        if (filtered.isEmpty()) return@LaunchedEffect  // wait for items
+        val saved = scrollPositions[systemKey] ?: 0
+        val target = saved.coerceIn(0, filtered.size - 1)
+        listState.scrollToItem(target)
+        // Place the gamepad cursor on the same item so D-pad navigation
+        // resumes from the visible row instead of jumping back to item 0.
+        selectedIndex = target
+        lastRestoredKey = systemKey
+    }
+
+    // Helper that cycles the system filter (null = all systems), driven by
+    // L2/R2 (activity-level systemCycleEvents flow).
     fun cycleSystem(delta: Int) {
         if (systems.isEmpty()) return
         val all = listOf<String?>(null) + systems
         val idx = all.indexOf(systemFilter).let { if (it < 0) 0 else it }
         val next = (idx + delta + all.size) % all.size
         systemFilter = all[next]
+    }
+
+    // L2/R2 (triggers) cycle the system filter globally — Activity emits the
+    // delta on systemCycleEvents and we apply it here so the toolbar chip
+    // stays in sync.
+    val activity = LocalContext.current.findComponentActivity() as? MainActivity
+    LaunchedEffect(activity, systems, systemFilter) {
+        activity?.systemCycleEvents?.collect { delta -> cycleSystem(delta) }
     }
 
     Scaffold(
@@ -211,6 +323,39 @@ fun RomCatalogScreen(
                 .focusRequester(listFocusRequester)
                 .focusable()
                 .onPreviewKeyEvent { event ->
+                    if (holdNav.handleHorizontalHoldKeyEvent(
+                            event,
+                            scope,
+                            onPage = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val page = listState.layoutInfo.visibleItemsInfo.size
+                                        .coerceAtLeast(1)
+                                    selectedIndex = (selectedIndex + d * page)
+                                        .coerceIn(0, filtered.size - 1)
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                            onAlphabet = { d ->
+                                if (filtered.isNotEmpty()) {
+                                    val cur = selectedIndex.coerceIn(0, filtered.size - 1)
+                                    val curLetter = firstLetter(filtered[cur].name)
+                                    val step = if (d > 0) 1 else -1
+                                    var row = cur + step
+                                    var found = -1
+                                    while (row in filtered.indices) {
+                                        val ltr = firstLetter(filtered[row].name)
+                                        if (ltr.isNotEmpty() && ltr != curLetter) {
+                                            found = row; break
+                                        }
+                                        row += step
+                                    }
+                                    selectedIndex = if (found >= 0) found
+                                        else if (d > 0) filtered.size - 1 else 0
+                                    scope.launch { listState.animateScrollToItem(selectedIndex) }
+                                }
+                            },
+                        )
+                    ) return@onPreviewKeyEvent true
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
                         Key.DirectionDown -> {
@@ -223,29 +368,6 @@ fun RomCatalogScreen(
                         Key.DirectionUp -> {
                             if (filtered.isNotEmpty()) {
                                 selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
-                            true
-                        }
-                        // D-pad / stick left/right → cycle system filter
-                        Key.DirectionLeft -> { cycleSystem(-1); true }
-                        Key.DirectionRight -> { cycleSystem(1); true }
-                        // L1 / R1 → page-scroll the list (Steam Deck parity).
-                        Key.ButtonL1 -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex - page).coerceAtLeast(0)
-                                scope.launch { listState.animateScrollToItem(selectedIndex) }
-                            }
-                            true
-                        }
-                        Key.ButtonR1 -> {
-                            if (filtered.isNotEmpty()) {
-                                val page = listState.layoutInfo.visibleItemsInfo.size
-                                    .coerceAtLeast(1)
-                                selectedIndex = (selectedIndex + page)
-                                    .coerceAtMost(filtered.size - 1)
                                 scope.launch { listState.animateScrollToItem(selectedIndex) }
                             }
                             true
@@ -279,7 +401,8 @@ fun RomCatalogScreen(
                             viewModel.fetchRomCatalog(force = true)
                             true
                         }
-                        // L2 / R2 are Activity-level tab switches — let them bubble up.
+                        // L1/R1 (system cycle) and L2/R2 (tab cycle) are
+                        // intercepted at the Activity level — never reach here.
                         else -> false
                     }
                 }
@@ -393,11 +516,12 @@ fun RomCatalogScreen(
             confirmButton = {
                 TextButton(onClick = {
                     val id = rom.rom_id ?: rom.title_id
+                    val extract = rom.preferredDownloadExtractFormat()
                     viewModel.downloadRom(
                         romId = id,
                         system = rom.system,
-                        filename = rom.filename,
-                        extractFormat = rom.preferredDownloadExtractFormat(),
+                        filename = rom.preferredDownloadFilename(extract),
+                        extractFormat = extract,
                     )
                     confirmTarget = null
                 }) { Text("Download") }
@@ -473,7 +597,9 @@ private fun DownloadBanner(name: String) {
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         CircularProgressIndicator(modifier = Modifier.size(18.dp))
-        Text("Downloading $name…", style = MaterialTheme.typography.bodyMedium)
+        // Now an enqueue confirmation — the actual transfer is running on
+        // the Downloads tab via DownloadManager.
+        Text("Queued $name — open Downloads tab", style = MaterialTheme.typography.bodyMedium)
     }
 }
 
