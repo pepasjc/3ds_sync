@@ -1,4 +1,5 @@
 import hashlib
+import os
 
 from app.models.save import BundleFile, SaveBundle
 from app.services.bundle import create_bundle
@@ -1165,6 +1166,122 @@ class TestPs2VmcImport:
         r = client.post(
             "/api/v1/saves/ps2-vmc/import",
             content=b"not a card",
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 400
+
+
+class TestPs2Files:
+    """Physical-card path: P2FD folder payload <-> stored single-game card."""
+
+    def test_push_folder_then_download_as_files(self, client, auth_headers):
+        from app.services import ps2mc
+
+        files = [("icon.sys", b"\x07" * 964), ("BASLUS-20312.save", b"S" * 6000)]
+        payload = ps2mc.build_p2fd("BASLUS-20312", files)
+
+        up = client.post(
+            "/api/v1/saves/SLUS20312/ps2-files",
+            content=payload,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert up.status_code == 200
+
+        # Downloadable both as a P2FD folder and as a full card (cross-source).
+        dl = client.get("/api/v1/saves/SLUS20312/ps2-files", headers=auth_headers)
+        assert dl.status_code == 200
+        assert dl.headers["X-Save-Dir"] == "BASLUS-20312"
+        got_dir, got_files = ps2mc.parse_p2fd(dl.content)
+        assert got_dir == "BASLUS-20312"
+        assert dict(got_files) == dict(files)
+
+        card = client.get("/api/v1/saves/SLUS20312/ps2-card", headers=auth_headers)
+        assert card.status_code == 200
+        assert dict(ps2mc.parse_card(card.content)["BASLUS-20312"]) == dict(files)
+
+    def test_vmc_import_then_files_download(self, client, auth_headers):
+        """A save imported from a VMC is restorable to a physical card via P2FD."""
+        from app.services import ps2mc
+
+        files = [("data.bin", b"D" * 3000)]
+        card = ps2mc.build_card({"BESLES-50490": files})
+        client.post(
+            "/api/v1/saves/ps2-vmc/import",
+            content=card,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+
+        dl = client.get("/api/v1/saves/SLES50490/ps2-files", headers=auth_headers)
+        assert dl.status_code == 200
+        got_dir, got_files = ps2mc.parse_p2fd(dl.content)
+        assert got_dir == "BESLES-50490"
+        assert dict(got_files) == dict(files)
+
+    def test_push_rejects_garbage(self, client, auth_headers):
+        r = client.post(
+            "/api/v1/saves/SLUS20312/ps2-files",
+            content=b"nope",
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 400
+
+
+class TestPs1VmcImport:
+    def test_import_splits_card_and_downloads(self, client, auth_headers):
+        import struct
+        from app.services import ps1mc
+
+        card = ps1mc.format_empty_card()
+
+        def place(block, name, data):
+            padded = data + b"\x00" * (ps1mc.BLOCK_SIZE - len(data))
+            card[block * ps1mc.BLOCK_SIZE:(block + 1) * ps1mc.BLOCK_SIZE] = padded
+            fr = bytearray(ps1mc.FRAME_SIZE)
+            fr[0] = ps1mc.ST_FIRST
+            struct.pack_into("<I", fr, 0x04, ps1mc.BLOCK_SIZE)
+            struct.pack_into("<H", fr, 0x08, ps1mc.NO_NEXT)
+            nm = name.encode("ascii")
+            fr[0x0A:0x0A + len(nm)] = nm
+            fr[0x7F] = ps1mc._xor(fr[:0x7F])
+            card[block * ps1mc.FRAME_SIZE:(block + 1) * ps1mc.FRAME_SIZE] = fr
+
+        save_a = bytes(range(256)) * 8  # 2048 bytes
+        place(1, "BASLUS-00067HERO", save_a)
+        place(2, "BESLES-12345QUEST", os.urandom(2048))
+
+        r = client.post(
+            "/api/v1/saves/ps1-vmc/import",
+            content=bytes(card),
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+        serials = {row["serial"] for row in r.json()["imported"]}
+        assert serials == {"SLUS00067", "SLES12345"}
+
+        # The imported save is downloadable as a single-save card and round-trips.
+        dl = client.get("/api/v1/saves/SLUS00067/ps1-card", headers=auth_headers)
+        assert dl.status_code == 200
+        parsed = dict(ps1mc.parse_card(dl.content))
+        assert "BASLUS-00067HERO" in parsed
+        assert parsed["BASLUS-00067HERO"][:2048] == save_a
+
+    def test_import_accepts_vmp(self, client, auth_headers):
+        from app.services import ps1mc
+        from app.services.ps1_cards import create_vmp
+
+        card = ps1mc.build_single_save_card("BASLUS-00067HERO", os.urandom(8192))
+        r = client.post(
+            "/api/v1/saves/ps1-vmc/import",
+            content=create_vmp(card),
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+        assert r.json()["imported"][0]["serial"] == "SLUS00067"
+
+    def test_import_rejects_non_card(self, client, auth_headers):
+        r = client.post(
+            "/api/v1/saves/ps1-vmc/import",
+            content=b"junk",
             headers={**auth_headers, "Content-Type": "application/octet-stream"},
         )
         assert r.status_code == 400

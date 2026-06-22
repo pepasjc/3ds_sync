@@ -479,6 +479,31 @@ def _store_ps1_single_card(
     }
 
 
+@router.post("/saves/{title_id}/ps1-save")
+async def upload_ps1_save(
+    title_id: str,
+    request: Request,
+    name: str = Query(""),
+    console_id: str = Query(""),
+):
+    """Accept one PS1 save (raw block data read off a physical PS1 card) and
+    store it as a single-save 128 KB card under its serial."""
+    title_id = _validate_title_id(title_id)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    save_name = (name or title_id).strip()
+    try:
+        card = ps1mc.build_single_save_card(save_name, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    cid = _console_id_from_request(request, console_id)
+    result = _store_ps1_single_card(title_id, card, int(time.time()), cid)
+    return {"status": "ok", **result}
+
+
 @router.post("/saves/ps1-vmc/import")
 async def import_ps1_vmc(request: Request, console_id: str = Query("")):
     """Split a 128 KB PS1 memory card / VMC into per-game single-save cards.
