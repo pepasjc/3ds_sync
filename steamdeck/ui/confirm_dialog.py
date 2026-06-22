@@ -81,7 +81,7 @@ class ConfirmDialog(QDialog, GamepadModalMixin):
             return
         super().keyPressEvent(event)
 
-    def handle_gamepad_key(self, key: int) -> bool:
+    def handle_gamepad_key(self, key: int, from_gamepad: bool = False) -> bool:
         if key in (Qt.Key.Key_Return, Qt.Key.Key_A):
             self.accept()
             return True
@@ -138,7 +138,7 @@ class ResultDialog(QDialog, GamepadModalMixin):
             return
         super().keyPressEvent(event)
 
-    def handle_gamepad_key(self, key: int) -> bool:
+    def handle_gamepad_key(self, key: int, from_gamepad: bool = False) -> bool:
         if key in (
             Qt.Key.Key_Return,
             Qt.Key.Key_A,

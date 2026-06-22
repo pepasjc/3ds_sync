@@ -580,7 +580,7 @@ QLabel#detailLabel {{
             return
         super().keyPressEvent(event)
 
-    def handle_gamepad_key(self, key: int) -> bool:
+    def handle_gamepad_key(self, key: int, from_gamepad: bool = False) -> bool:
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_B, Qt.Key.Key_Backspace):
             self.reject()
             return True

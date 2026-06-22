@@ -101,7 +101,9 @@ class GamepadModalMixin:
             if current and not previous:
                 key = modal_gamepad_key(idx)
                 if key is not None:
-                    self.handle_gamepad_key(key)
+                    # from_gamepad=True so dialogs can tell a real face-button
+                    # press from a typed letter and skip text-edit guards.
+                    self.handle_gamepad_key(key, from_gamepad=True)
 
     def _notify_parent_gamepad_handoff(self, *_args) -> None:
         """Tell the parent window to ignore held inputs after this modal closes."""

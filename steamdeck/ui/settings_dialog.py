@@ -39,9 +39,18 @@ class SettingsDialog(QDialog, GamepadModalMixin):
         self.setModal(True)
         self.setMinimumWidth(580)
         self.setStyleSheet(theme.STYLESHEET)
+        # Cap height so the button bar never falls off the bottom of the
+        # Steam Deck's 800px screen — the content scrolls instead.
+        self.setMaximumHeight(760)
         self._init_gamepad_modal()
 
-        layout = QVBoxLayout(self)
+        # Outer layout: scrollable content on top, a fixed button bar below.
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 24, 24, 24)
 
@@ -208,16 +217,26 @@ class SettingsDialog(QDialog, GamepadModalMixin):
         layout.addWidget(_separator())
         layout.addStretch()
 
-        # ── Buttons ───────────────────────────────────────────────
-        btn_row = QHBoxLayout()
+        # Mount the scrollable content.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll, 1)
+
+        # ── Buttons (fixed bar, always visible) ───────────────────
+        btn_bar = QWidget()
+        btn_row = QHBoxLayout(btn_bar)
+        btn_row.setContentsMargins(24, 12, 24, 16)
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel  [B]")
         cancel_btn.clicked.connect(self.reject)
         save_btn = QPushButton("Save  [A]")
         save_btn.clicked.connect(self.accept)
+        save_btn.setDefault(True)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
-        layout.addLayout(btn_row)
+        outer.addWidget(btn_bar)
 
     def _browse_path(self):
         path = QFileDialog.getExistingDirectory(
@@ -461,10 +480,14 @@ class SettingsDialog(QDialog, GamepadModalMixin):
             return
         super().keyPressEvent(event)
 
-    def handle_gamepad_key(self, key: int) -> bool:
-        # Let text inputs handle their own keys (Backspace, Enter, etc.)
+    def handle_gamepad_key(self, key: int, from_gamepad: bool = False) -> bool:
+        # A physical gamepad button is never text entry, so ignore the
+        # text-edit guard for it — otherwise A/B do nothing while a field
+        # (always focused on open) has focus. Typed keys still respect it.
         focused = self.focusWidget()
-        is_editing = isinstance(focused, (QLineEdit, QSpinBox, QComboBox))
+        is_editing = not from_gamepad and isinstance(
+            focused, (QLineEdit, QSpinBox, QComboBox)
+        )
 
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_B) and not is_editing:
             self.reject()
