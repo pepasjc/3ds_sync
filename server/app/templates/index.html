@@ -393,6 +393,65 @@
       border-radius: 12px; padding: 1px 9px; font-size: 11px; color: var(--text-2);
     }
 
+    /* ── STICKY VIEW HEADER (ctx-bar + alphabet jump) ── */
+    /* Wraps the back-bar and A-Z strip so both stay pinned just below the
+       page header while the ROM grid/list scrolls underneath. */
+    .view-head {
+      position: sticky; top: var(--hdr-h, 56px); z-index: 80;
+      background: var(--bg); margin-bottom: 16px; padding-top: 4px;
+    }
+    .view-head .ctx-bar { margin-bottom: 0; padding-bottom: 10px; border-bottom: none; }
+
+    /* ── VIEW TOGGLE (grid / list) ── */
+    .view-toggle {
+      margin-left: auto; display: flex; gap: 2px;
+      background: var(--bg-card); border: 1px solid var(--border-muted);
+      border-radius: 7px; padding: 2px; flex-shrink: 0;
+    }
+    .vt-btn {
+      background: none; border: none; cursor: pointer; color: var(--text-2);
+      padding: 4px 9px; border-radius: 5px; font-size: 14px; line-height: 1;
+      transition: background .12s, color .12s;
+    }
+    .vt-btn:hover  { color: var(--text); }
+    .vt-btn.active { background: var(--accent); color: #fff; }
+
+    /* ── ALPHABET JUMP STRIP ── */
+    .alpha-bar {
+      display: flex; flex-wrap: wrap; gap: 2px;
+      padding: 8px 0; border-bottom: 1px solid var(--border-muted);
+    }
+    .alpha-btn {
+      min-width: 22px; height: 22px; padding: 0 4px;
+      background: none; border: 1px solid transparent; border-radius: 5px;
+      color: var(--text-2); font-size: 11px; font-weight: 600; cursor: pointer;
+      transition: background .1s, color .1s, border-color .1s;
+    }
+    .alpha-btn:hover { background: var(--bg-card); color: var(--text); border-color: var(--border); }
+    .alpha-btn:disabled, .alpha-btn.off { color: var(--border); cursor: default; background: none; border-color: transparent; }
+
+    /* Quick-jump target offset: clear the sticky page header + view header. */
+    .card-grid > *, .rom-list > * { scroll-margin-top: calc(var(--hdr-h, 56px) + 96px); }
+
+    /* ── ROM LIST (compact rows — alternative to card grid) ── */
+    .rom-list { display: flex; flex-direction: column; gap: 4px; }
+    .rom-row {
+      display: flex; align-items: center; gap: 12px; position: relative;
+      background: var(--bg-card); border: 1px solid var(--border-muted);
+      border-radius: 6px; padding: 7px 12px;
+      transition: border-color .12s, background .12s;
+    }
+    .rom-row:hover { border-color: var(--border); background: var(--bg-card-h); }
+    .row-stripe { width: 3px; align-self: stretch; border-radius: 2px; flex-shrink: 0; }
+    .row-name {
+      flex: 1; min-width: 0; font-size: 13px; font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .rom-row .save-dot { margin-left: 0; flex-shrink: 0; }
+    .row-size { font-size: 11px; color: var(--text-muted); width: 74px; text-align: right; flex-shrink: 0; }
+    .rom-row .badge { font-size: 9px; flex-shrink: 0; }
+    .rom-row .rom-btns { margin-left: 0; flex-shrink: 0; flex-wrap: nowrap; }
+
     /* ── LOAD MORE SENTINEL ── */
     .load-more {
       padding: 22px; text-align: center; color: var(--text-muted); font-size: 12px;
@@ -457,6 +516,12 @@
       #sys-chips::-webkit-scrollbar { display: none; }
       #app { padding: 20px 16px; gap: 0; }
       .card-grid { grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; }
+
+      /* View header sits BELOW the sticky system chips on mobile. */
+      .view-head { top: calc(var(--hdr-h, 56px) + var(--chips-h, 52px)); }
+      .card-grid > *, .rom-list > * {
+        scroll-margin-top: calc(var(--hdr-h, 56px) + var(--chips-h, 52px) + 96px);
+      }
     }
 
     /* ── RESPONSIVE — phone ── */
@@ -624,6 +689,8 @@ const S = {
   searchAbort:   null,
   tab:           'roms',
   q:             '',
+  // Grid (cards) vs list (compact rows). Persisted across sessions.
+  layout:        localStorage.getItem('gamesync_layout') || 'grid',
   // Lazy render state — reused by both the system view and search view
   lazy: { items: [], rendered: 0, observer: null, containerId: null, renderFn: null },
 };
@@ -1393,13 +1460,17 @@ async function openSystem(sys) {
     return;
   }
 
-  // Shell: context bar + grid + load-more sentinel.
+  // Sort by name so the alphabet quick-jump and grouping are meaningful.
+  sortByName(roms);
+
+  // Shell: sticky view header + grid/list + load-more sentinel.
   qs('#roms-pane').innerHTML =
-    contextBar(sys, roms.length) +
-    `<div class="card-grid" id="lazy-grid"></div>
+    contextBar(sys, roms.length, roms) +
+    `<div class="${gridClass()}" id="lazy-grid"></div>
      <div class="load-more" id="lazy-sentinel">Loading more…</div>`;
 
-  startLazy(roms, 'lazy-grid', 'lazy-sentinel', romCardHtml);
+  startLazy(roms, 'lazy-grid', 'lazy-sentinel', rowOrCard());
+  syncHdrHeight();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1435,6 +1506,7 @@ async function runSearch(q) {
   }
 
   const roms = (data.roms || []).map(r => ({ ...r, hasSave: S.savedTitleIds.has(r.title_id) }));
+  sortByName(roms);
   S.searchResults = { q, total: data.total, shown: roms.length, roms };
 
   if (!roms.length) {
@@ -1445,11 +1517,12 @@ async function runSearch(q) {
   }
 
   qs('#roms-pane').innerHTML =
-    searchBar(q, roms.length, data.total) +
-    `<div class="card-grid" id="lazy-grid"></div>
+    searchBar(q, roms.length, data.total, roms) +
+    `<div class="${gridClass()}" id="lazy-grid"></div>
      <div class="load-more" id="lazy-sentinel">Loading more…</div>`;
 
-  startLazy(roms, 'lazy-grid', 'lazy-sentinel', romCardHtml);
+  startLazy(roms, 'lazy-grid', 'lazy-sentinel', rowOrCard());
+  syncHdrHeight();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1512,7 +1585,9 @@ function disposeLazy() {
 // ═══════════════════════════════════════════════════════
 //  ROM CARD — HTML builder (same markup as before, now per-item)
 // ═══════════════════════════════════════════════════════
-function romCardHtml(rom) {
+// Build the download/extract button group + share metadata for a ROM.
+// Shared by the card (grid) and row (list) renderers so both stay in sync.
+function romActions(rom) {
   const sys  = rom.system || 'UNKNOWN';
   const c    = clr(sys);
   // Always prefer rom_id over title_id for routing/extract: title_id
@@ -1527,13 +1602,6 @@ function romCardHtml(rom) {
   const extractFormats = Array.isArray(rom.extract_formats) ? rom.extract_formats : [];
   const rawUrl = `/api/v1/roms/${encodeURIComponent(dlId)}`;
   const rawLabel = (rom.filename?.split('.').pop() || 'ROM').toUpperCase();
-
-  // Floating share icon — anchored top-right of the card via .rom-share.
-  // Only points at the raw/direct download (rawUrl): ?extract= conversion
-  // routes aren't stable shareable URLs (job-cached, streamed, slow).
-  const shareIcon = `<button class="rom-share" data-action="copy"
-        data-url="${rawUrl}" title="Copy share link to original ${rawLabel}"
-        aria-label="Copy share link">🔗</button>`;
 
   let btnHtml;
   if (extractFormats.length && extractFormats.includes('iso') && extractFormats.includes('cso')) {
@@ -1623,6 +1691,22 @@ function romCardHtml(rom) {
       data-url="${rawUrl}" data-fn="${fn}">↓</button>`;
   }
 
+  return { btnHtml, rawUrl, rawLabel, c, sys };
+}
+
+// ═══════════════════════════════════════════════════════
+//  ROM CARD — grid layout
+// ═══════════════════════════════════════════════════════
+function romCardHtml(rom) {
+  const { btnHtml, rawUrl, rawLabel, c, sys } = romActions(rom);
+
+  // Floating share icon — anchored top-right of the card via .rom-share.
+  // Only points at the raw/direct download (rawUrl): ?extract= conversion
+  // routes aren't stable shareable URLs (job-cached, streamed, slow).
+  const shareIcon = `<button class="rom-share" data-action="copy"
+        data-url="${rawUrl}" title="Copy share link to original ${rawLabel}"
+        aria-label="Copy share link">🔗</button>`;
+
   return `<div class="rom-card">
     ${shareIcon}
     <div class="rom-stripe" style="background:${c}"></div>
@@ -1641,29 +1725,114 @@ function romCardHtml(rom) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  CONTEXT-BAR HELPERS (back button + header for drill-down views)
+//  ROM ROW — compact list layout (denser, better for desktop)
 // ═══════════════════════════════════════════════════════
-function contextBar(sys, count) {
-  const c = clr(sys);
-  return `<div class="ctx-bar">
-    <button class="back-btn" data-action="nav-overview" title="Back to systems">← Systems</button>
-    <div class="ctx-title">
-      <span class="badge" style="background:${c}">${esc(sys)}</span>
-      <h2>${esc(lbl(sys))}</h2>
-      <span class="ctx-count">${count}</span>
-    </div>
+function romRowHtml(rom) {
+  const { btnHtml, rawUrl, c, sys } = romActions(rom);
+  return `<div class="rom-row">
+    <div class="row-stripe" style="background:${c}"></div>
+    <span class="badge" style="background:${c}">${esc(sys)}</span>
+    <div class="row-name" title="${esc(rom.name)}">${esc(rom.name)}</div>
+    ${rom.hasSave ? `<span class="save-dot">save</span>` : ''}
+    <span class="row-size">${fmtB(rom.size)}</span>
+    <button class="dl-btn copy" data-action="copy" data-url="${rawUrl}" title="Copy share link">🔗</button>
+    ${btnHtml}
   </div>`;
 }
 
-function searchBar(q, shown, total) {
-  const capped = total > shown ? ` (showing first ${shown} — narrow your search for more)` : '';
-  return `<div class="ctx-bar">
-    <button class="back-btn" data-action="nav-overview" title="Clear search">← Systems</button>
-    <div class="ctx-title">
-      <h2>Search: "${esc(q)}"</h2>
-      <span class="ctx-count">${total} match${total === 1 ? '' : 'es'}${capped}</span>
+// ═══════════════════════════════════════════════════════
+//  CONTEXT-BAR HELPERS (back button + header for drill-down views)
+// ═══════════════════════════════════════════════════════
+function contextBar(sys, count, items) {
+  const c = clr(sys);
+  return `<div class="view-head">
+    <div class="ctx-bar">
+      <button class="back-btn" data-action="nav-overview" title="Back to systems">← Systems</button>
+      <div class="ctx-title">
+        <span class="badge" style="background:${c}">${esc(sys)}</span>
+        <h2>${esc(lbl(sys))}</h2>
+        <span class="ctx-count">${count}</span>
+      </div>
+      ${viewToggleHtml()}
     </div>
+    ${alphaBarHtml(items)}
   </div>`;
+}
+
+function searchBar(q, shown, total, items) {
+  const capped = total > shown ? ` (showing first ${shown} — narrow your search for more)` : '';
+  return `<div class="view-head">
+    <div class="ctx-bar">
+      <button class="back-btn" data-action="nav-overview" title="Clear search">← Systems</button>
+      <div class="ctx-title">
+        <h2>Search: "${esc(q)}"</h2>
+        <span class="ctx-count">${total} match${total === 1 ? '' : 'es'}${capped}</span>
+      </div>
+      ${viewToggleHtml()}
+    </div>
+    ${alphaBarHtml(items)}
+  </div>`;
+}
+
+// ── VIEW HEADER WIDGETS ──────────────────────────────────
+// Grid/list toggle. Reflects S.layout; persisted in setLayout().
+function viewToggleHtml() {
+  const g = S.layout === 'grid', l = S.layout === 'list';
+  return `<div class="view-toggle">
+    <button class="vt-btn${g ? ' active' : ''}" data-action="layout" data-layout="grid" title="Grid view" aria-label="Grid view">▦</button>
+    <button class="vt-btn${l ? ' active' : ''}" data-action="layout" data-layout="list" title="List view" aria-label="List view">☰</button>
+  </div>`;
+}
+
+// First sort key of a name: A-Z, or '#' for anything starting non-alpha.
+function firstLetter(name) {
+  const ch = (name || '').trim().charAt(0).toUpperCase();
+  return (ch >= 'A' && ch <= 'Z') ? ch : '#';
+}
+
+// A-Z (+#) quick-jump strip. Letters with no matching ROM are disabled.
+function alphaBarHtml(items) {
+  const present = new Set((items || []).map(it => firstLetter(it.name)));
+  const letters = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
+  const btns = letters.map(L => {
+    const on = present.has(L);
+    return on
+      ? `<button class="alpha-btn" data-action="alpha" data-letter="${L}">${L}</button>`
+      : `<button class="alpha-btn off" disabled>${L}</button>`;
+  }).join('');
+  return `<div class="alpha-bar">${btns}</div>`;
+}
+
+const gridClass = () => S.layout === 'list' ? 'rom-list' : 'card-grid';
+const rowOrCard = () => S.layout === 'list' ? romRowHtml : romCardHtml;
+
+function sortByName(arr) {
+  arr.sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+// Switch grid/list. Persists and re-renders the current ROM view.
+function setLayout(layout) {
+  if (layout !== 'grid' && layout !== 'list') return;
+  if (layout === S.layout) return;
+  S.layout = layout;
+  localStorage.setItem('gamesync_layout', layout);
+  if (S.view === 'system' && S.currentSystem) openSystem(S.currentSystem);
+  else if (S.view === 'search' && S.q)         runSearch(S.q);
+}
+
+// Scroll to the first ROM whose name starts with `letter`. Because cards are
+// lazy-rendered, render forward until the target index exists, then scroll to
+// it (DOM child index === item index, nothing else lives in the container).
+function jumpToLetter(letter) {
+  const items = S.lazy.items;
+  const idx = items.findIndex(it => firstLetter(it.name) === letter);
+  if (idx < 0) return;
+  let guard = 0;
+  while (S.lazy.rendered <= idx && guard++ < 1000) renderNextBatch();
+  const container = document.getElementById(S.lazy.containerId);
+  const el = container && container.children[idx];
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1866,6 +2035,8 @@ document.addEventListener('click', e => {
   if (action === 'extract')      enqueueExtract(tid, name, fmt);
   if (action === 'nav-system')   { qs('#search').value = ''; S.q = ''; openSystem(sys); }
   if (action === 'nav-overview') { qs('#search').value = ''; S.q = ''; renderOverview(); }
+  if (action === 'layout')       setLayout(btn.dataset.layout);
+  if (action === 'alpha')        jumpToLetter(btn.dataset.letter);
 });
 
 // ── QUEUE ACTIONS / OUTSIDE CLOSE ────────────────────────
@@ -1891,6 +2062,12 @@ document.addEventListener('click', e => {
 function syncHdrHeight() {
   const h = document.querySelector('header').getBoundingClientRect().height;
   document.documentElement.style.setProperty('--hdr-h', h + 'px');
+  // Mobile-only: the system chip bar sits below the header and the view
+  // header must stack below both. Measure it so the sticky offset is exact.
+  const chips = document.getElementById('sys-chips');
+  const ch = (chips && getComputedStyle(chips).display !== 'none')
+    ? chips.getBoundingClientRect().height : 0;
+  document.documentElement.style.setProperty('--chips-h', ch + 'px');
 }
 
 // ── SEARCH ───────────────────────────────────────────────

@@ -1118,3 +1118,53 @@ class Test3dsLookup:
         result = r.json()["results"][0]
         assert result["canonical_name"] == "Mario Kart 7 (USA)"
         assert result["title_id"] == "0004000000030800"
+
+
+class TestPs2VmcImport:
+    def test_import_splits_card_into_per_game_saves(self, client, auth_headers):
+        from app.services import ps2mc
+
+        games = {
+            "BASLUS-20312": [("icon.sys", b"\x01" * 964), ("save.bin", b"A" * 5000)],
+            "BESLES-50490": [("data", b"B" * 2048)],
+            "BADATA-SYSTEM": [("sys", b"C" * 16)],  # no serial -> skipped
+        }
+        card = ps2mc.build_card(games)
+
+        r = client.post(
+            "/api/v1/saves/ps2-vmc/import",
+            content=card,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        serials = {row["serial"] for row in body["imported"]}
+        assert serials == {"SLUS20312", "SLES50490"}
+        assert body["skipped"] == ["BADATA-SYSTEM"]
+
+        # Each imported game is now downloadable as its own card and round-trips.
+        dl = client.get("/api/v1/saves/SLUS20312/ps2-card", headers=auth_headers)
+        assert dl.status_code == 200
+        parsed = ps2mc.parse_card(dl.content)
+        assert dict(parsed["BASLUS-20312"]) == dict(games["BASLUS-20312"])
+
+    def test_import_accepts_ecc_ps2_image(self, client, auth_headers):
+        from app.services import ps2mc
+        from app.services.ps2_cards import add_ecc
+
+        card = ps2mc.build_card({"BASLUS-20312": [("s", b"Z" * 100)]})
+        r = client.post(
+            "/api/v1/saves/ps2-vmc/import",
+            content=add_ecc(card),
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+        assert r.json()["imported"][0]["serial"] == "SLUS20312"
+
+    def test_import_rejects_non_card(self, client, auth_headers):
+        r = client.post(
+            "/api/v1/saves/ps2-vmc/import",
+            content=b"not a card",
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 400
