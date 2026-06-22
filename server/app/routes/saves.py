@@ -16,6 +16,7 @@ from shared.sync_id import canonicalize_slug_title_id
 from app.services.ps1_cards import (
     create_vmp,
     ensure_raw_slot_files,
+    extract_raw_card,
     get_slot_raw_from_files,
     is_ps1_title_id,
     psp_visible_files,
@@ -30,6 +31,7 @@ from app.services.ps2_cards import (
     get_canonical_card_from_files as get_ps2_canonical_card_from_files,
     normalize_ps2_card_format,
 )
+from app.services import ps1mc, ps2mc
 from app.services.gc_cards import (
     canonical_card_name as gc_canonical_card_name,
     gc_card_from_gci,
@@ -337,6 +339,219 @@ async def upload_ps2_card(
         "timestamp": meta.last_sync,
         "sha256": hashlib.sha256(canonical).hexdigest(),
     }
+
+
+def _store_single_game_card(
+    serial: str, game_dir: str, files: list[tuple[str, bytes]],
+    timestamp: int, console_id: str,
+) -> dict:
+    """Store one game's save as a single-game 8 MB ``card.mc2`` under its serial.
+
+    Per-game canonical storage reuses the existing PS2 card pipeline, so the
+    plain ``GET /saves/{serial}/ps2-card`` download path serves it unchanged.
+    """
+    title_id = _validate_title_id(serial)
+    card = ps2mc.build_card({game_dir: files}, timestamp=timestamp)
+    bundle = SaveBundle(
+        title_id=0,
+        timestamp=timestamp,
+        files=[
+            BundleFile(
+                path=canonical_card_name(),
+                size=len(card),
+                sha256=hashlib.sha256(card).digest(),
+                data=card,
+            )
+        ],
+        title_id_str=title_id,
+    )
+    storage.store_save(bundle, source="ps2_vmc", console_id=console_id)
+    return {
+        "dir": game_dir,
+        "serial": title_id,
+        "size": len(card),
+        "sha256": hashlib.sha256(card).hexdigest(),
+    }
+
+
+@router.get("/saves/{title_id}/ps2-files")
+async def download_ps2_files(title_id: str):
+    """Return one game's save as a P2FD folder payload for the physical-card path.
+
+    The server holds the canonical single-game ``card.mc2``; here it is parsed
+    back into its directory + files so the PS2 client can write them straight to
+    a physical memory card via libmc.
+    """
+    title_id = _validate_title_id(title_id)
+    meta = storage.get_metadata(title_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    files = storage.load_save_files(title_id)
+    if not files:
+        raise HTTPException(status_code=404, detail="Save data missing on disk")
+
+    match = get_ps2_canonical_card_from_files(files)
+    if match is None:
+        raise HTTPException(status_code=404, detail="No PS2 card found for this title")
+    _, card = match
+
+    games = ps2mc.parse_card(card)
+    if not games:
+        raise HTTPException(status_code=404, detail="No game folder in stored card")
+    game_dir, game_files = next(iter(games.items()))
+    payload = ps2mc.build_p2fd(game_dir, game_files)
+
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "X-Save-Timestamp": str(meta.client_timestamp),
+            "X-Save-Hash": hashlib.sha256(payload).hexdigest(),
+            "X-Save-Size": str(len(payload)),
+            "X-Save-Dir": game_dir,
+        },
+    )
+
+
+@router.post("/saves/{title_id}/ps2-files")
+async def upload_ps2_files(
+    title_id: str,
+    request: Request,
+    console_id: str = Query(""),
+):
+    """Accept one game's save as a P2FD folder payload (physical-card push).
+
+    The server builds the canonical single-game ``card.mc2`` from the folder, so
+    a save pushed off a physical card is interchangeable with VMC/MemCard Pro
+    imports for the same serial.
+    """
+    title_id = _validate_title_id(title_id)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    try:
+        game_dir, files = ps2mc.parse_p2fd(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    cid = _console_id_from_request(request, console_id)
+    result = _store_single_game_card(
+        title_id, game_dir, files, int(time.time()), cid
+    )
+    return {"status": "ok", **result}
+
+
+def _store_ps1_single_card(
+    serial: str, raw_card: bytes, timestamp: int, console_id: str
+) -> dict:
+    """Store one save as a single-save 128 KB PS1 card under its serial.
+
+    Reuses the existing PS1 storage layout (``slot0.mcd`` + legacy ``.VMP``) so
+    the plain ``GET /saves/{serial}/ps1-card`` download path serves it unchanged.
+    """
+    title_id = _validate_title_id(serial)
+    resolved = _resolve_ps1_title_alias(title_id)
+    files = {
+        slot_raw_name(0): raw_card,
+        "SCEVMC0.VMP": create_vmp(raw_card),
+    }
+    bundle = SaveBundle(
+        title_id=0,
+        timestamp=timestamp,
+        files=[
+            BundleFile(
+                path=path,
+                size=len(data),
+                sha256=hashlib.sha256(data).digest(),
+                data=data,
+            )
+            for path, data in sorted(files.items())
+        ],
+        title_id_str=resolved,
+    )
+    storage.store_save(bundle, source="ps1_vmc", console_id=console_id)
+    return {
+        "serial": title_id,
+        "size": len(raw_card),
+        "sha256": hashlib.sha256(raw_card).hexdigest(),
+    }
+
+
+@router.post("/saves/ps1-vmc/import")
+async def import_ps1_vmc(request: Request, console_id: str = Query("")):
+    """Split a 128 KB PS1 memory card / VMC into per-game single-save cards.
+
+    Accepts a raw ``.mcd``/``.mcr`` card or a ``.vmp``; each save block-chain is
+    extracted, keyed by its disc serial, and stored as its own single-save card.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    try:
+        raw = extract_raw_card(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        saves = ps1mc.parse_card(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid PS1 card: {exc}")
+
+    cid = _console_id_from_request(request, console_id)
+    timestamp = int(time.time())
+    imported: list[dict] = []
+    skipped: list[str] = []
+    for name, data in saves:
+        serial = ps1mc.serial_from_filename(name)
+        if serial is None:
+            skipped.append(name)
+            continue
+        card = ps1mc.build_single_save_card(name, data)
+        imported.append(_store_ps1_single_card(serial, card, timestamp, cid))
+
+    return {"status": "ok", "imported": imported, "skipped": skipped}
+
+
+@router.post("/saves/ps2-vmc/import")
+async def import_ps2_vmc(request: Request, console_id: str = Query("")):
+    """Split a full PS2 memory-card / VMC image into per-game saves.
+
+    Accepts an 8 MB ``.mc2`` or ``.ps2`` card image (a physical card dump, an
+    OPL VMC file, or a MemCard Pro per-channel image).  Each game directory is
+    extracted and stored separately keyed by its disc serial, so a save written
+    on one card syncs to every other PS2 source for the same game.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    try:
+        card = extract_ps2_canonical_card(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        games = ps2mc.parse_card(card)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid PS2 card: {exc}")
+
+    cid = _console_id_from_request(request, console_id)
+    timestamp = int(time.time())
+    imported: list[dict] = []
+    skipped: list[str] = []
+    for game_dir, files in games.items():
+        serial = ps2mc.serial_from_dirname(game_dir)
+        if serial is None:
+            skipped.append(game_dir)
+            continue
+        imported.append(
+            _store_single_game_card(serial, game_dir, files, timestamp, cid)
+        )
+
+    return {"status": "ok", "imported": imported, "skipped": skipped}
 
 
 @router.post("/saves/{title_id}/ps1-card")
