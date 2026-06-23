@@ -417,22 +417,32 @@ def _ps1_compute_disc_groups(entries) -> dict[str, tuple[int, int, str]]:
     the PSP client can use the field's presence as a "this is a PS1
     game" flag without an extra system check.
     """
-    groups: dict[str, list] = {}
-    for e in entries:
-        if (e.system or '').upper() not in _PS1_EBOOT_SYSTEMS:
-            continue
-        if not e.title_id:
-            continue
-        groups.setdefault(e.title_id, []).append(e)
+    ps1 = [
+        e for e in entries
+        if (e.system or '').upper() in _PS1_EBOOT_SYSTEMS and e.title_id
+    ]
 
-    meta: dict[str, tuple[int, int, str]] = {}
-    for group in groups.values():
+    # Only files carrying an explicit (Disc N) tag can form a multi-disc set,
+    # and the set must span at least two distinct disc numbers.  This keeps
+    # same-serial single-disc revisions (Alundra + Alundra (Rev 1)) separate.
+    tagged: dict[str, list] = {}
+    for e in ps1:
+        if _ps1_has_disc_tag(e.filename):
+            tagged.setdefault(e.title_id, []).append(e)
+
+    multi: dict[str, tuple[int, int, str]] = {}
+    for group in tagged.values():
+        if len(group) < 2 or len({_ps1_disc_number(e.filename) for e in group}) < 2:
+            continue
         group.sort(key=lambda e: (_ps1_disc_number(e.filename), e.filename))
         total = len(group)
         primary_rom_id = group[0].rom_id
         for idx, e in enumerate(group, 1):
-            meta[e.rom_id] = (idx, total, primary_rom_id)
-    return meta
+            multi[e.rom_id] = (idx, total, primary_rom_id)
+
+    # Single-disc PS1 games still report (1, 1, rom_id) so clients can use
+    # the field's presence as a "this is a PS1 game" flag.
+    return {e.rom_id: multi.get(e.rom_id, (1, 1, e.rom_id)) for e in ps1}
 
 
 # ── Misc endpoints ───────────────────────────────────────────────────────────
@@ -1379,6 +1389,16 @@ def _ps1_disc_number(filename: str) -> int:
     return int(m.group(1)) if m else 1
 
 
+def _ps1_has_disc_tag(filename: str) -> bool:
+    """True only when the filename carries an explicit ``(Disc N)`` tag.
+
+    Same-serial single-disc revisions (e.g. ``Alundra (USA)`` and
+    ``Alundra (USA) (Rev 1)``) must NOT be treated as a multi-disc set —
+    only files that actually name a disc number do.
+    """
+    return bool(_PS1_DISC_NUM_RE.search(filename or ''))
+
+
 def _ps1_normalize_gamecode(value: str | None) -> str:
     """Strip non-alphanumerics and uppercase.  pop-fe + popstation expect
     the canonical PS1 product code form (``SCUS94503``, 9 chars, no dash);
@@ -1407,6 +1427,10 @@ def _ps1_disc_siblings(entry) -> list:
     title_id = entry.title_id
     if not title_id:
         return [entry]
+    # A multi-disc set requires this entry to carry an explicit (Disc N) tag;
+    # otherwise same-serial single-disc revisions would be wrongly merged.
+    if not _ps1_has_disc_tag(entry.filename):
+        return [entry]
     catalog = rom_scanner.get()
     if catalog is None:
         return [entry]
@@ -1414,8 +1438,9 @@ def _ps1_disc_siblings(entry) -> list:
         e for e in catalog.list_all()
         if (e.system or '').upper() in _PS1_EBOOT_SYSTEMS
         and e.title_id == title_id
+        and _ps1_has_disc_tag(e.filename)
     ]
-    if len(siblings) <= 1:
+    if len(siblings) <= 1 or len({_ps1_disc_number(e.filename) for e in siblings}) < 2:
         return [entry]
     siblings.sort(key=lambda e: (_ps1_disc_number(e.filename), e.filename))
     return siblings
