@@ -40,6 +40,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -1802,20 +1803,38 @@ def _psio_find_cue(source_dir: Path) -> Path:
 
 _PS1_BRACKET_TAG_RE = re.compile(r'\s*\[[^\]]*\]')
 
+# PSIO's menu refuses filenames longer than this and cannot render non-ASCII
+# bytes, so every BIN/CU2 member name we emit must stay ASCII and <= 60 chars.
+PSIO_MAX_FILENAME = 60
+
+
+def _psio_ascii_only(value: str) -> str:
+    """Best-effort ASCII: decompose accents, drop combining marks, drop the rest.
+
+    PSIO cannot display non-ASCII bytes; NFKD decomposition salvages accented
+    Latin names (e.g. ``Pokémon`` -> ``Pokemon``) while the remaining CJK /
+    symbol bytes are dropped.
+    """
+    decomposed = unicodedata.normalize('NFKD', str(value or ''))
+    stripped = ''.join(c for c in decomposed if not unicodedata.combining(c))
+    return stripped.encode('ascii', 'ignore').decode('ascii')
+
 
 def _ps1_psio_base_name(name: str) -> str:
     """PSIO BIN/CU2 base name for one game.
 
     Drops the ``(Disc N)`` tag and any ``[..]`` tags (translation / dump
     flags) but keeps region parens like ``(USA)`` — matching the on-disk
-    PSIO convention (e.g. ``Fear Effect (USA) (Disc 1).bin``).  The per-disc
-    suffix is re-appended by the caller.
+    PSIO convention (e.g. ``Fear Effect (USA) (Disc 1).bin``).  Non-ASCII
+    characters are stripped (PSIO can't render them); the per-disc suffix is
+    re-appended by the caller, which also enforces the 60-char limit.
     """
     stem = Path(name).stem
     cleaned = _PS1_DISC_NUM_RE.sub('', stem)
     cleaned = _PS1_BRACKET_TAG_RE.sub('', cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned or stem
+    cleaned = _psio_ascii_only(cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ._')
+    return cleaned or 'game'
 
 
 async def _extract_ps1_psio(system: str, entry) -> Response:
@@ -1888,9 +1907,14 @@ async def _extract_ps1_psio(system: str, entry) -> Response:
                 # BIN/CU2 stems plus a MULTIDISC.LST — no per-disc subfolders.
                 if multi:
                     disc_no = _ps1_disc_number(sibling.filename)
-                    out_base = f"{base_name} (Disc {disc_no})"
+                    disc_suffix = f' (Disc {disc_no})'
                 else:
-                    out_base = base_name
+                    disc_suffix = ''
+                # PSIO rejects filenames > 60 chars; leave room for the disc
+                # suffix and the .bin/.cu2 extension (4 chars).
+                limit = max(1, PSIO_MAX_FILENAME - len(disc_suffix) - 4)
+                trimmed = base_name if len(base_name) <= limit else base_name[:limit].rstrip(' ._')
+                out_base = f"{trimmed}{disc_suffix}"
                 zf.writestr(f"{out_base}.cu2", cu2_text)
                 # _parse_cue_for_psio enforces a single monolithic BIN.
                 for ref in referenced_files:

@@ -48,8 +48,12 @@ typedef enum {
     APP_VIEW_ROMS      = 0,   /* server catalog (HTTP) */
     APP_VIEW_LOCAL     = 1,   /* installed ISOs or HDL partitions */
     APP_VIEW_DOWNLOADS = 2,   /* download queue */
-    APP_VIEW_CONFIG    = 3,
-    APP_VIEW_COUNT     = 4,
+    APP_VIEW_SAVES     = 3,   /* VMC / MemCard Pro card-image sync */
+    APP_VIEW_MCARD     = 4,   /* physical memory card slot 1 (mc0:) */
+    APP_VIEW_MCARD2    = 5,   /* physical memory card slot 2 (mc1:) */
+    APP_VIEW_SERVER    = 6,   /* all PS1/PS2 saves on the server */
+    APP_VIEW_CONFIG    = 7,
+    APP_VIEW_COUNT     = 8,
 } AppView;
 
 typedef enum {

@@ -36,6 +36,8 @@ extern const unsigned char netman_irx[] __attribute__((aligned(16)));
 extern const unsigned int  netman_irx_size;
 extern const unsigned char smap_irx[] __attribute__((aligned(16)));
 extern const unsigned int  smap_irx_size;
+extern const unsigned char mmceman_irx[] __attribute__((aligned(16)));
+extern const unsigned int  mmceman_irx_size;
 
 #ifdef __cplusplus
 }

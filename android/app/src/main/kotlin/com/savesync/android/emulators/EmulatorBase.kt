@@ -226,6 +226,28 @@ abstract class EmulatorBase {
     }
 
     /**
+     * Reads the canonical PS1 save serial from a raw memory-card image
+     * (``.mcd`` / ``.mcr``), matching the server's ``ps1mc.serial_from_filename``.
+     *
+     * The server keys every PS1 save by the product code embedded in the
+     * save block's directory frame (e.g. ``BASLPS-00555...`` → ``SLPS00555``),
+     * which the game writes identically across regional/limited editions. The
+     * disc serial parsed by [readPs1Serial] can differ for variant releases
+     * (e.g. a "Gentei Box" disc that boots ``SLPS-00545`` but still writes
+     * ``BASLPS-00555`` to the card), so preferring the in-card code keeps the
+     * local title ID aligned with the server slot.
+     *
+     * PS1 cards are 128 KB = 16 blocks * 8 KB. Block 0 frame 1..15 each hold a
+     * directory entry; a frame whose first byte is 0x51 (ST_FIRST) starts a
+     * save, with the product-code filename at offset 0x0A (up to 20 bytes).
+     *
+     * Returns a bare product code (e.g. "SLPS00555"), or null if the file is
+     * not a recognisable PS1 card or has no save with a parseable serial.
+     */
+    protected fun readPs1SaveCardSerial(cardFile: File): String? =
+        Ps1CardSerial.readSaveSerial(cardFile)
+
+    /**
      * Reads the PS2 disc serial from an ISO/BIN/CUE image.
      *
      * PS2 discs use the same SYSTEM.CNF/BOOT parsing strategy as PS1, including

@@ -913,6 +913,194 @@ class TestRomCatalog:
             settings.rom_dir = original
             rom_scanner._catalog = None
 
+    def test_ps1_disc_groups_require_disc_tag(self):
+        """Same-serial single-disc revisions must not be reported as a
+        multi-disc set; only explicit (Disc N) files group together."""
+        from app.routes.roms import _ps1_compute_disc_groups
+
+        class _E:
+            def __init__(self, rom_id, title_id, filename):
+                self.rom_id = rom_id
+                self.title_id = title_id
+                self.filename = filename
+                self.system = "PS1"
+
+        entries = [
+            _E("SCUS94228", "SCUS94228", "Alundra (USA).chd"),
+            _E(
+                "SCUS94228__r1",
+                "SCUS94228",
+                "Alundra (USA) (Rev 1) [Un-Worked Design by Supper v1].chd",
+            ),
+            _E("SCUS94163", "SCUS94163", "Final Fantasy VII (USA) (Disc 1).chd"),
+            _E("SCUS94163__d2", "SCUS94163", "Final Fantasy VII (USA) (Disc 2).chd"),
+        ]
+
+        meta = _ps1_compute_disc_groups(entries)
+
+        # Single-disc revisions: each reports (1, 1, self) — not combined.
+        assert meta["SCUS94228"] == (1, 1, "SCUS94228")
+        assert meta["SCUS94228__r1"] == (1, 1, "SCUS94228__r1")
+        # Real two-disc set: total 2, shared primary.
+        assert meta["SCUS94163"] == (1, 2, "SCUS94163")
+        assert meta["SCUS94163__d2"] == (2, 2, "SCUS94163")
+
+    def test_ps1_psio_multidisc_flat_layout(
+        self, tmp_path, client, auth_headers, monkeypatch
+    ):
+        """Multi-disc PSIO output is flat in one game folder: each disc's
+        BIN/CU2 share a clean stem (translation tags stripped) plus a
+        MULTIDISC.LST — no per-disc subfolders."""
+        from app.routes import roms as roms_mod
+        from app.config import settings
+        import io
+        import zipfile as zf_mod
+
+        original = settings.rom_dir
+        try:
+            roms = tmp_path / "roms"
+            psx = roms / "psx"
+            psx.mkdir(parents=True)
+            settings.rom_dir = roms
+
+            for n in (1, 2):
+                stem = f"Some Game (USA) (Disc {n}) [T-En by X]"
+                (psx / f"{stem}.bin").write_bytes(b"\0" * 2352 * 300)
+                (psx / f"{stem}.cue").write_text(
+                    f'FILE "{stem}.bin" BINARY\n'
+                    "  TRACK 01 MODE2/2352\n"
+                    "    INDEX 01 00:02:00\n",
+                    encoding="utf-8",
+                )
+
+            class _Entry:
+                def __init__(self, rom_id, n):
+                    stem = f"Some Game (USA) (Disc {n}) [T-En by X]"
+                    self.rom_id = rom_id
+                    self.title_id = "SLUS00001"
+                    self.system = "PS1"
+                    self.name = stem
+                    self.filename = f"{stem}.cue"
+                    self.path = f"psx/{stem}.cue"
+                    self.is_bundle = False
+
+            entries = [_Entry("SLUS00001", 1), _Entry("SLUS00001__d2", 2)]
+
+            class _Catalog:
+                def get(self, rid):
+                    return next((e for e in entries if e.rom_id == rid), None)
+
+                def list_all(self):
+                    return entries
+
+            monkeypatch.setattr(roms_mod.rom_scanner, "get", lambda: _Catalog())
+
+            resp = client.get(
+                "/api/v1/roms/SLUS00001?extract=psio", headers=auth_headers
+            )
+            assert resp.status_code == 200, resp.content
+            assert resp.headers["content-type"] == "application/zip"
+            with zf_mod.ZipFile(io.BytesIO(resp.content)) as zf:
+                assert sorted(zf.namelist()) == [
+                    "MULTIDISC.LST",
+                    "Some Game (USA) (Disc 1).bin",
+                    "Some Game (USA) (Disc 1).cu2",
+                    "Some Game (USA) (Disc 2).bin",
+                    "Some Game (USA) (Disc 2).cu2",
+                ]
+                assert zf.read("MULTIDISC.LST") == (
+                    b"Some Game (USA) (Disc 1).bin\r\n"
+                    b"Some Game (USA) (Disc 2).bin\r\n"
+                )
+        finally:
+            settings.rom_dir = original
+
+    def test_ps1_psio_base_name_is_ascii_and_short(self):
+        """PSIO can't render non-ASCII and caps filenames at 60 chars; the
+        base-name helper must drop accents and translation tags up front."""
+        from app.routes.roms import _ps1_psio_base_name
+
+        assert _ps1_psio_base_name("Pokémon (USA) [T-En by X]") == "Pokemon (USA)"
+        # CJK bytes have no ASCII fallback -> dropped, leaving the region tag.
+        assert _ps1_psio_base_name("テトリス (Japan)") == "(Japan)"
+        assert _ps1_psio_base_name("Game (Disc 1) (USA)") == "Game (USA)"
+
+    def test_ps1_psio_caps_member_names_at_60_chars(
+        self, tmp_path, client, auth_headers, monkeypatch
+    ):
+        """Single + multi-disc PSIO output must keep every BIN/CU2 member
+        name (with extension) within PSIO's 60-char filename limit."""
+        from app.routes import roms as roms_mod
+        from app.config import settings
+        import io
+        import zipfile as zf_mod
+
+        original = settings.rom_dir
+        try:
+            roms = tmp_path / "roms"
+            psx = roms / "psx"
+            psx.mkdir(parents=True)
+            settings.rom_dir = roms
+
+            long_name = (
+                "A Very Long PlayStation Game Title That Goes Well Beyond The "
+                "Sixty Character PSIO Filename Limit For Sure"
+            )
+
+            def _write_disc(stem):
+                (psx / f"{stem}.bin").write_bytes(b"\0" * 2352 * 300)
+                (psx / f"{stem}.cue").write_text(
+                    f'FILE "{stem}.bin" BINARY\n'
+                    "  TRACK 01 MODE2/2352\n"
+                    "    INDEX 01 00:02:00\n",
+                    encoding="utf-8",
+                )
+
+            # Two discs so the multi-disc suffix path is exercised too.
+            _write_disc(f"{long_name} (Disc 1)")
+            _write_disc(f"{long_name} (Disc 2)")
+
+            class _Entry:
+                def __init__(self, rom_id, n):
+                    stem = f"{long_name} (Disc {n})"
+                    self.rom_id = rom_id
+                    self.title_id = "SLUS99999"
+                    self.system = "PS1"
+                    self.name = stem
+                    self.filename = f"{stem}.cue"
+                    self.path = f"psx/{stem}.cue"
+                    self.is_bundle = False
+
+            entries = [_Entry("SLUS99999", 1), _Entry("SLUS99999__d2", 2)]
+
+            class _Catalog:
+                def get(self, rid):
+                    return next((e for e in entries if e.rom_id == rid), None)
+
+                def list_all(self):
+                    return entries
+
+            monkeypatch.setattr(roms_mod.rom_scanner, "get", lambda: _Catalog())
+
+            resp = client.get(
+                "/api/v1/roms/SLUS99999?extract=psio", headers=auth_headers
+            )
+            assert resp.status_code == 200, resp.content
+            with zf_mod.ZipFile(io.BytesIO(resp.content)) as zf:
+                names = zf.namelist()
+                assert "MULTIDISC.LST" in names
+                for member in names:
+                    assert len(member) <= 60, f"{member!r} exceeds 60 chars"
+                # BIN/CU2 within a disc must still share a stem.
+                bins = sorted(n for n in names if n.endswith(".bin"))
+                for bin_name in bins:
+                    assert bin_name.replace(".bin", ".cu2") in names
+                # MULTIDISC.LST must reference the (truncated) bin names.
+                lst = zf.read("MULTIDISC.LST").decode("utf-8").splitlines()
+                assert sorted(line.strip() for line in lst) == sorted(bins)
+        finally:
+            settings.rom_dir = original
+
     def test_cue_to_cu2_writer_handles_track_offsets(self, tmp_path):
         from app.routes.roms import _cue_to_cu2_text
 

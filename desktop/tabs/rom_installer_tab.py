@@ -25,8 +25,11 @@ from rom_installer import (
     available_systems_for_profiles,
     build_install_plan,
     fetch_rom_catalog,
+    group_multidisc_roms,
     install_rom,
     profile_rom_format,
+    resolve_profile_rom_folder,
+    sanitize_installed_files,
 )
 
 
@@ -83,6 +86,22 @@ class InstallWorker(QThread):
         self.finished.emit(ok, fail, all_paths)
 
 
+class SanitizeWorker(QThread):
+    finished = pyqtSignal(list)   # list of (old_path, new_path) renames
+    error = pyqtSignal(str)
+
+    def __init__(self, profile: dict, system: str, parent=None):
+        super().__init__(parent)
+        self.profile = profile
+        self.system = system
+
+    def run(self):
+        try:
+            self.finished.emit(sanitize_installed_files(self.profile, self.system))
+        except Exception as exc:
+            self.error.emit(str(exc) or exc.__class__.__name__)
+
+
 class RomInstallerTab(QWidget):
     def __init__(self, profiles_tab):
         super().__init__()
@@ -91,6 +110,7 @@ class RomInstallerTab(QWidget):
         self._roms: list[dict] = []
         self._fetch_worker: CatalogFetchWorker | None = None
         self._install_worker: InstallWorker | None = None
+        self._sanitize_worker: SanitizeWorker | None = None
         self._init_ui()
         self.refresh_profiles()
 
@@ -129,6 +149,14 @@ class RomInstallerTab(QWidget):
         self.install_btn = QPushButton("Install Selected")
         self.install_btn.clicked.connect(self.install_selected)
         search_row.addWidget(self.install_btn)
+        self.sanitize_btn = QPushButton("Sanitize Installed Files")
+        self.sanitize_btn.setToolTip(
+            "Rename installed files/folders that break PSIO's limits\n"
+            "(filenames > 60 chars or non-ASCII characters).\n"
+            "Keeps each game's .bin/.cu2 pair aligned."
+        )
+        self.sanitize_btn.clicked.connect(self.sanitize_installed)
+        search_row.addWidget(self.sanitize_btn)
         layout.addLayout(search_row)
 
         self.status_label = QLabel("")
@@ -201,6 +229,13 @@ class RomInstallerTab(QWidget):
                 self.system_combo.setCurrentIndex(idx)
         self.system_combo.blockSignals(False)
         self._on_system_changed()
+        # PSIO-specific filename limits (ASCII, <= 60 chars) only apply to
+        # PSIO profiles, so the sanitize button is gated to them.
+        self.sanitize_btn.setEnabled(
+            str(profile.get("device_type", "")).strip().upper() == "PSIO"
+            if profile
+            else False
+        )
 
     def _on_system_changed(self):
         profile = self._current_profile()
@@ -240,8 +275,9 @@ class RomInstallerTab(QWidget):
         profile = self._current_profile()
         system = self.system_combo.currentText()
         override = str(self.format_combo.currentData() or "auto")
+        display_roms = group_multidisc_roms(profile or {}, roms, system, override)
         self.table.setRowCount(0)
-        for rom in roms:
+        for rom in display_roms:
             row = self.table.rowCount()
             self.table.insertRow(row)
             try:
@@ -251,10 +287,16 @@ class RomInstallerTab(QWidget):
                 plan = None
                 fmt = ""
 
+            members = rom.get("disc_members") or []
+            name = rom.get("name") or rom.get("filename", "")
+            filename = rom.get("filename", "")
+            if len(members) > 1:
+                name = f"{name} ({len(members)} discs)"
+                filename = f"{len(members)} discs combined"
             values = [
                 rom.get("system", ""),
-                rom.get("name") or rom.get("filename", ""),
-                rom.get("filename", ""),
+                name,
+                filename,
                 _fmt_size(int(rom.get("size") or 0)),
                 fmt,
                 rom.get("rom_id") or rom.get("title_id", ""),
@@ -370,3 +412,80 @@ class RomInstallerTab(QWidget):
                 "ROM Installer",
                 f"Installed {ok} ROM(s):\n" + "\n".join(paths[:20]),
             )
+
+    def sanitize_installed(self):
+        profile = self._current_profile()
+        system = self.system_combo.currentText()
+        if not profile or not system:
+            QMessageBox.warning(self, "ROM Installer", "Choose a profile and system first.")
+            return
+        if str(profile.get("device_type", "")).strip().upper() != "PSIO":
+            QMessageBox.information(
+                self,
+                "ROM Installer",
+                "Sanitizing enforces PSIO limits (ASCII filenames <= 60 chars).\n"
+                "Select a PSIO profile to continue.",
+            )
+            return
+        try:
+            root = resolve_profile_rom_folder(profile, system)
+        except Exception:
+            root = None
+        if not root or not Path(root).is_dir():
+            QMessageBox.warning(
+                self, "ROM Installer", "Profile ROM folder not found:\n" + str(root or "")
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Sanitize Installed Files",
+            "Scan this profile's ROM folder and rename any files or folders that\n"
+            "break PSIO's limits (filenames > 60 chars or non-ASCII characters)?\n\n"
+            "Each game's .bin/.cu2 pair is kept on a matching stem and\n"
+            "MULTIDISC.LST is rewritten to match.\n\n"
+            f"Folder:\n{root}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.sanitize_btn.setEnabled(False)
+        self.status_label.setText("Sanitizing installed files...")
+        self._sanitize_worker = SanitizeWorker(profile, system, self)
+        self._sanitize_worker.finished.connect(self._on_sanitize_finished)
+        self._sanitize_worker.error.connect(self._on_sanitize_error)
+        self._sanitize_worker.start()
+
+    def _on_sanitize_finished(self, renames: list):
+        self.sanitize_btn.setEnabled(
+            str(self._current_profile().get("device_type", "")).strip().upper() == "PSIO"
+            if self._current_profile()
+            else False
+        )
+        count = len(renames)
+        if count:
+            self.status_label.setText(f"Sanitized {count} item(s).")
+            preview = "\n".join(
+                f"{Path(old).name} -> {Path(new).name}" for old, new in renames[:25]
+            )
+            more = f"\n... and {count - 25} more" if count > 25 else ""
+            QMessageBox.information(
+                self,
+                "ROM Installer",
+                f"Renamed {count} item(s):\n\n{preview}{more}",
+            )
+        else:
+            self.status_label.setText("No problematic files found.")
+            QMessageBox.information(
+                self, "ROM Installer", "No files needed renaming. Everything is PSIO-safe."
+            )
+
+    def _on_sanitize_error(self, message: str):
+        self.sanitize_btn.setEnabled(
+            str(self._current_profile().get("device_type", "")).strip().upper() == "PSIO"
+            if self._current_profile()
+            else False
+        )
+        self.status_label.setText("Sanitize failed.")
+        QMessageBox.critical(self, "ROM Installer", message)

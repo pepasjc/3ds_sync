@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,15 @@ ROM_FORMAT_OPTIONS: list[tuple[str, str]] = [
 ROM_FORMAT_LABELS = dict(ROM_FORMAT_OPTIONS)
 
 ARCHIVE_EXTRACT_FORMATS = {"cue", "psio", "gdi", "cci", "folder"}
+# Formats where the server stitches every disc of a multi-disc game into a
+# single output (one PSIO BIN/CU2 set, one multi-disc EBOOT.PBP).  For these
+# we collapse the per-disc catalog rows into one installable entry; for raw /
+# cue / chd each disc stays its own file.
+COMBINED_DISC_FORMATS = {"psio", "eboot"}
+_DISC_TAG_RE = re.compile(
+    r"\s*[\(\[]\s*Dis[ck]\s*\d+(?:\s*of\s*\d+)?\s*[\)\]]", re.IGNORECASE
+)
+_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]")
 DISC_CUE_SYSTEMS = {
     "PS1",
     "PSX",
@@ -50,6 +60,10 @@ DISC_ISO_SYSTEMS = {"PS2", "PSP", "GC", "WII", "XBOX", "X360", "XBOX360"}
 EMULATOR_DEVICE_TYPES = {"RetroArch", "EmuDeck"}
 HARDWARE_3DS_DEVICE_TYPES = {"Generic", "Everdrive", "CD Folder"}
 XBOX_SYSTEMS = {"XBOX", "X360", "XBOX360"}
+
+# PSIO's menu refuses filenames > 60 chars and cannot render non-ASCII bytes.
+# We keep folder + member names within this limit for PSIO installs.
+PSIO_MAX_NAME = 60
 
 
 ROM_SUBDIRS: dict[str, list[str]] = {
@@ -204,6 +218,95 @@ def choose_extract_format(
     return selected
 
 
+def strip_disc_tag(name: str) -> str:
+    """Drop ``(Disc N)`` / ``(Disk N of M)`` tokens from a game name."""
+    cleaned = _DISC_TAG_RE.sub("", str(name or ""))
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _ascii_only(value: str) -> str:
+    """Best-effort ASCII: decompose accents, drop combining marks, drop the rest.
+
+    PSIO cannot render non-ASCII bytes; NFKD salvages accented Latin names
+    (``Pokémon`` -> ``Pokemon``) while remaining CJK / symbol bytes are dropped.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(value or ""))
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return stripped.encode("ascii", "ignore").decode("ascii")
+
+
+def clean_ps1_title(name: str) -> str:
+    """PSIO install folder name: drop disc tags and ``[..]`` tags (translation /
+    dump flags) but keep region parens like ``(USA)``.  Strips non-ASCII bytes
+    and caps at ``PSIO_MAX_NAME`` so PSIO's menu can list the folder.  Mirrors
+    the on-disk PSIO convention where the game folder is the bare title."""
+    cleaned = _DISC_TAG_RE.sub("", str(name or ""))
+    cleaned = _BRACKET_TAG_RE.sub("", cleaned)
+    cleaned = _ascii_only(cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ._")
+    if len(cleaned) > PSIO_MAX_NAME:
+        cleaned = cleaned[:PSIO_MAX_NAME].rstrip(" ._")
+    return cleaned or "game"
+
+
+def group_multidisc_roms(
+    profile: dict,
+    roms: list[dict],
+    system: str,
+    override_format: str = "",
+) -> list[dict]:
+    """Collapse multi-disc PS1 groups into one catalog entry per game.
+
+    Only collapses when the effective install format produces a single
+    combined output (see ``COMBINED_DISC_FORMATS``).  The merged entry keeps
+    the group's ``primary_rom_id`` as its ``rom_id`` — requesting that from the
+    server returns the full multi-disc set (the server groups siblings by
+    title_id).  A synthetic ``disc_members`` list and ``disc_total`` are
+    attached for display.  Non-PS1 / single-disc / non-combined rows pass
+    through unchanged and keep their original order.
+    """
+    result: list[dict] = []
+    aggregates: dict[str, dict] = {}
+    for rom in roms:
+        try:
+            fmt = choose_extract_format(profile, rom, system, override_format)
+        except Exception:
+            fmt = None
+        total = int(rom.get("disc_total") or 1)
+        primary = str(rom.get("primary_rom_id") or "")
+        has_disc_tag = bool(
+            _DISC_TAG_RE.search(str(rom.get("filename") or rom.get("name") or ""))
+        )
+        if fmt in COMBINED_DISC_FORMATS and total > 1 and primary and has_disc_tag:
+            agg = aggregates.get(primary)
+            if agg is None:
+                agg = dict(rom)
+                agg["rom_id"] = primary
+                agg["disc_members"] = []
+                aggregates[primary] = agg
+                result.append(agg)
+            agg["disc_members"].append(rom)
+        else:
+            result.append(rom)
+
+    for agg in aggregates.values():
+        members = sorted(
+            agg["disc_members"], key=lambda r: int(r.get("disc_index") or 0)
+        )
+        primary_member = next(
+            (m for m in members if str(m.get("rom_id")) == str(agg["rom_id"])),
+            members[0],
+        )
+        agg["disc_members"] = members
+        agg["disc_total"] = len(members)
+        agg["size"] = sum(int(m.get("size") or 0) for m in members)
+        agg["filename"] = primary_member.get("filename") or agg.get("filename")
+        agg["name"] = strip_disc_tag(
+            primary_member.get("name") or primary_member.get("filename") or ""
+        )
+    return result
+
+
 def derive_download_filename(filename: str, extract_format: str | None) -> str:
     fmt = (extract_format or "").strip().lower()
     if not fmt:
@@ -309,7 +412,10 @@ def build_install_plan(
         return InstallPlan(rom_id, display_name, system_up, filename, target_path, extract)
 
     if extract in ARCHIVE_EXTRACT_FORMATS or bool(rom.get("is_bundle")):
-        target_dir = target_root / safe_folder_name(display_name)
+        # PSIO installs into a bare game folder (translation/disc tags stripped);
+        # the server already names the BIN/CU2 inside it.
+        folder_name = clean_ps1_title(display_name) if extract == "psio" else display_name
+        target_dir = target_root / safe_folder_name(folder_name)
         return InstallPlan(
             rom_id=rom_id,
             display_name=display_name,
@@ -417,3 +523,173 @@ def available_systems_for_profiles(profiles: Iterable[dict]) -> list[str]:
     for profile in profiles:
         systems.update(profile_systems(profile))
     return sorted(s for s in systems if s)
+
+
+# ── PSIO install sanitization ────────────────────────────────────────────────
+#
+# PSIO's menu refuses filenames > 60 chars and cannot render non-ASCII bytes.
+# Games installed before these limits were enforced (or copied onto the SD
+# card by hand) need renaming.  ``sanitize_installed_files`` walks a profile's
+# ROM folder and renames every offending file / folder, keeping each game's
+# ``.bin``/``.cu2`` pair on a matching stem and rewriting ``MULTIDISC.LST``.
+
+_PSIO_PAIR_EXTS = (".bin", ".cu2")
+
+
+def psio_safe_name(name: str, reserve: int = 0) -> str:
+    """ASCII-only, ``PSIO_MAX_NAME - reserve`` chars.  ``reserve`` is the number
+    of characters to leave for a suffix the caller appends (e.g. an extension
+    or `` (Disc N)``)."""
+    text = _ascii_only(name)
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" ._")
+    limit = max(1, PSIO_MAX_NAME - reserve)
+    if len(text) > limit:
+        text = text[:limit].rstrip(" ._")
+    return text or "game"
+
+
+def _free_pair_stem(parent: Path, desired: str, own: set[Path]) -> str:
+    """A stem whose ``.bin`` and ``.cu2`` are both free in ``parent``.
+
+    Collisions (two different source stems collapsing to the same ASCII name)
+    get a ``~n`` suffix, re-truncated so the final filename still fits.
+    """
+    if _pair_stem_free(parent, desired, own):
+        return desired
+    n = 2
+    while n < 1000:
+        suffix = f"~{n}"
+        limit = max(1, PSIO_MAX_NAME - 4 - len(suffix))
+        candidate = desired[:limit].rstrip(" ._") + suffix
+        if _pair_stem_free(parent, candidate, own):
+            return candidate
+        n += 1
+    return desired
+
+
+def _pair_stem_free(parent: Path, stem: str, own: set[Path]) -> bool:
+    for ext in _PSIO_PAIR_EXTS:
+        path = parent / f"{stem}{ext}"
+        if path.exists() and path not in own:
+            return False
+    return True
+
+
+def _free_single_name(parent: Path, desired: str, own: Path) -> Path:
+    candidate = parent / desired
+    if candidate == own or not candidate.exists():
+        return candidate
+    stem = Path(desired).stem
+    ext = Path(desired).suffix
+    n = 2
+    while n < 1000:
+        suffix = f"~{n}"
+        limit = max(1, PSIO_MAX_NAME - len(ext) - len(suffix))
+        candidate = parent / f"{stem[:limit].rstrip(' ._')}{suffix}{ext}"
+        if candidate == own or not candidate.exists():
+            return candidate
+        n += 1
+    return parent / desired
+
+
+def _sanitize_dir_files(directory: Path, renames: list[tuple[str, str]]) -> None:
+    """Rename ``.bin``/``.cu2`` pairs + loose files in ``directory`` to PSIO-safe
+    names, keeping paired stems aligned and rewriting ``MULTIDISC.LST``."""
+    pairs: dict[str, dict[str, Path]] = {}
+    loose: list[Path] = []
+    for entry in sorted(directory.iterdir()):
+        if not entry.is_file():
+            continue
+        ext = entry.suffix.lower()
+        if ext in _PSIO_PAIR_EXTS:
+            pairs.setdefault(entry.stem, {})[ext] = entry
+        elif entry.name.upper() != "MULTIDISC.LST":
+            loose.append(entry)
+
+    bin_renames: dict[str, str] = {}
+
+    for stem, files in sorted(pairs.items()):
+        desired = psio_safe_name(stem, reserve=4)
+        if desired == stem:
+            continue
+        own = {p for p in files.values()}
+        final_stem = _free_pair_stem(directory, desired, own)
+        if final_stem == stem:
+            continue
+        for ext in _PSIO_PAIR_EXTS:
+            old = files.get(ext)
+            if not old:
+                continue
+            new_path = directory / f"{final_stem}{ext}"
+            old.rename(new_path)
+            renames.append((str(old), str(new_path)))
+            if ext == ".bin":
+                bin_renames[old.name] = new_path.name
+
+    for old in loose:
+        ext = old.suffix
+        desired = psio_safe_name(old.stem, reserve=len(ext)) + ext
+        if desired == old.name:
+            continue
+        new_path = _free_single_name(old.parent, desired, old)
+        if new_path == old:
+            continue
+        old.rename(new_path)
+        renames.append((str(old), str(new_path)))
+
+    lst = directory / "MULTIDISC.LST"
+    if bin_renames and lst.is_file():
+        # newline="" disables platform translation so the on-disk CRLF
+        # endings PSIO expects are preserved exactly.
+        with lst.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            lines = [
+                bin_renames.get(line.strip(), line.strip())
+                for line in fh.read().splitlines()
+            ]
+        with lst.open("w", encoding="utf-8", newline="") as fh:
+            fh.write("\r\n".join(lines) + "\r\n")
+
+
+def _sanitize_folder_name(folder: Path, renames: list[tuple[str, str]]) -> None:
+    desired = psio_safe_name(folder.name, reserve=0)
+    if desired == folder.name:
+        return
+    new_path = _free_single_name(folder.parent, desired, folder)
+    if new_path == folder:
+        return
+    folder.rename(new_path)
+    renames.append((str(folder), str(new_path)))
+
+
+def sanitize_installed_files(profile: dict, system: str) -> list[tuple[str, str]]:
+    """Rename PSIO-installed files/folders that break the ASCII + 60-char limits.
+
+    Walks the profile's ROM folder: each game subfolder has its ``.bin``/``.cu2``
+    pairs aligned to a matching PSIO-safe stem (with ``MULTIDISC.LST`` rewritten)
+    and is itself renamed; loose files under the root are fixed too.  Returns a
+    list of ``(old_path, new_path)`` records.  Does nothing if the folder is
+    missing.  Never raises on individual rename failures — problems are skipped
+    so one locked file doesn't abort the whole sweep.
+    """
+    renames: list[tuple[str, str]] = []
+    try:
+        root = resolve_profile_rom_folder(profile, system)
+    except Exception:
+        return renames
+    if not root.is_dir():
+        return renames
+
+    try:
+        _sanitize_dir_files(root, renames)
+    except OSError:
+        pass
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            _sanitize_dir_files(child, renames)
+            _sanitize_folder_name(child, renames)
+        except OSError:
+            continue
+    return renames

@@ -24,6 +24,7 @@ import com.savesync.android.api.SaturnArchiveLookupResult
 import com.savesync.android.api.SaveSyncApi
 import com.savesync.android.emulators.EmulatorRegistry
 import com.savesync.android.emulators.EmudeckPaths
+import com.savesync.android.emulators.Ps1CardSerial
 import com.savesync.android.emulators.SaveEntry
 import com.savesync.android.emulators.impl.AzaharEmulator
 import com.savesync.android.emulators.impl.DolphinEmulator
@@ -470,6 +471,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     beetleSaturnPerCoreFolder = currentSettings.beetleSaturnPerCoreFolder,
                     cdGamesPerContentFolder = currentSettings.cdGamesPerContentFolder
                 )
+                    .filterNot { entry -> isEmptyPs1Card(entry) }
+                    .map { entry -> overridePs1TitleFromCard(entry) }
 
                 // Discover all ROMs the emulators know about (with expected save paths)
                 val allRomEntries = EmulatorRegistry.discoverAllRomEntries(
@@ -900,6 +903,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (idx <= 0) return 0
         val prefix = titleId.substring(0, idx)
         return if (prefix == normalizeSystemCode(prefix)) 0 else 1
+    }
+
+    /**
+     * Re-keys a PS1 local save by the product code embedded inside its memory-card
+     * file, which is what the server keys by ([Ps1CardSerial]).  This overrides the
+     * disc-serial / filename title ID that emulators (DuckStation, RetroArch, …)
+     * derive, so variant discs (e.g. a "Gentei Box" that boots SLPS-00545 but writes
+     * BISLPS-00555 to the card) land in the same server slot as every other edition.
+     *
+     * Only applies when the card actually parses to a serial; unplayed / non-card
+     * saves keep their original ID.  Runs before name enrichment so the display name
+     * is looked up from the corrected serial too.
+     */
+    private fun overridePs1TitleFromCard(entry: SaveEntry): SaveEntry {
+        if (entry.systemName != "PS1") return entry
+        val card = entry.saveFile ?: return entry
+        if (!card.isFile) return entry
+        val inCardSerial = Ps1CardSerial.readSaveSerial(card) ?: return entry
+        if (inCardSerial.equals(entry.titleId, ignoreCase = true)) return entry
+        return entry.copy(titleId = inCardSerial)
+    }
+
+    /**
+     * A PS1 memory card with no save blocks (a freshly formatted / phantom
+     * per-game card, e.g. one DuckStation auto-created for a variant disc) has
+     * nothing to sync. Surfacing it produces a bogus row keyed by the card's
+     * filename serial — the source of the duplicate "Gentei Box" entry beside
+     * the real save. Drop those before they reach the list. Non-card / non-PS1
+     * saves are kept untouched.
+     */
+    private fun isEmptyPs1Card(entry: SaveEntry): Boolean {
+        if (entry.systemName != "PS1") return false
+        val card = entry.saveFile ?: return false
+        if (!card.isFile) return false
+        return Ps1CardSerial.isEmptyCard(card)
     }
 
     /**
