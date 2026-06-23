@@ -103,6 +103,41 @@ def _psx_region_hint(name: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
+# Region/language words that appear in disc-name tags and should NOT be treated
+# as a distinguishing edition (e.g. "(Japan)", "(USA, Europe)", "(En,Fr,De)").
+_REGION_TAG_WORDS = {
+    "usa", "europe", "japan", "world", "asia", "korea", "china", "australia",
+    "france", "germany", "italy", "spain", "netherlands", "sweden", "brazil",
+    "en", "fr", "de", "es", "it", "ja", "nl", "pt", "sv", "da", "no", "fi", "ko", "zh",
+}
+_DISC_TAG_RE = re.compile(r"\b(disc|cd|disk)\b", re.IGNORECASE)
+_TAG_GROUP_RE = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
+
+
+def _psx_meaningful_tags(name: str) -> tuple[str, ...]:
+    """Return the edition-distinguishing tags in a name, excluding region and
+    disc markers.
+
+    ``"Soul Edge (Japan)"``               → ``()``
+    ``"Soul Edge (Japan) (Gentei Box)"``  → ``("gentei box",)``
+    ``"FF VII (USA) (Disc 1)"``           → ``()``
+
+    Two names with the same slug but different meaningful tags are different
+    releases (base game vs limited edition), so a lookup for the plain name must
+    not resolve to a variant's serial just because it sorts lower.
+    """
+    out: list[str] = []
+    for raw in _TAG_GROUP_RE.findall(name):
+        tag = raw.strip().lower()
+        if not tag or _DISC_TAG_RE.search(tag):
+            continue
+        parts = [p.strip() for p in tag.split(",")]
+        if parts and all(p in _REGION_TAG_WORDS for p in parts):
+            continue
+        out.append(tag)
+    return tuple(sorted(out))
+
+
 def _slug_roman_variants(slug: str) -> list[str]:
     """Return roman<->arabic variants for a normalized slug.
 
@@ -947,8 +982,18 @@ def lookup_psx_serial(name: str) -> str | None:
 
     if not candidates:
         return None
+    # Multiple releases can share a slug (base game, limited editions, revisions).
+    # Prefer the candidate whose edition tags match the query's, so a plain
+    # "Soul Edge (Japan)" resolves to the base disc (SLPS00555) instead of the
+    # alphabetically-lower "Gentei Box" serial (SLPS00545).
+    query_tags = _psx_meaningful_tags(name)
+    tag_matched = [
+        code for code in candidates
+        if _psx_meaningful_tags(_psx_names.get(code, "")) == query_tags
+    ]
+    pool = tag_matched or candidates
     region_hint = _psx_region_hint(name)
-    return min(candidates, key=lambda code: _psx_serial_region_rank(code, region_hint))
+    return min(pool, key=lambda code: _psx_serial_region_rank(code, region_hint))
 
 
 def lookup_saturn_serial(name: str) -> str | None:
