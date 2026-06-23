@@ -1775,11 +1775,22 @@ def _psio_find_cue(source_dir: Path) -> Path:
     return cues[0]
 
 
-def _psio_archive_prefix(entry, index: int, total: int) -> str:
-    if total <= 1:
-        return ''
-    name = _safe_archive_stem(getattr(entry, 'name', '') or getattr(entry, 'filename', '') or f"Disc {index}")
-    return f"Disc {index:02d} - {name}"
+_PS1_BRACKET_TAG_RE = re.compile(r'\s*\[[^\]]*\]')
+
+
+def _ps1_psio_base_name(name: str) -> str:
+    """PSIO BIN/CU2 base name for one game.
+
+    Drops the ``(Disc N)`` tag and any ``[..]`` tags (translation / dump
+    flags) but keeps region parens like ``(USA)`` — matching the on-disk
+    PSIO convention (e.g. ``Fear Effect (USA) (Disc 1).bin``).  The per-disc
+    suffix is re-appended by the caller.
+    """
+    stem = Path(name).stem
+    cleaned = _PS1_DISC_NUM_RE.sub('', stem)
+    cleaned = _PS1_BRACKET_TAG_RE.sub('', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned or stem
 
 
 async def _extract_ps1_psio(system: str, entry) -> Response:
@@ -1814,9 +1825,13 @@ async def _extract_ps1_psio(system: str, entry) -> Response:
     tmp = Path(tmpdir)
     zip_path = tmp / f"{_safe_archive_stem(entry.name or entry.filename or 'psio')}.zip"
 
+    multi = len(source_pairs) > 1
+    base_name = _ps1_psio_base_name(entry.name or entry.filename or 'psio')
+
     def _run() -> Path:
         extract_root = tmp / 'extract'
         extract_root.mkdir()
+        bin_names: list[str] = []
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
             for index, (sibling, source) in enumerate(source_pairs, start=1):
                 if source.is_dir():
@@ -1844,11 +1859,20 @@ async def _extract_ps1_psio(system: str, entry) -> Response:
                     )
 
                 cu2_text, referenced_files = _cue_to_cu2_text(cue_path)
-                prefix = _psio_archive_prefix(sibling, index, len(source_pairs))
-                arc_prefix = f"{prefix}/" if prefix else ''
-                zf.writestr(f"{arc_prefix}{cue_path.stem}.cu2", cu2_text)
+                # PSIO wants every disc flat in one game folder with matching
+                # BIN/CU2 stems plus a MULTIDISC.LST — no per-disc subfolders.
+                if multi:
+                    disc_no = _ps1_disc_number(sibling.filename)
+                    out_base = f"{base_name} (Disc {disc_no})"
+                else:
+                    out_base = base_name
+                zf.writestr(f"{out_base}.cu2", cu2_text)
+                # _parse_cue_for_psio enforces a single monolithic BIN.
                 for ref in referenced_files:
-                    zf.write(ref, f"{arc_prefix}{ref.name}")
+                    zf.write(ref, f"{out_base}.bin")
+                bin_names.append(f"{out_base}.bin")
+            if multi:
+                zf.writestr('MULTIDISC.LST', '\r\n'.join(bin_names) + '\r\n')
         return zip_path
 
     try:
