@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import re
+import struct
 import time
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -477,6 +478,41 @@ def _store_ps1_single_card(
         "size": len(raw_card),
         "sha256": hashlib.sha256(raw_card).hexdigest(),
     }
+
+
+@router.get("/saves/{title_id}/ps1-save")
+async def download_ps1_save(title_id: str):
+    """Return one PS1 save's raw data for restoring to a physical PS1 card.
+
+    Payload: u32 name_len (LE) + name + raw save bytes.  The name is the PS1
+    save's on-card filename (needed to recreate the directory entry)."""
+    title_id = _validate_title_id(title_id)
+    resolved = _resolve_ps1_title_alias(title_id)
+    meta = storage.get_metadata(resolved)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="No save found for this title")
+
+    files = storage.load_save_files(resolved)
+    raw = get_slot_raw_from_files(files or [], 0)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="No PS1 card stored for this title")
+
+    saves = ps1mc.parse_card(raw)
+    if not saves:
+        raise HTTPException(status_code=404, detail="No save in stored PS1 card")
+
+    name, data = saves[0]
+    nb = name.encode("ascii", "replace")
+    payload = struct.pack("<I", len(nb)) + nb + data
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "X-Save-Name": name,
+            "X-Save-Size": str(len(data)),
+            "X-Save-Hash": hashlib.sha256(data).hexdigest(),
+        },
+    )
 
 
 @router.post("/saves/{title_id}/ps1-save")
