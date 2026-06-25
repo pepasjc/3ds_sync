@@ -74,6 +74,24 @@ class Settings(BaseSettings):
     # output_dir, which works for self-contained converters but breaks
     # pop-fe.
     rom_ps1_eboot_cwd: str = ""
+    # Optional command template for converting a PS1 disc image into a
+    # POPStarter .VCD so OPL (Open PS2 Loader) on a PS2 can play PS1 games
+    # via the built-in POPS emulator.  POPStarter expects one .VCD per
+    # disc (no multi-disc merge), so the template is invoked once per disc
+    # with the single-disc placeholder set:
+    #   {input}      — path to this disc's image (.chd / .cue / .bin / .iso)
+    #   {output}     — path the converter should write the .VCD to
+    #   {output_dir} — fresh per-request scratch dir (must contain the .VCD
+    #                  somewhere underneath when the command finishes)
+    #   {stem}       — disc filename without extension
+    #   {title}      — human-readable game name (catalog ``name``)
+    #   {gamecode}   — PS1 product code (e.g. "SCUS94503", 9 chars no dash)
+    # Example using krHACKen's popstation-based VCD tool:
+    #   ["popstation","-p","-c","{output_dir}","{input}"]
+    # Stay empty until the operator configures the toolchain — until then
+    # the server returns 503 with a hint pointing at SYNC_ROM_PS1_VCD_COMMAND.
+    rom_ps1_vcd_command: str = ""
+    rom_ps1_vcd_cwd: str = ""
     api_key: str = "anything"
     host: str = "0.0.0.0"
     port: int = 8000

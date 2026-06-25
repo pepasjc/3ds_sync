@@ -332,6 +332,20 @@ _PS1_EBOOT_SPEC = {
     'mime': 'application/octet-stream',
 }
 
+# PS1 → POPStarter .VCD conversion (for OPL / Open PS2 Loader on PS2).
+# Mirrors the EBOOT spec so it shares the templated-command + cache code
+# path.  Output is a single raw .VCD served straight to the client, which
+# renames it to the OPL disc-serial convention (``SLUS_012.34.VCD``) and
+# drops it into the POPS folder.  Unlike EBOOT there is no multi-disc
+# merge — POPStarter keeps one .VCD per disc.
+_PS1_VCD_SPEC = {
+    'setting': 'rom_ps1_vcd_command',
+    'env': 'SYNC_ROM_PS1_VCD_COMMAND',
+    'label': 'POPStarter VCD',
+    'output_ext': '.vcd',
+    'mime': 'application/octet-stream',
+}
+
 # All systems that support any CHD extraction
 _CD_SYSTEMS   = _CUE_SYSTEMS | _GDI_SYSTEMS
 _ALL_EXTRACT  = _CD_SYSTEMS | _PSP_SYSTEMS
@@ -926,6 +940,11 @@ async def download_rom(
             # so the handler can look up sibling discs (multi-disc
             # games) by shared ``title_id``.
             return await _extract_ps1_eboot(file_path, sys_up, entry)
+        elif fmt == 'vcd' and sys_up in _PS1_EBOOT_SYSTEMS:
+            # PS1 → POPStarter .VCD for OPL on PS2.  Single-disc only
+            # (one VCD per disc); checked before the generic CUE/BIN
+            # branch for the same reason as EBOOT.
+            return await _extract_ps1_vcd(file_path, sys_up, entry)
         elif fmt == 'psio' and sys_up in _PS1_EBOOT_SYSTEMS:
             return await _extract_ps1_psio(sys_up, entry)
         elif fmt == 'rvz' or (fmt == 'iso' and file_path.suffix.lower() == '.rvz'):
@@ -1596,6 +1615,131 @@ async def _extract_ps1_eboot(source_path: Path, system: str, entry) -> Response:
         return Response(status_code=504, content="Conversion timed out (>1 hour)")
 
     cached_path = _save_to_cache_by_key(final_path, 'ps1_eboot', cache_key, spec['output_ext'])
+    return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
+
+
+async def _extract_ps1_vcd(source_path: Path, system: str, entry) -> Response:
+    """Convert a single PS1 disc image to a POPStarter .VCD for OPL on PS2.
+
+    OPL's POPStarter launcher plays PS1 games on PS2 hardware via the
+    internal POPS emulator, reading one ``.VCD`` per disc from the USB
+    ``POPS`` folder.  Unlike PSP EBOOTs there is no multi-disc merge —
+    each disc produces its own VCD, so this handler converts just the
+    requested ``source_path`` (the desktop client renames it to the OPL
+    ``SLUS_012.34.VCD`` convention and routes it to ``POPS/``).
+
+    Output is the raw .VCD — no zip wrapper — so the client can stream it
+    straight to the target path.  Until the operator wires up
+    ``SYNC_ROM_PS1_VCD_COMMAND`` the route returns 503 with a setup hint.
+    """
+    if system not in _PS1_EBOOT_SYSTEMS:
+        return Response(
+            status_code=400,
+            content=(
+                "VCD extraction is only supported for PS1 ROMs "
+                f"(got {system})"
+            ),
+        )
+
+    spec = _PS1_VCD_SPEC
+    rom_dir = settings.rom_dir
+    if rom_dir is None:
+        return Response(status_code=503, content="ROM directory not configured")
+    if not source_path.is_file():
+        return Response(status_code=404, content="Disc file not found on disk")
+
+    # Single-disc cache key (one VCD per disc).
+    cache_key = _conversion_cache_key_multi([source_path], 'vcd')
+    cached = _lookup_cached_by_key('ps1_vcd', cache_key, spec['output_ext'])
+    if cached is not None:
+        return _stream_file_response(cached, spec['mime'])
+
+    command_template = getattr(settings, spec['setting'])
+    if not command_template:
+        return Response(
+            status_code=503,
+            content=(
+                f"PS1 → {spec['label']} conversion is not configured on the server.\n"
+                f"\n"
+                f"OPL (Open PS2 Loader) plays PS1 games via POPStarter, which reads\n"
+                f"one .VCD per disc from the USB POPS folder.  Set {spec['env']} to a\n"
+                f"command template that reads {{input}} and writes a .VCD under\n"
+                f"{{output_dir}}.\n"
+                f"\n"
+                f"Available placeholders:\n"
+                f"  {{input}}      — this disc's image path (.chd / .cue / .bin / .iso)\n"
+                f"  {{output}}     — suggested output path (the converter may ignore it)\n"
+                f"  {{output_dir}} — fresh scratch dir; converter must put the .VCD under it\n"
+                f"  {{stem}}       — disc filename without extension\n"
+                f"  {{title}}      — game name (catalog ``name``, falls back to filename)\n"
+                f"  {{gamecode}}   — PS1 product code (catalog ``title_id``, e.g. SCUS94503)\n"
+                f"\n"
+                f"Example (krHACKen popstation-based VCD tool):\n"
+                f"  SYNC_ROM_PS1_VCD_COMMAND="
+                f"[\"popstation\",\"-p\",\"-c\",\"{{output_dir}}\",\"{{input}}\"]\n"
+            ),
+        )
+
+    cwd = settings.rom_ps1_vcd_cwd or None
+    tmpdir = tempfile.mkdtemp(prefix='ps1_vcd_', dir=_conversion_tmp_dir())
+
+    title = entry.name or _ps1_clean_title(source_path.name)
+    gamecode = (
+        _ps1_normalize_gamecode(entry.title_id)
+        or _ps1_normalize_gamecode(_extract_ps1_serial_from_filename(source_path.name))
+        or 'SLUS00000'
+    )
+
+    def _run() -> Path:
+        tmp = Path(tmpdir)
+        stage = tmp / 'stage'
+        stage.mkdir()
+
+        cmd = _expand_command_template(
+            command_template,
+            input=str(source_path),
+            output=str(stage / 'game.vcd'),
+            output_dir=str(stage),
+            stem=source_path.stem,
+            title=title,
+            gamecode=gamecode,
+            inputs=[str(source_path)],
+        )
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            cwd=cwd or str(tmp),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or 'PS1 → VCD conversion failed'
+            )
+
+        candidates = _find_outputs(stage, {spec['output_ext']})
+        if not candidates:
+            raise RuntimeError(
+                "converter completed but did not produce a "
+                f"{spec['output_ext']} file"
+                + (('\n' + result.stdout[-2000:]) if result.stdout else '')
+            )
+        # Prefer a single output; otherwise take the largest match.
+        candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+        return candidates[0]
+
+    try:
+        final_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>1 hour)")
+
+    cached_path = _save_to_cache_by_key(final_path, 'ps1_vcd', cache_key, spec['output_ext'])
     return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
 
 
@@ -2290,15 +2434,16 @@ def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
         if sys_up in _PS1_EBOOT_SYSTEMS:
             # PS1 CHD: PS3 client wants CUE/BIN, PSP client wants
             # EBOOT.PBP, and PSIO wants BIN/CU2. Advertise all so each client picks its
-            # native format from extract_formats[].
-            return 'cue', ['cue', 'eboot', 'psio']
+            # native format from extract_formats[].  OPL (PS2) wants a
+            # POPStarter VCD, so 'vcd' rides along here too.
+            return 'cue', ['cue', 'eboot', 'psio', 'vcd']
         if sys_up in _CUE_SYSTEMS:
             return 'cue', ['cue']
     elif sys_up in _PS1_EBOOT_SYSTEMS and suffix in {'.cue', '.bin', '.iso', '.img'}:
         # PS1 native disc images (no CHD) — no extract needed for the
         # PS3 client (raw CUE/BIN is fine), but the PSP client needs
-        # an EBOOT, so advertise that as the only option.
-        formats = ['eboot']
+        # an EBOOT and OPL/POPStarter needs a VCD, so advertise both.
+        formats = ['eboot', 'vcd']
         if suffix == '.cue':
             formats.append('psio')
         return None, formats
