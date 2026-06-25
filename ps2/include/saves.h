@@ -30,6 +30,8 @@
 typedef struct {
     char     path[SAVE_DIR_LEN];
     char     filename[128];
+    char     serial[GAME_ID_LEN];   /* derived from filename ("" if none) */
+    char     name[64];              /* game title (filled from server list) */
     uint64_t size;
     bool     has_ecc;          /* PS2 .ps2 (528-byte page) image */
     bool     is_ps1;           /* PS1 card image (128 KB / .vmp) */
@@ -76,6 +78,10 @@ int  saves_upload_mc_game(const SyncState *state, int port, const McGame *game,
 int  saves_upload_ps1_save(const SyncState *state, int port, const McGame *game,
                            char *msg, size_t msg_size);
 
+/* Restore one PS1 save from the server back onto a physical PS1 card. */
+int  saves_restore_ps1_save(const SyncState *state, int port, const char *serial,
+                            char *msg, size_t msg_size);
+
 /* Restore one game (by serial) from the server back onto the memory card.
  * Returns number of files written, or negative on error. */
 int  saves_restore_mc_game(const SyncState *state, int port, const char *serial,
@@ -112,7 +118,17 @@ int  saves_download_server_to_vmc(const SyncState *state, const ServerSave *save
 
 /* Broadcast a GameID over the MMCE protocol so a MemCard Pro 2 / SD2PSX
  * switches to that game's VMC channel. Returns 0 if a device responded. */
-int  saves_mcp_set_gameid(const char *serial, char *msg, size_t msg_size);
+/* Detect what is in a memory-card slot: 0=empty, 1=card (gen1/plain), 2=MMCE
+ * (MemCard Pro 2 / SD2PSX).  Safe: only MMCE-probes when a card is present. */
+int  saves_mcp_detect(int port);
+
+/* MCP GameID mode for saves_mcp_set_gameid. */
+#define SAVES_MCP_AUTO 1
+#define SAVES_MCP_GEN1 2
+#define SAVES_MCP_GEN2 3
+
+int  saves_mcp_set_gameid(const char *serial, int port, int mode,
+                          char *msg, size_t msg_size);
 
 /* Enumerate candidate 8 MB card images under the storage root (VMC/ + root). */
 void saves_scan_local(SaveVmcList *out);

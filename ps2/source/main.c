@@ -366,6 +366,7 @@ static int           g_mcard2_selected = 0, g_mcard2_scroll = 0;
 static ServerSaveList g_server;
 static int           g_server_selected = 0, g_server_scroll = 0;
 static int           g_server_source = 0;   /* 0=VMC, 1=Slot1, 2=Slot2 */
+static int           g_mmce_mode = 1;  /* GameID: 0=off, 1=auto, 2=gen1, 3=gen2 */
 static bool          g_hdd_format_confirm = false;
 
 static char          g_scratch[256 * 1024];      /* JSON page buffer */
@@ -654,6 +655,8 @@ static void scan_local(void) {
     redraw();
 }
 
+static void fill_vmc_names(SaveVmcList *list);   /* forward decl */
+
 static void scan_saves(void) {
     if (!g_state.usb_ready) {
         snprintf(g_saves.last_error, sizeof(g_saves.last_error),
@@ -664,6 +667,7 @@ static void scan_saves(void) {
     ui_status("Scanning card images...");
     redraw();
     saves_scan_local(&g_saves);
+    fill_vmc_names(&g_saves);
     if (g_saves.count > 0) {
         ui_status("Saves: %d card image(s)", g_saves.count);
     }
@@ -706,6 +710,21 @@ static void pull_all_saves(void) {
 static void fill_mc_names(McGameList *list) {
     for (int i = 0; i < list->count; i++) {
         list->items[i].name[0] = '\0';
+        for (int j = 0; j < g_server.count; j++) {
+            if (strcmp(g_server.items[j].serial, list->items[i].serial) == 0) {
+                strncpy(list->items[i].name, g_server.items[j].name,
+                        sizeof(list->items[i].name) - 1);
+                break;
+            }
+        }
+    }
+}
+
+/* Fill each VMC file's display name from the fetched server save list. */
+static void fill_vmc_names(SaveVmcList *list) {
+    for (int i = 0; i < list->count; i++) {
+        list->items[i].name[0] = '\0';
+        if (list->items[i].serial[0] == '\0') continue;
         for (int j = 0; j < g_server.count; j++) {
             if (strcmp(g_server.items[j].serial, list->items[i].serial) == 0) {
                 strncpy(list->items[i].name, g_server.items[j].name,
@@ -759,19 +778,23 @@ static void restore_mc_game_at(McGameList *list, int sel) {
 
     const McGame *g = &list->items[sel];
     if (g->serial[0] == '\0') { ui_error("No serial for %s", g->dir); return; }
-    if (list->is_ps1) { ui_error("PS1 restore-to-card unsupported; use VMC"); return; }
     int port = list->port;
-    if (!confirm("Restore %s from server\nto Slot%d card?\nOverwrites card files.",
+    if (!confirm("Restore %s to Slot%d?\nWrites only this game's save\n(overwrites it if present).",
                  g->serial, port + 1))
         return;
     ui_status("Restoring %s...", g->serial);
     redraw();
 
     char msg[128];
-    int rc = saves_restore_mc_game(&g_state, port, g->serial, msg, sizeof(msg));
+    int rc = list->is_ps1
+        ? saves_restore_ps1_save(&g_state, port, g->serial, msg, sizeof(msg))
+        : saves_restore_mc_game(&g_state, port, g->serial, msg, sizeof(msg));
+    /* Rescan silently, then show the restore result LAST. */
+    saves_scan_mcard(port, list);
+    fill_mc_names(list);
     if (rc < 0) ui_error("%s", msg);
     else        ui_status("%s", msg);
-    scan_mcard_list(port, list);
+    redraw();
 }
 
 static void mark_server_local(void) {
@@ -793,6 +816,7 @@ static void fetch_server_saves(void) {
     mark_server_local();
     fill_mc_names(&g_mcard);
     fill_mc_names(&g_mcard2);
+    fill_vmc_names(&g_saves);
     if (g_server.count > 0) ui_status("Server: %d save(s)", g_server.count);
     else if (g_server.last_error[0]) ui_error("%s", g_server.last_error);
     redraw();
@@ -830,17 +854,21 @@ static void server_download_to_source(void) {
         return;
     }
 
-    if (s->is_ps1) { ui_error("PS1 restore-to-card unsupported; use VMC source"); return; }
-    if (!confirm("Restore %s from server\nto %s card?\nOverwrites card files.",
+    if (!confirm("Restore %s to %s?\nWrites only this game's save\n(overwrites it if present).",
                  s->serial, source_name()))
         return;
     ui_status("Restoring %s to %s...", s->serial, source_name());
     redraw();
     char msg[128];
-    int rc = saves_restore_mc_game(&g_state, port, s->serial, msg, sizeof(msg));
-    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
-    scan_mcard_list(port, source_list());
+    int rc = s->is_ps1
+        ? saves_restore_ps1_save(&g_state, port, s->serial, msg, sizeof(msg))
+        : saves_restore_mc_game(&g_state, port, s->serial, msg, sizeof(msg));
+    /* Rescan first (it sets its own status), then show the restore result LAST
+     * so it isn't clobbered by the scan line. */
+    saves_scan_mcard(port, source_list());
+    fill_mc_names(source_list());
     mark_server_local();
+    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
     redraw();
 }
 
@@ -922,21 +950,21 @@ static void cycle_server_source(void) {
     redraw();
 }
 
-static void mcp_switch_gameid(const char *serial) {
+static void mcp_switch_gameid(const char *serial, int port) {
+    if (g_mmce_mode == 0) {
+        ui_error("GameID off - set mode in Config ([])");
+        redraw();
+        return;
+    }
     if (!serial || !serial[0]) { ui_error("No serial to switch to"); return; }
     char msg[128];
-    int rc = saves_mcp_set_gameid(serial, msg, sizeof(msg));
+    int rc = saves_mcp_set_gameid(serial, port, g_mmce_mode, msg, sizeof(msg));
     if (rc < 0) { ui_error("%s", msg); redraw(); return; }
 
-    ui_status("%s", msg);
-    redraw();
-
-    /* Give the MemCard Pro a moment to mount the new channel, then refresh
-     * the slot views so they reflect the now-mounted VMC. */
-    DelayThread(400000);
-    saves_scan_mcard(0, &g_mcard);
-    saves_scan_mcard(1, &g_mcard2);
-    mark_server_local();
+    /* Do NOT auto-rescan here: right after a channel switch the MemCard Pro is
+     * still mounting the new VMC, and probing it mid-mount intermittently hangs
+     * libmc (gen1 freeze).  Tell the user to rescan ([]) once it has switched. */
+    ui_status("%s - press [] to rescan", msg);
     redraw();
 }
 
@@ -1257,7 +1285,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_TRIANGLE) restore_mc_game_at(&g_mcard, g_mcard_selected);
             else if (pressed & PAD_R1) {
                 if (g_mcard.count > 0 && g_mcard_selected < g_mcard.count)
-                    mcp_switch_gameid(g_mcard.items[g_mcard_selected].serial);
+                    mcp_switch_gameid(g_mcard.items[g_mcard_selected].serial, 0);
             }
             clamp_scroll(&g_mcard_selected, &g_mcard_scroll, g_mcard.count);
         } else if (g_view == APP_VIEW_MCARD2) {
@@ -1270,7 +1298,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_TRIANGLE) restore_mc_game_at(&g_mcard2, g_mcard2_selected);
             else if (pressed & PAD_R1) {
                 if (g_mcard2.count > 0 && g_mcard2_selected < g_mcard2.count)
-                    mcp_switch_gameid(g_mcard2.items[g_mcard2_selected].serial);
+                    mcp_switch_gameid(g_mcard2.items[g_mcard2_selected].serial, 1);
             }
             clamp_scroll(&g_mcard2_selected, &g_mcard2_scroll, g_mcard2.count);
         } else if (g_view == APP_VIEW_SERVER) {
@@ -1285,7 +1313,8 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_L1)       server_sync_all();
             else if (pressed & PAD_R1) {
                 if (g_server.count > 0 && g_server_selected < g_server.count)
-                    mcp_switch_gameid(g_server.items[g_server_selected].serial);
+                    mcp_switch_gameid(g_server.items[g_server_selected].serial,
+                                      source_port() < 0 ? 0 : source_port());
             }
             clamp_scroll(&g_server_selected, &g_server_scroll, g_server.count);
         } else if (g_view == APP_VIEW_CONFIG) {
@@ -1293,6 +1322,11 @@ int main(int argc, char *argv[]) {
                 cycle_storage_pref(-1);
             } else if (pressed & PAD_RIGHT) {
                 cycle_storage_pref(1);
+            } else if (pressed & PAD_SQUARE) {
+                g_mmce_mode = (g_mmce_mode + 1) % 4;   /* off/auto/gen1/gen2 */
+                ui_set_mmce(g_mmce_mode);
+                static const char *mn[] = {"off", "auto", "gen1", "gen2"};
+                ui_status("GameID mode: %s", mn[g_mmce_mode]);
             } else if (pressed & PAD_TRIANGLE) {
                 if (!g_hdd_format_confirm) {
                     g_hdd_format_confirm = true;

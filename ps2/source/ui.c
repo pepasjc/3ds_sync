@@ -63,9 +63,14 @@ static const u32 C_SEP         = RGB(0x60, 0x80, 0xa0);
 static char g_status[256];
 static AppView g_view_for_hints = APP_VIEW_ROMS;
 static char g_server_source_label[8] = "VMC";
+static int  g_mmce_mode_disp = 1;   /* 0 off, 1 auto, 2 gen1, 3 gen2 */
 
 void ui_set_server_source(const char *src) {
     snprintf(g_server_source_label, sizeof(g_server_source_label), "%s", src);
+}
+
+void ui_set_mmce(int mode) {
+    g_mmce_mode_disp = mode;
 }
 
 /* ---- Pixel-precise putchar helpers ---- */
@@ -395,11 +400,13 @@ void ui_draw_saves(const SaveVmcList *list, int selected, int scroll) {
 
         const char *tag = v->is_ps1 ? "ps1" : (v->has_ecc ? "ps2" : "mc2");
         unsigned kb = (unsigned)(v->size / 1024ULL);
-        /* prefix(1) + name(66) + sp + "["(1)+tag(3)+"]"(1) + sp + size = 80 */
+        const char *label = v->name[0] ? v->name : v->filename;
+        /* prefix(1) + serial(10) + sp + title/file(53) + sp + tag(5) + sp + size = 80 */
         put_printf(0, row, fg, bg, COLS,
-                   "%s%-66.66s [%-3s] %5u KB",
+                   "%s%-10.10s %-53.53s [%-3s] %5u KB",
                    is_sel ? ">" : " ",
-                   v->filename, tag, kb);
+                   v->serial[0] ? v->serial : "-",
+                   label, tag, kb);
     }
 }
 
@@ -586,10 +593,16 @@ void ui_draw_config(const SyncState *state) {
              state->storage_backend == STORAGE_BACKEND_HDLOADER
                  ? HDL_DOWNLOADS_FILE
                  : roms_downloads_file());
+    {
+        static const char *mn[] = {"off", "auto", "gen1", "gen2"};
+        int m = (g_mmce_mode_disp >= 0 && g_mmce_mode_disp < 4) ? g_mmce_mode_disp : 1;
+        cfg_line(&row, C_TEXT,
+                 "gameid_mode= %s  (SQUARE cycles: off/auto/gen1/gen2)", mn[m]);
+    }
     cfg_line(&row, C_TEXT, "hdd_format = TRIANGLE twice (PS2 APA, wipes disk)");
     row++;
     cfg_line(&row, C_TEXT_DIM,
-             "Use Left/Right for storage, or edit %s with uLaunchELF.",
+             "Left/Right=storage  []=MMCE on/off  or edit %s in uLaunchELF.",
              CONFIG_PATH);
 }
 

@@ -176,3 +176,6 @@ server/third_party/mcr2vmp/mcr2vmp.exe
 .env
 .env.backup
 server/restic-backup.log
+ps2/_mmce_src/
+ps2/source/irx_mods.c
+ps2/include/irx_mods.h

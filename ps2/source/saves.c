@@ -36,9 +36,11 @@
 #define IOP_O_CREAT  0x0200
 #define IOP_O_TRUNC  0x0400
 
-/* MMCE devctl command (mmceman): set GameID so a MemCard Pro 2 / SD2PSX
- * switches to that game's VMC channel.  Value from mmceman mmce_cmds.h. */
-#define MMCE_CMD_SET_GAMEID 0x8
+/* MMCE devctl commands (mmceman mmce_cmds.h). GET_CARD is a cheap query used
+ * to detect whether an MMCE device (MemCard Pro 2 / SD2PSX) is in the slot. */
+#define MMCE_CMD_GET_CARD          0x3
+#define MMCE_CMD_SET_GAMEID        0x8
+#define MMCE_CMD_SET_GAMEID_LEGACY 0x20   /* gen1 MemCard Pro (0x21 protocol) */
 
 /* Aligned bounce buffer for memory-card DMA reads/writes. */
 static unsigned char g_mc_chunk[32768] __attribute__((aligned(64)));
@@ -54,6 +56,8 @@ static uint32_t get_u32(const uint8_t *p) {
 }
 
 /* ---- local card-image enumeration ---- */
+
+static bool mc_serial_from_dir(const char *name, char *out, size_t out_size);
 
 static bool is_vmc_size(uint64_t size, bool *has_ecc, bool *is_ps1) {
     if (has_ecc) *has_ecc = false;
@@ -91,6 +95,8 @@ static int scan_dir(const char *dir_path, SaveVmcList *out) {
         memset(e, 0, sizeof(*e));
         strncpy(e->path, full, sizeof(e->path) - 1);
         strncpy(e->filename, de->d_name, sizeof(e->filename) - 1);
+        if (!mc_serial_from_dir(de->d_name, e->serial, sizeof(e->serial)))
+            e->serial[0] = '\0';
         e->size = (uint64_t)st.st_size;
         e->has_ecc = has_ecc;
         e->is_ps1 = is_ps1;
@@ -218,14 +224,34 @@ static unsigned short mc_dir_attr(int port, const char *dir) {
 }
 
 /* Probe a card slot. Returns the card type (sceMcTypeNoCard==0 when empty),
- * negative on RPC failure; *formatted set when the card is formatted. */
+ * negative on RPC failure; *formatted set when the card is formatted.
+ *
+ * mcman returns sceMcResChangedCard (-1) on the first probe after a card is
+ * (re)inserted, often with type still 0 — so retry once to get a stable type. */
 static int mc_probe(int port, bool *formatted) {
-    int type = 0, free_clusters = 0, fmt = 0;
-    if (mcGetInfo(port, MC_SLOT, &type, &free_clusters, &fmt) < 0) return -100;
-    int res = mc_wait();          /* 0 ok, -1 card changed, -2 unformatted */
-    if (formatted) *formatted = (fmt != 0);
-    if (res == -2 && formatted) *formatted = false;
-    return type;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int type = 0, free_clusters = 0, fmt = 0;
+        if (mcGetInfo(port, MC_SLOT, &type, &free_clusters, &fmt) < 0) return -100;
+        int res = mc_wait();      /* 0 ok, -1 card changed, -2 unformatted */
+        if (formatted) *formatted = (fmt != 0);
+        if (res == -2 && formatted) *formatted = false;
+        if (res == -1 && type == 0) continue;   /* changed-card; re-probe */
+        return type;
+    }
+    return 0;
+}
+
+/* Free space in the card slot, in mcman "clusters" (PS2: 1 KB each).
+ * Returns -1 on probe failure. */
+static int mc_free_clusters(int port) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int type = 0, free_clusters = 0, fmt = 0;
+        if (mcGetInfo(port, MC_SLOT, &type, &free_clusters, &fmt) < 0) return -1;
+        int res = mc_wait();
+        if (res == -1 && type == 0) continue;   /* changed-card; re-probe */
+        return free_clusters;
+    }
+    return -1;
 }
 
 static void mc_dir_stats(int port, const char *dir, int *file_count, uint32_t *total) {
@@ -569,6 +595,98 @@ int saves_upload_ps1_save(const SyncState *state, int port, const McGame *game,
     return 0;
 }
 
+int saves_restore_ps1_save(const SyncState *state, int port, const char *serial,
+                           char *msg, size_t msg_size) {
+    uint8_t *buf = (uint8_t *)malloc(SAVES_P2FD_MAX);
+    if (!buf) { snprintf(msg, msg_size, "Out of memory"); return -1; }
+
+    char rpath[160];
+    snprintf(rpath, sizeof(rpath), "/api/v1/saves/%s/ps1-save", serial);
+    HttpRequest req;
+    memset(&req, 0, sizeof(req));
+    req.server_url = state->server_url;
+    req.api_key    = state->api_key;
+    req.path       = rpath;
+    req.method     = "GET";
+
+    int status = 0;
+    int n = http_get_buf(&req, buf, SAVES_P2FD_MAX, &status);
+    if (n < 0 || status != 200) {
+        free(buf);
+        snprintf(msg, msg_size, "Fetch failed (rc=%d http=%d)", n, status);
+        return -1;
+    }
+    /* Payload: u32 name_len | name | raw save data */
+    if (n < 4) { free(buf); snprintf(msg, msg_size, "Bad PS1 payload"); return -1; }
+    uint32_t namelen = get_u32(buf);
+    if (namelen == 0 || namelen >= 36 || (uint32_t)n < 4 + namelen) {
+        free(buf);
+        snprintf(msg, msg_size, "Corrupt PS1 payload");
+        return -1;
+    }
+    char name[36];
+    memcpy(name, buf + 4, namelen);
+    name[namelen] = '\0';
+    uint8_t *data = buf + 4 + namelen;
+    uint32_t datalen = (uint32_t)n - 4 - namelen;
+
+    char fp[64];
+    snprintf(fp, sizeof(fp), "/%s", name);
+
+    /* Free-space check when the save isn't already present (PS1 block = 8 KB;
+     * mcman reports free in 1 KB clusters). */
+    if (mc_entry_attr(port, name) == 0) {
+        uint32_t need_kb = (datalen + 1023) / 1024;
+        int freec = mc_free_clusters(port);
+        if (freec >= 0 && (uint32_t)freec < need_kb) {
+            free(buf);
+            snprintf(msg, msg_size,
+                     "Not enough space: need %u KB, free %d KB. Free space first.",
+                     need_kb, freec);
+            return -1;
+        }
+    }
+
+    mcDelete(port, MC_SLOT, fp);
+    mc_wait();
+    if (mcOpen(port, MC_SLOT, fp, IOP_O_WRONLY | IOP_O_CREAT | IOP_O_TRUNC) < 0) {
+        free(buf);
+        snprintf(msg, msg_size, "PS1 create failed %s", name);
+        return -1;
+    }
+    int fd = mc_wait();
+    if (fd < 0) {
+        free(buf);
+        snprintf(msg, msg_size, "PS1 open failed %s rc=%d", name, fd);
+        return -1;
+    }
+
+    bool ok = true;
+    uint32_t rem = datalen;
+    size_t src = 0;
+    while (rem > 0) {
+        int take = rem > sizeof(g_mc_chunk) ? (int)sizeof(g_mc_chunk) : (int)rem;
+        memcpy(g_mc_chunk, data + src, take);
+        if (mcWrite(fd, g_mc_chunk, take) < 0) { ok = false; break; }
+        int w = mc_wait();
+        if (w < 0) { ok = false; break; }
+        src += w;
+        rem -= w;
+    }
+    mcFlush(fd);
+    mc_wait();
+    mcClose(fd);
+    mc_wait();
+    free(buf);
+
+    if (!ok) {
+        snprintf(msg, msg_size, "PS1 write failed %s", name);
+        return -1;
+    }
+    snprintf(msg, msg_size, "Restored PS1 %s", serial);
+    return 0;
+}
+
 int saves_restore_mc_game(const SyncState *state, int port, const char *serial,
                           char *msg, size_t msg_size) {
     uint8_t *buf = (uint8_t *)malloc(SAVES_P2FD_MAX);
@@ -615,6 +733,31 @@ int saves_restore_mc_game(const SyncState *state, int port, const char *serial,
     }
     memcpy(dir, buf + pos, dirlen); dir[dirlen] = '\0'; pos += dirlen;
     uint32_t fcount = get_u32(buf + pos); pos += 4;
+
+    /* Free-space check: only when the game isn't already on the card (an
+     * overwrite reuses its existing clusters).  Pre-scan the file table to sum
+     * the clusters this save needs (1 KB clusters + 1 for the directory). */
+    bool exists = mc_dir_attr(port, dir) != 0;
+    if (!exists) {
+        size_t scan = pos;
+        uint32_t need = 1;                  /* directory */
+        bool scan_ok = true;
+        for (uint32_t f = 0; f < fcount; f++) {
+            if (scan + 4 > (size_t)n) { scan_ok = false; break; }
+            uint32_t snl = get_u32(buf + scan); scan += 4 + snl;
+            if (scan + 4 > (size_t)n) { scan_ok = false; break; }
+            uint32_t sdl = get_u32(buf + scan); scan += 4 + sdl;
+            need += (sdl + 1023) / 1024;
+        }
+        int freec = mc_free_clusters(port);
+        if (scan_ok && freec >= 0 && (uint32_t)freec < need) {
+            free(buf);
+            snprintf(msg, msg_size,
+                     "Not enough space: need %u KB, free %d KB. Free space first.",
+                     need, freec);
+            return -1;
+        }
+    }
 
     char dpath[40];
     snprintf(dpath, sizeof(dpath), "/%s", dir);
@@ -970,21 +1113,85 @@ static void format_gameid(const char *serial, char *out, size_t out_size) {
     }
 }
 
-int saves_mcp_set_gameid(const char *serial, char *msg, size_t msg_size) {
+/* Detect an MMCE device (MCP2 / SD2PSX) in a slot without stalling SIO2:
+ * verify a card is physically present via libmc first (empty-slot MMCE probes
+ * are what hang the bus), then issue a cheap MMCE query.
+ *   0 = empty slot, 1 = card present but not MMCE (gen1/plain), 2 = MMCE. */
+int saves_mcp_detect(int port) {
+    port = port == 1 ? 1 : 0;
+    bool fmt = false;
+    int type = mc_probe(port, &fmt);
+    if (type <= 0) return 0;                 /* no card / probe failed */
+
+    char dev[8];
+    snprintf(dev, sizeof(dev), "mmce%d:", port);
+    if (fileXioDevctl(dev, MMCE_CMD_GET_CARD, NULL, 0, NULL, 0) >= 0)
+        return 2;                            /* MMCE device responded */
+    return 1;                                /* present, but not MMCE */
+}
+
+/* mode: SAVES_MCP_AUTO routes by card TYPE from mcGetInfo (PS1-type -> gen1
+ * 0x21, PS2-type -> MMCE 0x8B) — never tries both, since 0x8B breaks a gen1 and
+ * 0x21 breaks an MCP2; SAVES_MCP_GEN1 0x21 only; SAVES_MCP_GEN2 0x8B only.  All
+ * paths present-check first so an empty slot is never driven. */
+int saves_mcp_set_gameid(const char *serial, int port, int mode,
+                         char *msg, size_t msg_size) {
+    port = port == 1 ? 1 : 0;
+
     char gid[32];
     format_gameid(serial, gid, sizeof(gid));
-    int len = (int)strlen(gid) + 1;        /* mmceman expects the NUL too */
+    int len = (int)strlen(gid) + 1;        /* include the NUL terminator */
 
-    /* An MMCE device may be in either slot; try both. */
-    static const char *devs[] = { "mmce0:", "mmce1:" };
-    for (int i = 0; i < 2; i++) {
-        int rc = fileXioDevctl((char *)devs[i], MMCE_CMD_SET_GAMEID,
-                               gid, len, NULL, 0);
-        if (rc >= 0) {
-            snprintf(msg, msg_size, "MemCard Pro switched to %s (%s)", gid, devs[i]);
+    char dev[8];
+    snprintf(dev, sizeof(dev), "mmce%d:", port);
+
+    if (mode == SAVES_MCP_AUTO) {
+        /* Route by the mounted card TYPE (libmc mcGetInfo, no SIO command, so
+         * it can't corrupt the device).  0x8B breaks a gen1 and 0x21 breaks an
+         * MCP2, so we must NOT try both.  A gen1 runs in PS1 mode (PS1-type
+         * card) and an MCP2 in PS2 mode (PS2-type card), so:
+         *   PS1-type -> gen1 0x21 only;  PS2-type -> MMCE 0x8B only. */
+        bool fmt = false;
+        int type = mc_probe(port, &fmt);
+        if (type <= 0) {
+            snprintf(msg, msg_size, "No card in slot %d", port + 1);
+            return -1;
+        }
+        if (type == MC_TYPE_PSX) {
+            if (fileXioDevctl(dev, MMCE_CMD_SET_GAMEID_LEGACY, gid, len, NULL, 0) >= 0) {
+                snprintf(msg, msg_size, "gen1 MemCard Pro switched to %s", gid);
+                return 0;
+            }
+            snprintf(msg, msg_size, "No gen1 response in slot %d (PS1 card)", port + 1);
+            return -1;
+        }
+        if (fileXioDevctl(dev, MMCE_CMD_SET_GAMEID, gid, len, NULL, 0) >= 0) {
+            snprintf(msg, msg_size, "MCP2/SD2PSX switched to %s", gid);
             return 0;
         }
+        snprintf(msg, msg_size, "No MMCE device in slot %d (PS2 card)", port + 1);
+        return -1;
     }
-    snprintf(msg, msg_size, "No MemCard Pro / SD2PSX responded");
+
+    /* Forced modes: present-check (libmc, safe) then the one command. */
+    bool fmt = false;
+    if (mc_probe(port, &fmt) <= 0) {
+        snprintf(msg, msg_size, "No card in slot %d", port + 1);
+        return -1;
+    }
+    if (mode == SAVES_MCP_GEN1) {
+        if (fileXioDevctl(dev, MMCE_CMD_SET_GAMEID_LEGACY, gid, len, NULL, 0) >= 0) {
+            snprintf(msg, msg_size, "gen1 MemCard Pro switched to %s", gid);
+            return 0;
+        }
+        snprintf(msg, msg_size, "No gen1 response in slot %d", port + 1);
+        return -1;
+    }
+    /* SAVES_MCP_GEN2 */
+    if (fileXioDevctl(dev, MMCE_CMD_SET_GAMEID, gid, len, NULL, 0) >= 0) {
+        snprintf(msg, msg_size, "MCP2/SD2PSX switched to %s", gid);
+        return 0;
+    }
+    snprintf(msg, msg_size, "No MMCE device in slot %d", port + 1);
     return -1;
 }
