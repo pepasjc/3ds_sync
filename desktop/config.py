@@ -24,6 +24,7 @@ DEVICE_TYPES = [
     "MemCard Pro FTP",
     "PSIO",
     "CD Folder",
+    "OPL",
 ]
 
 STATUS_COLORS = {

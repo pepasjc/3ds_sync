@@ -42,6 +42,7 @@ SINGLE_SYSTEM_DEVICES = {
     "MemCard Pro FTP",
     "PSIO",
     "CD Folder",
+    "OPL",
 }
 MEMCARD_PRO_SYSTEMS = ["PS1", "PS2", "GC", "DC"]
 MEMCARD_PRO_FTP_SYSTEMS = ["PS1", "PS2", "GC"]
@@ -578,6 +579,7 @@ class ProfileDialog(QDialog):
         is_memcard_ftp = device_type == "MemCard Pro FTP"
         is_psio = device_type == "PSIO"
         is_saroo = device_type == "SAROO"
+        is_opl = device_type == "OPL"
         self._set_single_system_choices(device_type)
         for widget in (
             self._ftp_host_label,
@@ -604,6 +606,8 @@ class ProfileDialog(QDialog):
             folder_label = "Root Folder:"
         elif is_psio:
             folder_label = "SD Card Root:"
+        elif is_opl:
+            folder_label = "USB Root:"
         self._game_folder_label.setText(folder_label)
         self._single_save_row_label.setVisible(not is_memcard_ftp)
         self._single_save_row_widget.setVisible(not is_memcard_ftp)
@@ -630,6 +634,13 @@ class ProfileDialog(QDialog):
             self.single_save_folder_edit.setPlaceholderText(
                 "Mednafen save folder (optional — for emulator sync)"
             )
+        elif is_opl:
+            self.game_folder_edit.setPlaceholderText(
+                "OPL USB root (DVD/, CD/ and POPS/ created here)…"
+            )
+            self.single_save_folder_edit.setPlaceholderText(
+                "Leave empty — OPL VMCs managed separately"
+            )
         else:
             self.game_folder_edit.setPlaceholderText("Root game / ROM folder...")
             self.single_save_folder_edit.setPlaceholderText(
@@ -644,6 +655,15 @@ class ProfileDialog(QDialog):
                 idx = self.rom_format_combo.findText(fmt_label)
                 if idx >= 0:
                     self.rom_format_combo.setCurrentIndex(idx)
+
+        # OPL defaults to PS2; Auto resolves to ISO (PS2) / VCD (PS1).
+        if is_opl and not self._loading:
+            self._apply_single_system_defaults("PS2")
+            idx = self.rom_format_combo.findText(
+                ROM_FORMAT_LABELS.get("auto", "Auto")
+            )
+            if idx >= 0:
+                self.rom_format_combo.setCurrentIndex(idx)
 
         # SAROO is always SAT; lock system and hide save-ext picker
         if is_saroo and not self._loading:
@@ -675,6 +695,8 @@ class ProfileDialog(QDialog):
             choices = MEMCARD_PRO_SYSTEMS
         elif device_type == "PSIO":
             choices = ["PS1"]
+        elif device_type == "OPL":
+            choices = ["PS2", "PS1"]
         else:
             choices = SYSTEM_CHOICES
         self.system_combo.blockSignals(True)

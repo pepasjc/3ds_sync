@@ -26,6 +26,7 @@ ROM_FORMAT_OPTIONS: list[tuple[str, str]] = [
     ("cia", "CIA"),
     ("decrypted_cci", "Decrypted CCI"),
     ("eboot", "PSP EBOOT.PBP"),
+    ("vcd", "PS1 VCD (POPStarter)"),
     ("cci", "Xbox CCI"),
     ("folder", "Extracted Folder"),
 ]
@@ -60,6 +61,7 @@ DISC_ISO_SYSTEMS = {"PS2", "PSP", "GC", "WII", "XBOX", "X360", "XBOX360"}
 EMULATOR_DEVICE_TYPES = {"RetroArch", "EmuDeck"}
 HARDWARE_3DS_DEVICE_TYPES = {"Generic", "Everdrive", "CD Folder"}
 XBOX_SYSTEMS = {"XBOX", "X360", "XBOX360"}
+OPL_SYSTEMS = {"PS1", "PS2"}
 
 # PSIO's menu refuses filenames > 60 chars and cannot render non-ASCII bytes.
 # We keep folder + member names within this limit for PSIO installs.
@@ -181,6 +183,13 @@ def default_rom_format(profile: dict, rom: dict, system: str) -> str | None:
 
     if device_type == "PSIO" and system_up in {"PS1", "PSX"}:
         return "psio"
+
+    # OPL: PS1 → POPStarter VCD, PS2 → ISO (both CD and DVD media).
+    if device_type == "OPL":
+        if system_up == "PS1":
+            return "vcd"
+        if system_up == "PS2":
+            return "iso"
 
     if system_up in XBOX_SYSTEMS:
         return "iso"
@@ -338,6 +347,8 @@ def derive_download_filename(filename: str, extract_format: str | None) -> str:
         return f"{stem}.cu2"
     if fmt == "eboot":
         return "EBOOT.PBP"
+    if fmt == "vcd":
+        return f"{stem}.vcd"
     if fmt == "cci":
         return f"{stem}.cci"
     return filename
@@ -391,6 +402,108 @@ def resolve_profile_rom_folder(profile: dict, system: str) -> Path:
     return base
 
 
+# ── OPL (Open PS2 Loader) install layout ────────────────────────────────────
+#
+# OPL reads PS2 games from ``DVD/`` (DVD-ROM) or ``CD/`` (CD-ROM) folders on a
+# FAT32 USB drive, and PS1 games (via POPStarter) from ``POPS/``.  Filenames
+# use the Sony disc serial in an OPL-parsed form: ``SLPS_204.36`` — the first
+# four letters, an underscore, then the 5-digit number split as ``DDD.DD``.
+# OPL treats the dot-separated tokens as ``<startup>.<display name>.<ext>``
+# for PS2, so PS2 keeps the game name: ``SLPS_204.36.Game Name.iso``.  PS1
+# POPStarter VCDs are matched to their VMC by filename prefix, so they use the
+# serial only: ``SLUS_012.34.VCD``.
+
+_SERIAL_RE = re.compile(r"^[A-Z]{4}\d{5}$")
+
+
+def opl_disc_id(serial: str | None) -> str:
+    """Convert a Sony PS1/PS2 disc serial to the OPL filename prefix.
+
+    ``SLPS20436`` / ``SLPS-20436`` / ``slps_204.36`` → ``SLPS_204.36``.
+    Returns ``""`` when the value doesn't resolve to a 4-letter + 5-digit
+    Sony code (so callers can fall back to the bare game name).
+    """
+    compact = re.sub(r"[^A-Za-z0-9]", "", str(serial or "")).upper()
+    if _SERIAL_RE.match(compact):
+        letters = compact[:4]
+        digits = compact[4:]
+        return f"{letters}_{digits[:3]}.{digits[3:]}"
+    return ""
+
+
+def opl_ps2_media(rom: dict) -> str:
+    """Return ``"CD"`` or ``"DVD"`` for a PS2 catalog row.
+
+    The server's native ``extract_format`` recommendation encodes the media:
+    DVD CHDs advertise ``iso``, CD CHDs advertise ``cue``.  Defaults to DVD
+    (the overwhelming majority of PS2 titles) when the catalog can't tell us.
+    """
+    native = str(rom.get("extract_format") or "").strip().lower()
+    if native == "cue":
+        return "CD"
+    return "DVD"
+
+
+def clean_opl_name(name: str) -> str:
+    """Sanitize a game name for the OPL filename middle token.
+
+    Keeps spaces (OPL displays them) but strips characters illegal on FAT32
+    and collapses ``(Disc N)`` tags (each disc is its own file).
+    """
+    cleaned = strip_disc_tag(str(name or ""))
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or "game"
+
+
+def _build_opl_install_plan(
+    profile: dict,
+    rom: dict,
+    system_up: str,
+    override_format: str,
+) -> InstallPlan:
+    rom_id = str(rom.get("rom_id") or rom.get("title_id") or "")
+    if not rom_id:
+        raise ValueError("Catalog entry is missing a ROM id.")
+    filename = safe_file_name(str(rom.get("filename") or f"{rom_id}.rom"))
+    extract = choose_extract_format(profile, rom, system_up, override_format)
+    target_root = resolve_profile_rom_folder(profile, system_up)
+    display_name = str(rom.get("name") or Path(filename).stem or rom_id)
+    serial_source = str(rom.get("title_id") or rom_id)
+    disc_id = opl_disc_id(serial_source)
+    name = clean_opl_name(display_name)
+
+    if system_up == "PS1":
+        # PS1 → POPStarter VCD in POPS/.  VCDs are matched to their VMC by
+        # filename prefix, so name by serial only (no game name).
+        folder = "POPS"
+        ext = "vcd"
+        if extract is None:
+            extract = "vcd"
+        base = disc_id or name
+        target_path = target_root / folder / f"{base}.{ext}"
+    else:  # PS2 — DVD/ vs CD/ by media, both served as .iso
+        folder = "CD" if opl_ps2_media(rom) == "CD" else "DVD"
+        ext = "iso"
+        if extract is None:
+            extract = "iso"
+        # OPL parses ``<startup>.<display name>.iso``; serial first so it
+        # boots correctly, name second for the OPL game list.
+        if disc_id:
+            target_path = target_root / folder / f"{disc_id}.{name}.{ext}"
+        else:
+            target_path = target_root / folder / f"{name}.{ext}"
+
+    return InstallPlan(
+        rom_id=rom_id,
+        display_name=display_name,
+        system=system_up,
+        source_filename=filename,
+        target_path=target_path,
+        extract_format=extract,
+    )
+
+
 def build_install_plan(
     profile: dict,
     rom: dict,
@@ -398,6 +511,11 @@ def build_install_plan(
     override_format: str = "",
 ) -> InstallPlan:
     system_up = (system or rom.get("system") or "").upper()
+    # OPL (Open PS2 Loader) has its own folder/naming layout (DVD/, CD/,
+    # POPS/ with serial-prefixed filenames) — handle it before the generic
+    # extract/archive logic below.
+    if str(profile.get("device_type", "")).strip() == "OPL" and system_up in OPL_SYSTEMS:
+        return _build_opl_install_plan(profile, rom, system_up, override_format)
     rom_id = str(rom.get("rom_id") or rom.get("title_id") or "")
     if not rom_id:
         raise ValueError("Catalog entry is missing a ROM id.")

@@ -104,6 +104,52 @@ def rom_client_ps1_eboot(rom_dir, client, auth_headers):
 
 
 @pytest.fixture()
+def rom_client_ps1_vcd(rom_dir, client, auth_headers):
+    """Fixture that wires up a stub VCD converter for PS1 → POPStarter
+    conversion.  The stub prefixes ``VCD:`` to the input bytes so tests
+    can assert content end-to-end without a real popstation install."""
+    from app.services import rom_db, rom_scanner
+
+    original_rom_dir = settings.rom_dir
+    original_interval = settings.rom_scan_interval
+    original_cmd = settings.rom_ps1_vcd_command
+    original_cwd = settings.rom_ps1_vcd_cwd
+
+    settings.rom_dir = rom_dir
+    settings.rom_scan_interval = 0
+    settings.rom_ps1_vcd_cwd = ""
+    settings.rom_ps1_vcd_command = json.dumps(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[2]).write_bytes(b'VCD:' + Path(sys.argv[1]).read_bytes())"
+            ),
+            "{input}",
+            "{output}",
+        ]
+    )
+
+    rom_db.init_db(settings.save_dir)
+    _load_server_game_name_data()
+
+    (rom_dir / "psx").mkdir()
+    iso = rom_dir / "psx" / "Crash Bandicoot (USA).iso"
+    iso.write_bytes(b"DISC")
+
+    rom_scanner.init(rom_dir)
+
+    yield client
+
+    settings.rom_dir = original_rom_dir
+    settings.rom_scan_interval = original_interval
+    settings.rom_ps1_vcd_command = original_cmd
+    settings.rom_ps1_vcd_cwd = original_cwd
+    rom_scanner._catalog = None
+
+
+@pytest.fixture()
 def rom_client_3ds_zip(rom_dir, client, auth_headers):
     from app.services import rom_db, rom_scanner
 
@@ -860,6 +906,58 @@ class TestRomCatalog:
         assert r2.status_code == 200
         assert r2.headers["content-type"] == "application/octet-stream"
         assert r2.content == b"PBP:DISC"
+
+    def test_ps1_vcd_extract_route(self, rom_client_ps1_vcd, auth_headers):
+        """``GET /api/v1/roms/<id>?extract=vcd`` runs the configured VCD
+        converter and streams a POPStarter .VCD back.  OPL on PS2 reads
+        these from the USB POPS/ folder to play PS1 games via POPS.
+        """
+        resp = rom_client_ps1_vcd.get(
+            "/api/v1/roms?system=PS1", headers=auth_headers
+        )
+        assert resp.status_code == 200
+        roms = resp.json()["roms"]
+        assert len(roms) == 1
+        rom_id = roms[0]["rom_id"]
+
+        # The catalog row should advertise vcd in its extract_formats.
+        assert "vcd" in roms[0].get("extract_formats", [])
+
+        r2 = rom_client_ps1_vcd.get(
+            f"/api/v1/roms/{rom_id}?extract=vcd", headers=auth_headers
+        )
+        assert r2.status_code == 200
+        assert r2.headers["content-type"] == "application/octet-stream"
+        assert r2.content == b"VCD:DISC"
+
+    def test_ps1_vcd_unconfigured_returns_503(
+        self, rom_dir, client, auth_headers
+    ):
+        """Without a VCD command template the route must surface a 503
+        with a hint pointing at SYNC_ROM_PS1_VCD_COMMAND."""
+        from app.services import rom_db, rom_scanner
+
+        original = settings.rom_dir
+        original_cmd = settings.rom_ps1_vcd_command
+        try:
+            rom_db.init_db(settings.save_dir)
+            _load_server_game_name_data()
+            settings.rom_dir = rom_dir
+            settings.rom_ps1_vcd_command = ""
+            (rom_dir / "psx").mkdir()
+            (rom_dir / "psx" / "Foo.iso").write_bytes(b"x")
+            rom_scanner.init(rom_dir)
+
+            rom_id = rom_scanner.get().list_by_system("PS1")[0].rom_id
+            resp = client.get(
+                f"/api/v1/roms/{rom_id}?extract=vcd", headers=auth_headers
+            )
+            assert resp.status_code == 503
+            assert "SYNC_ROM_PS1_VCD_COMMAND" in resp.text
+        finally:
+            settings.rom_dir = original
+            settings.rom_ps1_vcd_command = original_cmd
+            rom_scanner._catalog = None
 
     def test_ps1_cue_bundle_advertises_and_downloads_psio(
         self, tmp_path, client, auth_headers

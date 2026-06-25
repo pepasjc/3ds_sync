@@ -8,8 +8,11 @@ from rom_installer import (
     build_install_plan,
     choose_extract_format,
     clean_ps1_title,
+    default_rom_format,
     derive_download_filename,
     group_multidisc_roms,
+    opl_disc_id,
+    opl_ps2_media,
     psio_safe_name,
     resolve_profile_rom_folder,
     sanitize_installed_files,
@@ -360,3 +363,97 @@ def test_sanitize_truncates_long_names_under_sixty(tmp_path):
 def test_sanitize_missing_folder_is_noop(tmp_path):
     profile = {"device_type": "PSIO", "path": str(tmp_path / "missing"), "system": "PS1"}
     assert sanitize_installed_files(profile, "PS1") == []
+
+
+# ── OPL (Open PS2 Loader) install layout ────────────────────────────────────
+
+
+def test_opl_disc_id_formats_sony_serial():
+    assert opl_disc_id("SLPS20436") == "SLPS_204.36"
+    assert opl_disc_id("SLPS-20436") == "SLPS_204.36"
+    assert opl_disc_id("slps_204.36") == "SLPS_204.36"
+    assert opl_disc_id("SCUS94503") == "SCUS_945.03"
+    assert opl_disc_id("not a serial") == ""
+    assert opl_disc_id(None) == ""
+
+
+def test_opl_ps2_dvd_goes_to_dvd_folder_with_serial_name(tmp_path):
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS2"}
+    rom = {
+        "rom_id": "SLPS_204.36",
+        "title_id": "SLPS20436",
+        "system": "PS2",
+        "name": "Sakigake Otokojuku",
+        "filename": "Sakigake Otokojuku (Japan).chd",
+        "extract_format": "iso",
+        "extract_formats": ["iso"],
+    }
+    plan = build_install_plan(profile, rom, "PS2")
+
+    assert plan.extract_format == "iso"
+    assert plan.target_path == tmp_path / "DVD" / "SLPS_204.36.Sakigake Otokojuku.iso"
+
+
+def test_opl_ps2_cd_uses_cd_folder(tmp_path):
+    # The server advertises 'cue' for PS2 CD media — OPL still wants .iso,
+    # routed to the CD/ folder.
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS2"}
+    rom = {
+        "rom_id": "SLUS_203.44",
+        "title_id": "SLUS20344",
+        "system": "PS2",
+        "name": "Mr. Mosquito",
+        "filename": "Mr. Mosquito (USA).chd",
+        "extract_format": "cue",
+        "extract_formats": ["cue"],
+    }
+    plan = build_install_plan(profile, rom, "PS2")
+
+    assert plan.extract_format == "iso"
+    assert plan.target_path == tmp_path / "CD" / "SLUS_203.44.Mr. Mosquito.iso"
+    assert opl_ps2_media(rom) == "CD"
+
+
+def test_opl_ps1_vcd_goes_to_pops_folder_serial_only(tmp_path):
+    # POPStarter matches VMCs by VCD filename prefix, so VCDs are named by
+    # serial only (no game name) in the POPS/ folder.
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}
+    rom = {
+        "rom_id": "SLUS_012.34",
+        "title_id": "SLUS01234",
+        "system": "PS1",
+        "name": "Castlevania Symphony of the Night",
+        "filename": "Castlevania SOTN (USA).chd",
+        "extract_format": "cue",
+        "extract_formats": ["cue", "vcd"],
+    }
+    plan = build_install_plan(profile, rom, "PS1")
+
+    assert plan.extract_format == "vcd"
+    assert plan.target_path == tmp_path / "POPS" / "SLUS_012.34.vcd"
+
+
+def test_opl_default_rom_format(tmp_path):
+    ps2_rom = {"filename": "Game.chd", "extract_format": "iso", "extract_formats": ["iso"]}
+    ps1_rom = {"filename": "Game.chd", "extract_format": "cue", "extract_formats": ["cue", "vcd"]}
+    profile = {"device_type": "OPL", "path": str(tmp_path)}
+
+    assert default_rom_format(profile, ps2_rom, "PS2") == "iso"
+    assert default_rom_format(profile, ps1_rom, "PS1") == "vcd"
+
+
+def test_opl_strips_disc_tag_and_illegal_chars_in_name(tmp_path):
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS2"}
+    rom = {
+        "rom_id": "SCES_000.01",
+        "title_id": "SCES00001",
+        "system": "PS2",
+        "name": 'Cool: Game (Disc 1) [Hack]',
+        "filename": "Cool Game.chd",
+        "extract_format": "iso",
+        "extract_formats": ["iso"],
+    }
+    plan = build_install_plan(profile, rom, "PS2")
+
+    # Disc tag dropped, ':' stripped (illegal on FAT32), serial prefix kept.
+    assert plan.target_path == tmp_path / "DVD" / "SCES_000.01.Cool Game [Hack].iso"
