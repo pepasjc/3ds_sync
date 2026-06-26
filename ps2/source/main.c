@@ -299,6 +299,23 @@ static void pad_init(void) {
     padSetMainMode(0, 0, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK);
 }
 
+/* Re-open the controller port to recover padman/SIO2 state after an MMCE/gen1
+ * GameID transaction.  mmceman briefly takes over the SIO2 unit; on a slow
+ * gen1 that can leave padman's controller port in a bad state, hanging the
+ * next poll (apparent freeze).  Closing + reopening the port resyncs it. */
+static void pad_reinit(void) {
+    padPortClose(0, 0);
+    padPortOpen(0, 0, g_pad_buf);
+    padSetMainMode(0, 0, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK);
+    /* Wait for the port to come back to a stable/ready state. */
+    for (int i = 0; i < 200; i++) {
+        int st = padGetState(0, 0);
+        if (st == PAD_STATE_STABLE || st == PAD_STATE_FINDCTP1) break;
+        if (st == PAD_STATE_DISCONN) break;
+        DelayThread(2000);
+    }
+}
+
 static unsigned int g_prev_btns = 0;
 
 static unsigned int pad_read_pressed(void) {
@@ -366,7 +383,9 @@ static int           g_mcard2_selected = 0, g_mcard2_scroll = 0;
 static ServerSaveList g_server;
 static int           g_server_selected = 0, g_server_scroll = 0;
 static int           g_server_source = 0;   /* 0=VMC, 1=Slot1, 2=Slot2 */
-static int           g_mmce_mode = 1;  /* GameID: 0=off, 1=auto, 2=gen1, 3=gen2 */
+/* GameID device per slot lives in g_state.mmce_mode[] (persisted to config).
+ * 0=off, 1=auto, 2=gen1, 3=gen2. */
+static const char   *g_mmce_mode_names[4] = {"off", "auto", "gen1", "gen2"};
 static bool          g_hdd_format_confirm = false;
 
 static char          g_scratch[256 * 1024];      /* JSON page buffer */
@@ -950,21 +969,33 @@ static void cycle_server_source(void) {
     redraw();
 }
 
+static void cycle_mmce_mode(int port) {
+    port = port == 1 ? 1 : 0;
+    g_state.mmce_mode[port] = (g_state.mmce_mode[port] + 1) % 4;
+    ui_set_mmce(port, g_state.mmce_mode[port]);
+    config_save(&g_state);   /* persist the per-slot choice */
+    ui_status("Slot%d GameID: %s (saved)", port + 1,
+              g_mmce_mode_names[g_state.mmce_mode[port]]);
+    redraw();
+}
+
 static void mcp_switch_gameid(const char *serial, int port) {
-    if (g_mmce_mode == 0) {
-        ui_error("GameID off - set mode in Config ([])");
+    port = port == 1 ? 1 : 0;
+    if (g_state.mmce_mode[port] == 0) {
+        ui_error("Slot%d GameID off - SELECT to set device", port + 1);
         redraw();
         return;
     }
     if (!serial || !serial[0]) { ui_error("No serial to switch to"); return; }
+    int mode = g_state.mmce_mode[port];
     char msg[128];
-    int rc = saves_mcp_set_gameid(serial, port, g_mmce_mode, msg, sizeof(msg));
-    if (rc < 0) { ui_error("%s", msg); redraw(); return; }
+    int rc = saves_mcp_set_gameid(serial, port, mode, msg, sizeof(msg));
+    if (rc < 0) { ui_error("[mode=%s] %s", g_mmce_mode_names[mode], msg); redraw(); return; }
 
     /* Do NOT auto-rescan here: right after a channel switch the MemCard Pro is
      * still mounting the new VMC, and probing it mid-mount intermittently hangs
      * libmc (gen1 freeze).  Tell the user to rescan ([]) once it has switched. */
-    ui_status("%s - press [] to rescan", msg);
+    ui_status("[%s] %s - press [] to rescan", g_mmce_mode_names[mode], msg);
     redraw();
 }
 
@@ -1133,6 +1164,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     config_load_console_id(&g_state);
+    ui_set_mmce(0, g_state.mmce_mode[0]);   /* reflect persisted GameID modes */
+    ui_set_mmce(1, g_state.mmce_mode[1]);
     scr_printf("BOOT: console_id=%s server=%s\n",
                g_state.console_id, g_state.server_url);
 
@@ -1283,6 +1316,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_SQUARE)   scan_mcard_list(0, &g_mcard);
             else if (pressed & PAD_CROSS)    upload_mc_game_at(&g_mcard, g_mcard_selected);
             else if (pressed & PAD_TRIANGLE) restore_mc_game_at(&g_mcard, g_mcard_selected);
+            else if (pressed & PAD_SELECT)   cycle_mmce_mode(0);
             else if (pressed & PAD_R1) {
                 if (g_mcard.count > 0 && g_mcard_selected < g_mcard.count)
                     mcp_switch_gameid(g_mcard.items[g_mcard_selected].serial, 0);
@@ -1296,6 +1330,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_SQUARE)   scan_mcard_list(1, &g_mcard2);
             else if (pressed & PAD_CROSS)    upload_mc_game_at(&g_mcard2, g_mcard2_selected);
             else if (pressed & PAD_TRIANGLE) restore_mc_game_at(&g_mcard2, g_mcard2_selected);
+            else if (pressed & PAD_SELECT)   cycle_mmce_mode(1);
             else if (pressed & PAD_R1) {
                 if (g_mcard2.count > 0 && g_mcard2_selected < g_mcard2.count)
                     mcp_switch_gameid(g_mcard2.items[g_mcard2_selected].serial, 1);
@@ -1311,6 +1346,7 @@ int main(int argc, char *argv[]) {
             else if (pressed & PAD_CROSS)    server_download_to_source();
             else if (pressed & PAD_TRIANGLE) server_upload_from_source();
             else if (pressed & PAD_L1)       server_sync_all();
+            else if (pressed & PAD_SELECT)   cycle_mmce_mode(source_port() < 0 ? 0 : source_port());
             else if (pressed & PAD_R1) {
                 if (g_server.count > 0 && g_server_selected < g_server.count)
                     mcp_switch_gameid(g_server.items[g_server_selected].serial,
@@ -1322,11 +1358,6 @@ int main(int argc, char *argv[]) {
                 cycle_storage_pref(-1);
             } else if (pressed & PAD_RIGHT) {
                 cycle_storage_pref(1);
-            } else if (pressed & PAD_SQUARE) {
-                g_mmce_mode = (g_mmce_mode + 1) % 4;   /* off/auto/gen1/gen2 */
-                ui_set_mmce(g_mmce_mode);
-                static const char *mn[] = {"off", "auto", "gen1", "gen2"};
-                ui_status("GameID mode: %s", mn[g_mmce_mode]);
             } else if (pressed & PAD_TRIANGLE) {
                 if (!g_hdd_format_confirm) {
                     g_hdd_format_confirm = true;

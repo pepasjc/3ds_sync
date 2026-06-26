@@ -63,14 +63,15 @@ static const u32 C_SEP         = RGB(0x60, 0x80, 0xa0);
 static char g_status[256];
 static AppView g_view_for_hints = APP_VIEW_ROMS;
 static char g_server_source_label[8] = "VMC";
-static int  g_mmce_mode_disp = 1;   /* 0 off, 1 auto, 2 gen1, 3 gen2 */
+static int  g_mmce_mode_disp[2] = {1, 1};   /* per slot: 0 off,1 auto,2 gen1,3 gen2 */
 
 void ui_set_server_source(const char *src) {
     snprintf(g_server_source_label, sizeof(g_server_source_label), "%s", src);
 }
 
-void ui_set_mmce(int mode) {
-    g_mmce_mode_disp = mode;
+void ui_set_mmce(int port, int mode) {
+    if (port < 0 || port > 1) return;
+    g_mmce_mode_disp[port] = mode;
 }
 
 /* ---- Pixel-precise putchar helpers ---- */
@@ -163,11 +164,11 @@ static const char *view_hints(AppView v) {
             return "X=upload card  /\\=pull all  []=rescan  D-pad=move";
         case APP_VIEW_MCARD:
         case APP_VIEW_MCARD2:
-            return "X=upload  /\\=restore  []=rescan  R1=MCPro switch";
+            return "X=up /\\=restore []=scan R1=switch SELECT=device";
         case APP_VIEW_SERVER: {
             static char buf[80];
             snprintf(buf, sizeof(buf),
-                     "START=src[%s] X=download /\\=upload L1=sync-all R1=switch",
+                     "START=src[%s] X=dl /\\=up L1=all R1=switch SEL=device",
                      g_server_source_label);
             return buf;
         }
@@ -595,9 +596,11 @@ void ui_draw_config(const SyncState *state) {
                  : roms_downloads_file());
     {
         static const char *mn[] = {"off", "auto", "gen1", "gen2"};
-        int m = (g_mmce_mode_disp >= 0 && g_mmce_mode_disp < 4) ? g_mmce_mode_disp : 1;
+        int s1 = (g_mmce_mode_disp[0] >= 0 && g_mmce_mode_disp[0] < 4) ? g_mmce_mode_disp[0] : 1;
+        int s2 = (g_mmce_mode_disp[1] >= 0 && g_mmce_mode_disp[1] < 4) ? g_mmce_mode_disp[1] : 1;
         cfg_line(&row, C_TEXT,
-                 "gameid_mode= %s  (SQUARE cycles: off/auto/gen1/gen2)", mn[m]);
+                 "gameid_mode= Slot1:%s  Slot2:%s  (SELECT in a card view cycles)",
+                 mn[s1], mn[s2]);
     }
     cfg_line(&row, C_TEXT, "hdd_format = TRIANGLE twice (PS2 APA, wipes disk)");
     row++;

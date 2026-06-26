@@ -48,7 +48,7 @@ void ui_draw_saves(const SaveVmcList *list, int selected, int scroll);
 void ui_draw_mcard(const McGameList *list, int selected, int scroll);
 void ui_draw_server(const ServerSaveList *list, int selected, int scroll);
 void ui_set_server_source(const char *src);
-void ui_set_mmce(int on);
+void ui_set_mmce(int port, int mode);
 void ui_draw_downloads(const DownloadList *list, int selected, int scroll,
                        uint64_t active_done, uint64_t active_total,
                        uint64_t active_bps);

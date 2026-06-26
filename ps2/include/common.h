@@ -89,6 +89,10 @@ typedef struct {
     StoragePreference storage_pref; /* auto, usb, or hdd */
     StorageBackend    storage_backend;
 
+    /* GameID device per memory-card slot: 0=off,1=auto,2=gen1,3=gen2.
+     * Persisted so the gen1/MCP2 choice survives relaunch. */
+    int               mmce_mode[2];
+
     /* Detected install target. usb_ready is kept as the legacy "storage
      * ready" flag; usb_root is "mass:", "mass1:", etc. or "hdd0:hdl". */
     bool usb_ready;
