@@ -117,6 +117,10 @@ class InstallPlan:
     extract_format: str | None
     extract_archive: bool = False
     target_is_directory: bool = False
+    # PS1 → OPL POPStarter (Applications-menu method): after writing the .VCD,
+    # drop a renamed POPSTARTER.ELF launcher beside it and register the game in
+    # the USB-root conf_apps.cfg so it shows in OPL's Applications menu.
+    opl_popstarter: bool = False
 
     @property
     def format_label(self) -> str:
@@ -141,13 +145,22 @@ def fetch_rom_catalog(system: str = "", search: str = "") -> list[dict]:
 
 def profile_systems(profile: dict) -> list[str]:
     if "systems" in profile:
-        return [
+        systems = [
             str(s.get("system", "")).upper()
             for s in profile.get("systems", [])
             if s.get("enabled", True) and str(s.get("system", "")).strip()
         ]
-    system = str(profile.get("system", "")).upper()
-    return [system] if system else []
+    else:
+        system = str(profile.get("system", "")).upper()
+        systems = [system] if system else []
+    # OPL is a PS1/PS2 USB loader — always offer both in the ROM Installer
+    # regardless of the per-system enabled toggles, so the user never has to
+    # flip a setting to install PS1/PS2 onto an OPL drive.
+    if str(profile.get("device_type", "")).strip() == "OPL":
+        for sys_id in ("PS1", "PS2"):
+            if sys_id not in systems:
+                systems.append(sys_id)
+    return systems
 
 
 def system_profile_info(profile: dict, system: str) -> dict:
@@ -410,8 +423,11 @@ def resolve_profile_rom_folder(profile: dict, system: str) -> Path:
 # four letters, an underscore, then the 5-digit number split as ``DDD.DD``.
 # OPL treats the dot-separated tokens as ``<startup>.<display name>.<ext>``
 # for PS2, so PS2 keeps the game name: ``SLPS_204.36.Game Name.iso``.  PS1
-# POPStarter VCDs are matched to their VMC by filename prefix, so they use the
-# serial only: ``SLUS_012.34.VCD``.
+# POPStarter VCDs use the SAME scheme: ``SLUS_012.34.Game Name.VCD``.  Modern
+# OPL (136_DB-TA and newer) auto-lists VCDs from POPS/ in its PS1 page with no
+# config file, but it *requires* the ``SERIAL.Name.VCD`` form — a serial-only
+# name is ignored.  POPStarter then creates the per-game VMC in a folder named
+# after the full VCD filename, so the name token is needed there too.
 
 _SERIAL_RE = re.compile(r"^[A-Z]{4}\d{5}$")
 
@@ -474,25 +490,26 @@ def _build_opl_install_plan(
     name = clean_opl_name(display_name)
 
     if system_up == "PS1":
-        # PS1 → POPStarter VCD in POPS/.  VCDs are matched to their VMC by
-        # filename prefix, so name by serial only (no game name).
+        # PS1 → POPStarter .VCD in POPS/.  Extension is UPPERCASE: POPStarter
+        # matches its ``XX.<name>.ELF`` launcher to ``<name>.VCD`` case-
+        # sensitively, and a lowercase ``.vcd`` isn't found (it then falls back
+        # to uLaunchELF).  Name uses the SERIAL.Name scheme so the launcher and
+        # VCD share a base; the APPS/ app folder gives the display name.
         folder = "POPS"
-        ext = "vcd"
+        ext = "VCD"
         if extract is None:
             extract = "vcd"
-        base = disc_id or name
-        target_path = target_root / folder / f"{base}.{ext}"
     else:  # PS2 — DVD/ vs CD/ by media, both served as .iso
         folder = "CD" if opl_ps2_media(rom) == "CD" else "DVD"
         ext = "iso"
         if extract is None:
             extract = "iso"
-        # OPL parses ``<startup>.<display name>.iso``; serial first so it
-        # boots correctly, name second for the OPL game list.
-        if disc_id:
-            target_path = target_root / folder / f"{disc_id}.{name}.{ext}"
-        else:
-            target_path = target_root / folder / f"{name}.{ext}"
+    # OPL parses ``<startup>.<display name>.<ext>``; serial first so it boots
+    # correctly, name second for the OPL game list.
+    if disc_id:
+        target_path = target_root / folder / f"{disc_id}.{name}.{ext}"
+    else:
+        target_path = target_root / folder / f"{name}.{ext}"
 
     return InstallPlan(
         rom_id=rom_id,
@@ -501,7 +518,82 @@ def _build_opl_install_plan(
         source_filename=filename,
         target_path=target_path,
         extract_format=extract,
+        opl_popstarter=(system_up == "PS1"),
     )
+
+
+def _find_popstarter_elf(pops_dir: Path) -> Path | None:
+    """Locate POPSTARTER.ELF in the POPS folder, case-insensitively.
+
+    The user supplies POPSTARTER.ELF (+ POPS.ELF / IOPRP) once; we copy it per
+    game.  FAT32 is case-insensitive but the host OS may not be.
+    """
+    try:
+        for entry in pops_dir.iterdir():
+            if entry.is_file() and entry.name.lower() == "popstarter.elf":
+                return entry
+    except OSError:
+        return None
+    return None
+
+
+# OPL's Apps page auto-scans ``APPS/<folder>/`` subfolders that contain a
+# ``title.cfg`` on each game device (USB) — independent of which device holds
+# OPL's main config.  So each PS1 game gets its own APPS subfolder with a
+# renamed POPSTARTER.ELF + a title.cfg; no shared conf_apps.cfg, no memory-card
+# dependency.  The folder is named after the VCD stem (serial-prefixed) so our
+# folders are easy to tell apart from the user's own apps when pruning.
+#
+# POPStarter matches its launcher ELF to a VCD purely by filename, but on USB
+# the launcher MUST carry an ``XX.`` prefix (SMB uses ``SB.``, HDD none) — it
+# strips that prefix, then loads ``<rest>.VCD`` from POPS/.  Without the prefix
+# POPStarter doesn't treat it as a POPS launch and falls back to uLaunchELF.
+OPL_POPSTARTER_USB_PREFIX = "XX."
+
+
+def _popstarter_launcher_name(vcd_stem: str) -> str:
+    return f"{OPL_POPSTARTER_USB_PREFIX}{vcd_stem}.ELF"
+
+
+def _title_cfg_bytes(title: str, boot_name: str) -> bytes:
+    safe_title = re.sub(r"[\r\n]", " ", str(title)).strip() or boot_name
+    return f"title={safe_title}\nboot={boot_name}\n".encode("utf-8")
+
+
+def _install_popstarter_app(vcd_path: Path, display_name: str) -> list[Path]:
+    """Make a PS1 VCD show + launch from OPL's Apps page.
+
+    Creates ``APPS/<vcd_stem>/`` containing a renamed POPSTARTER.ELF (POPStarter
+    loads the VCD in POPS/ whose name matches its own ELF filename) and a
+    ``title.cfg`` giving the display name.  The VCD itself stays in POPS/.
+    Skips silently if POPSTARTER.ELF isn't in the POPS folder.
+    """
+    written: list[Path] = []
+    pops_dir = vcd_path.parent
+    src = _find_popstarter_elf(pops_dir)
+    if src is None:
+        return written
+    base = vcd_path.stem  # SERIAL.Name
+    app_dir = pops_dir.parent / "APPS" / base
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return written
+    launcher = app_dir / _popstarter_launcher_name(base)  # XX.<stem>.ELF (USB)
+    try:
+        shutil.copy2(src, launcher)
+    except OSError:
+        return written
+    written.append(launcher)
+
+    title_cfg = app_dir / "title.cfg"
+    label = _opl_display_from_vcd(vcd_path) if not str(display_name).strip() else display_name
+    try:
+        title_cfg.write_bytes(_title_cfg_bytes(label, launcher.name))
+        written.append(title_cfg)
+    except OSError:
+        pass
+    return written
 
 
 def build_install_plan(
@@ -628,7 +720,10 @@ def install_rom(
         except OSError:
             shutil.copy2(tmp_path, target)
             tmp_path.unlink(missing_ok=True)
-        return [target]
+        written = [target]
+        if plan.opl_popstarter:
+            written.extend(_install_popstarter_app(target, plan.display_name))
+        return written
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -811,3 +906,105 @@ def sanitize_installed_files(profile: dict, system: str) -> list[tuple[str, str]
         except OSError:
             continue
     return renames
+
+
+_OPL_SERIAL_PREFIX_RE = re.compile(r"^[A-Z]{4}_\d{3}\.\d{2}\.")
+
+
+def _opl_display_from_vcd(vcd_path: Path) -> str:
+    """Recover a game's display name from its VCD filename.
+
+    ``SLUS_012.34.Castlevania SOTN.vcd`` → ``Castlevania SOTN``.  Falls back to
+    the whole stem when there's no recognisable serial prefix.
+    """
+    stem = vcd_path.stem
+    match = _OPL_SERIAL_PREFIX_RE.match(stem)
+    return stem[match.end():] if match else stem
+
+
+def _vcd_present(pops_dir: Path, base: str) -> bool:
+    """True if a ``<base>.vcd`` (any case) exists in the POPS folder."""
+    return (pops_dir / f"{base}.vcd").exists() or (pops_dir / f"{base}.VCD").exists()
+
+
+def _remove_orphan_popstarter_apps(apps_dir: Path, pops_dir: Path) -> list[str]:
+    """Delete APPS/<folder>/ app folders whose game VCD is gone.
+
+    Only serial-named folders (``SLUS_xxx.xx.*``) are considered ours, so the
+    user's own app folders / loose ELFs are never touched.
+    """
+    removed: list[str] = []
+    if not apps_dir.is_dir():
+        return removed
+    for child in sorted(apps_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        if not _OPL_SERIAL_PREFIX_RE.match(child.name):
+            continue
+        if _vcd_present(pops_dir, child.name):
+            continue
+        try:
+            shutil.rmtree(child)
+            removed.append(str(child))
+        except OSError:
+            pass
+    return removed
+
+
+def repair_opl_popstarter(profile: dict, system: str) -> list[tuple[str, str]]:
+    """Backfill POPStarter app folders for already-installed VCDs.
+
+    For each ``POPS/*.VCD`` missing its ``APPS/<stem>/`` folder (renamed
+    POPSTARTER.ELF + title.cfg), creates it so the game shows on OPL's Apps
+    page.  Also removes orphan app folders for games whose VCD was deleted.
+    Idempotent.  Returns ``(path, detail)`` records.  Raises ``ValueError`` if
+    VCDs exist but POPSTARTER.ELF is absent.
+    """
+    fixed: list[tuple[str, str]] = []
+    try:
+        root = resolve_profile_rom_folder(profile, system)
+    except Exception:
+        return fixed
+    pops = root / "POPS"
+    if not pops.is_dir():
+        return fixed
+    vcds = sorted(
+        p for p in pops.iterdir() if p.is_file() and p.suffix.lower() == ".vcd"
+    )
+    apps_dir = root / "APPS"
+
+    if vcds:
+        src = _find_popstarter_elf(pops)
+        if src is None:
+            raise ValueError(
+                "POPSTARTER.ELF not found in the POPS folder.\n"
+                "Add POPSTARTER.ELF (plus POPS.ELF and IOPRP252.IMG) to POPS/ and retry."
+            )
+        for vcd in vcds:
+            app_dir = apps_dir / vcd.stem
+            launcher = app_dir / _popstarter_launcher_name(vcd.stem)
+            title_cfg = app_dir / "title.cfg"
+            if launcher.exists() and title_cfg.exists():
+                continue
+            made = _install_popstarter_app(vcd, _opl_display_from_vcd(vcd))
+            if made:
+                fixed.append((str(vcd), str(app_dir)))
+
+    # Clean up app folders for games whose VCD was removed.
+    for orphan in _remove_orphan_popstarter_apps(apps_dir, pops):
+        fixed.append((orphan, "(removed stale app folder)"))
+    return fixed
+
+
+def repair_installed_files(profile: dict, system: str) -> list[tuple[str, str]]:
+    """Dispatch the "Sanitize/Repair Installed Files" action by device type.
+
+    PSIO → enforce filename limits; OPL → backfill POPStarter launchers and
+    conf_apps.cfg entries.  Other devices → no-op.
+    """
+    device_type = str(profile.get("device_type", "")).strip().upper()
+    if device_type == "OPL":
+        return repair_opl_popstarter(profile, system)
+    if device_type == "PSIO":
+        return sanitize_installed_files(profile, system)
+    return []

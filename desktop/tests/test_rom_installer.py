@@ -13,11 +13,15 @@ from rom_installer import (
     group_multidisc_roms,
     opl_disc_id,
     opl_ps2_media,
+    profile_systems,
     psio_safe_name,
     resolve_profile_rom_folder,
     sanitize_installed_files,
     strip_disc_tag,
+    repair_installed_files,
+    repair_opl_popstarter,
     _safe_extract_zip,
+    _install_popstarter_app,
 )
 
 
@@ -414,9 +418,8 @@ def test_opl_ps2_cd_uses_cd_folder(tmp_path):
     assert opl_ps2_media(rom) == "CD"
 
 
-def test_opl_ps1_vcd_goes_to_pops_folder_serial_only(tmp_path):
-    # POPStarter matches VMCs by VCD filename prefix, so VCDs are named by
-    # serial only (no game name) in the POPS/ folder.
+def test_opl_ps1_vcd_goes_to_pops_folder_serial_and_name(tmp_path):
+    # OPL only lists VCDs named SERIAL.Name.VCD — a serial-only name is ignored.
     profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}
     rom = {
         "rom_id": "SLUS_012.34",
@@ -430,7 +433,170 @@ def test_opl_ps1_vcd_goes_to_pops_folder_serial_only(tmp_path):
     plan = build_install_plan(profile, rom, "PS1")
 
     assert plan.extract_format == "vcd"
-    assert plan.target_path == tmp_path / "POPS" / "SLUS_012.34.vcd"
+    assert plan.target_path == (
+        tmp_path / "POPS" / "SLUS_012.34.Castlevania Symphony of the Night.VCD"
+    )
+    # PS1 VCDs need an Applications-menu launcher + conf_apps.cfg entry.
+    assert plan.opl_popstarter is True
+
+
+def test_opl_ps2_iso_is_not_popstarter():
+    profile = {"device_type": "OPL", "system": "PS2"}
+    rom = {
+        "rom_id": "SLUS_200.02", "title_id": "SLUS20002", "system": "PS2",
+        "name": "Some PS2 Game", "filename": "game.chd",
+        "extract_format": "iso", "extract_formats": ["iso"],
+    }
+    plan = build_install_plan(profile, rom, "PS2")
+    assert plan.opl_popstarter is False
+
+
+def test_install_popstarter_app_writes_appfolder_and_titlecfg(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    (pops / "POPSTARTER.ELF").write_bytes(b"ELFDATA")
+    vcd = pops / "SLUS_012.34.Castlevania SOTN.vcd"
+    vcd.write_bytes(b"vcd")
+
+    written = _install_popstarter_app(vcd, "Castlevania SOTN")
+
+    # APPS/<stem>/ holds the XX.-prefixed launcher + title.cfg; VCD in POPS/.
+    app_dir = tmp_path / "APPS" / "SLUS_012.34.Castlevania SOTN"
+    launcher = app_dir / "XX.SLUS_012.34.Castlevania SOTN.ELF"
+    title_cfg = app_dir / "title.cfg"
+    assert launcher.read_bytes() == b"ELFDATA"
+    assert launcher in written and title_cfg in written
+    assert title_cfg.read_text() == (
+        "title=Castlevania SOTN\n"
+        "boot=XX.SLUS_012.34.Castlevania SOTN.ELF\n"
+    )
+
+
+def test_install_popstarter_app_idempotent(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    (pops / "popstarter.elf").write_bytes(b"ELFDATA")  # case-insensitive source
+    vcd = pops / "SLUS_012.34.Game.vcd"
+    vcd.write_bytes(b"vcd")
+
+    _install_popstarter_app(vcd, "Game")
+    _install_popstarter_app(vcd, "Game")  # reinstall: overwrites, no extra files
+
+    app_dir = tmp_path / "APPS" / "SLUS_012.34.Game"
+    files = sorted(p.name for p in app_dir.iterdir())
+    assert files == ["XX.SLUS_012.34.Game.ELF", "title.cfg"]
+
+
+def test_install_popstarter_app_no_elf_skips(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    vcd = pops / "SLUS_012.34.Game.vcd"
+    vcd.write_bytes(b"vcd")
+
+    # No POPSTARTER.ELF present → nothing written, VCD install still succeeds.
+    assert _install_popstarter_app(vcd, "Game") == []
+    assert not (tmp_path / "APPS").exists()
+
+
+def test_repair_removes_orphan_appfolder_keeps_user_apps(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    (pops / "POPSTARTER.ELF").write_bytes(b"E")
+    apps = tmp_path / "APPS"
+    apps.mkdir()
+    # Live game: VCD present (its app folder will be backfilled).
+    (pops / "SLUS_012.34.Live.vcd").write_bytes(b"v")
+    # Orphan app folder: serial-named but VCD gone → should be removed.
+    orphan = apps / "SCUS_946.01.Gone"
+    orphan.mkdir()
+    (orphan / "SCUS_946.01.Gone.ELF").write_bytes(b"E")
+    (orphan / "title.cfg").write_bytes(b"title=Gone\nboot=SCUS_946.01.Gone.ELF\n")
+    # User's own app folder + loose ELF — must never be touched.
+    (apps / "uLaunchELF").mkdir()
+    (apps / "uLaunchELF" / "BOOT.ELF").write_bytes(b"u")
+    (apps / "ps2sync.elf").write_bytes(b"app")
+
+    fixed = repair_opl_popstarter(
+        {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}, "PS1"
+    )
+
+    # Orphan folder gone; live game backfilled; user apps intact.
+    assert not orphan.exists()
+    assert (apps / "SLUS_012.34.Live" / "title.cfg").exists()
+    assert (apps / "uLaunchELF" / "BOOT.ELF").exists()
+    assert (apps / "ps2sync.elf").exists()
+    assert any("SCUS_946.01.Gone" in old for old, _ in fixed)
+
+
+def test_opl_profile_always_offers_ps1_ps2():
+    # No systems enabled in the profile, but OPL must still offer PS1+PS2.
+    profile = {"device_type": "OPL", "systems": []}
+    assert set(profile_systems(profile)) == {"PS1", "PS2"}
+
+
+def test_opl_profile_merges_ps1_ps2_with_enabled_systems():
+    profile = {
+        "device_type": "OPL",
+        "systems": [{"system": "PS2", "enabled": True}],
+    }
+    systems = profile_systems(profile)
+    assert set(systems) == {"PS1", "PS2"}
+    # Existing enabled system kept (not duplicated).
+    assert systems.count("PS2") == 1
+
+
+def test_non_opl_profile_respects_enabled_toggles():
+    profile = {
+        "device_type": "RetroArch",
+        "systems": [
+            {"system": "PS1", "enabled": False},
+            {"system": "GBA", "enabled": True},
+        ],
+    }
+    assert profile_systems(profile) == ["GBA"]
+
+
+def test_repair_opl_backfills_launcher_and_conf(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    (pops / "POPSTARTER.ELF").write_bytes(b"ELF")
+    # Two already-installed VCDs with no launcher/conf yet.
+    (pops / "SLUS_012.34.Castlevania SOTN.vcd").write_bytes(b"a")
+    (pops / "SCUS_946.01.LEMMINGS 3D.vcd").write_bytes(b"b")
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}
+
+    fixed = repair_opl_popstarter(profile, "PS1")
+
+    assert len(fixed) == 2
+    cv_dir = tmp_path / "APPS" / "SLUS_012.34.Castlevania SOTN"
+    lem_dir = tmp_path / "APPS" / "SCUS_946.01.LEMMINGS 3D"
+    assert (cv_dir / "XX.SLUS_012.34.Castlevania SOTN.ELF").read_bytes() == b"ELF"
+    assert (cv_dir / "title.cfg").read_text() == (
+        "title=Castlevania SOTN\nboot=XX.SLUS_012.34.Castlevania SOTN.ELF\n"
+    )
+    assert (lem_dir / "title.cfg").read_text() == (
+        "title=LEMMINGS 3D\nboot=XX.SCUS_946.01.LEMMINGS 3D.ELF\n"
+    )
+    # Idempotent: a second run finds nothing to do.
+    assert repair_opl_popstarter(profile, "PS1") == []
+
+
+def test_repair_opl_missing_popstarter_raises(tmp_path):
+    pops = tmp_path / "POPS"
+    pops.mkdir()
+    (pops / "SLUS_012.34.Game.vcd").write_bytes(b"a")
+    profile = {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}
+    with pytest.raises(ValueError, match="POPSTARTER.ELF"):
+        repair_opl_popstarter(profile, "PS1")
+
+
+def test_repair_dispatch_by_device(tmp_path):
+    # OPL with no POPS folder → no-op (empty), not an error.
+    opl = {"device_type": "OPL", "path": str(tmp_path), "system": "PS1"}
+    assert repair_installed_files(opl, "PS1") == []
+    # Unknown device → no-op.
+    other = {"device_type": "RetroArch", "path": str(tmp_path)}
+    assert repair_installed_files(other, "PS1") == []
 
 
 def test_opl_default_rom_format(tmp_path):
