@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include <gccore.h>
 #include <ogc/card.h>
@@ -345,4 +347,121 @@ void saves_fetch_server(const SyncState *state,
 
     if (out->count == 0 && out->last_error[0] == '\0')
         snprintf(out->last_error, sizeof(out->last_error), "No GC saves on server");
+}
+
+/* ---- VMC: full card images on SD ---- */
+
+#define VMC_DIR SD_ROOT "/VMC"
+
+static bool vmc_size_ok(uint32_t size) {
+    return size >= 0x80000 && size <= 0x1000000 && (size % GC_BLOCK_SIZE) == 0;
+}
+
+static bool has_card_ext(const char *fname) {
+    size_t n = strlen(fname);
+    static const char *exts[] = { ".raw", ".gcp", ".mc", ".bin", ".mcd", NULL };
+    for (int i = 0; exts[i]; i++) {
+        size_t el = strlen(exts[i]);
+        if (n > el && strcasecmp(fname + n - el, exts[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void scan_vmc_dir(const char *dir, SaveVmcList *out) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && out->count < SAVES_MAX_VMC) {
+        if (de->d_name[0] == '.') continue;
+        if (!has_card_ext(de->d_name)) continue;
+        char path[SAVE_DIR_LEN];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (!vmc_size_ok((uint32_t)st.st_size)) continue;
+        SaveVmc *v = &out->items[out->count];
+        memset(v, 0, sizeof(*v));
+        strncpy(v->path, path, sizeof(v->path) - 1);
+        strncpy(v->filename, de->d_name, sizeof(v->filename) - 1);
+        v->size = (uint32_t)st.st_size;
+        out->count++;
+    }
+    closedir(d);
+}
+
+void saves_scan_vmc(SaveVmcList *out) {
+    if (!out) return;
+    out->count = 0;
+    out->last_error[0] = '\0';
+    scan_vmc_dir(VMC_DIR, out);
+    scan_vmc_dir(SD_ROOT, out);
+    if (out->count == 0)
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "No card images in %s or sd:/", VMC_DIR);
+}
+
+int saves_upload_vmc(const SyncState *state, const SaveVmc *vmc, char *msg, size_t msg_size) {
+    if (!state || !vmc) return -1;
+    FILE *fp = fopen(vmc->path, "rb");
+    if (!fp) { snprintf(msg, msg_size, "Open %s failed", vmc->filename); return -1; }
+    uint8_t *buf = malloc(vmc->size);
+    if (!buf) { fclose(fp); snprintf(msg, msg_size, "Out of memory (%u KB)", vmc->size / 1024); return -1; }
+    size_t rd = fread(buf, 1, vmc->size, fp);
+    fclose(fp);
+    if (rd != vmc->size) { free(buf); snprintf(msg, msg_size, "Read %s short", vmc->filename); return -1; }
+
+    HttpRequest req = {0};
+    req.server_url        = state->server_url;
+    req.api_key           = state->api_key;
+    req.path              = "/api/v1/saves/gc-vmc/import";
+    req.method            = "POST";
+    req.body              = buf;
+    req.body_len          = vmc->size;
+    req.body_content_type = "application/octet-stream";
+
+    static uint8_t resp[4096];
+    int status = 0;
+    int n = http_get_buf(&req, resp, sizeof(resp), &status);
+    free(buf);
+    if (n >= 0 && status == 200) {
+        int games = 0;
+        for (char *p = (char *)resp; (p = strstr(p, "title_id")) != NULL; p++) games++;
+        snprintf(msg, msg_size, "Imported %d game(s) from %s", games, vmc->filename);
+        return 0;
+    }
+    snprintf(msg, msg_size, "Import %s failed (HTTP %d, n=%d)", vmc->filename, status, n);
+    return -1;
+}
+
+int saves_pull_all(const SyncState *state, const ServerSaveList *server,
+                   char *msg, size_t msg_size) {
+    if (!state || !server) return -1;
+    mkdir(VMC_DIR, 0777);
+
+    int ok = 0, fail = 0;
+    for (int i = 0; i < server->count; i++) {
+        const char *tid = server->items[i].title_id;
+        char path[96];
+        snprintf(path, sizeof(path), "/api/v1/saves/%s/gc-card?format=gci", tid);
+
+        HttpRequest req = {0};
+        req.server_url = state->server_url;
+        req.api_key    = state->api_key;
+        req.path       = path;
+        req.method     = "GET";
+
+        int status = 0;
+        int n = http_get_buf(&req, g_gci, SAVES_GCI_MAX, &status);
+        if (n < 0 || status != 200) { fail++; continue; }
+
+        char out_path[SAVE_DIR_LEN];
+        snprintf(out_path, sizeof(out_path), "%s/%s.gci", VMC_DIR, tid);
+        FILE *fp = fopen(out_path, "wb");
+        if (!fp) { fail++; continue; }
+        size_t wr = fwrite(g_gci, 1, (size_t)n, fp);
+        fclose(fp);
+        if (wr == (size_t)n) ok++; else fail++;
+    }
+    snprintf(msg, msg_size, "Pulled %d GCI(s), %d failed", ok, fail);
+    return ok;
 }

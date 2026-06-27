@@ -43,6 +43,7 @@ from app.services.gc_cards import (
     get_full_card_from_files as gc_get_full_card_from_files,
     get_gci_from_files as gc_get_gci_from_files,
     is_gc_card_image,
+    parse_card_entries as gc_parse_card_entries,
 )
 from app.services.bundle import BundleError, create_bundle, parse_bundle
 
@@ -613,6 +614,56 @@ async def import_ps2_vmc(request: Request, console_id: str = Query("")):
         )
 
     return {"status": "ok", "imported": imported, "skipped": skipped}
+
+
+def _store_gc_single_game(game_code: str, gci: bytes, timestamp: int, console_id: str) -> dict:
+    """Store one game's GCI under GC_<gamecode> as a full card image."""
+    title_id = f"GC_{game_code.upper()}"
+    card = gc_card_from_gci(gci)
+    if card is not None:
+        store_data, store_name = card, gc_canonical_card_name()
+    else:
+        store_data, store_name = gci, "card.gci"
+    bundle = SaveBundle(
+        title_id=0,
+        timestamp=timestamp,
+        files=[
+            BundleFile(
+                path=store_name,
+                size=len(store_data),
+                sha256=hashlib.sha256(store_data).digest(),
+                data=store_data,
+            )
+        ],
+        title_id_str=title_id,
+    )
+    storage.store_save(bundle, source="gc_vmc", console_id=console_id)
+    return {"title_id": title_id, "size": len(store_data)}
+
+
+@router.post("/saves/gc-vmc/import")
+async def import_gc_vmc(request: Request, console_id: str = Query("")):
+    """Split a full GameCube memory-card image into per-game saves.
+
+    Accepts an 8 MB GC card image (a physical card dump, a MemCard Pro GC
+    channel image, or a Dolphin ``.raw``).  Each save is extracted and stored
+    separately keyed by ``GC_<gamecode>``, so a save written on one card syncs
+    to every other GC source for the same game.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    if not is_gc_card_image(body):
+        raise HTTPException(status_code=400, detail="Not a GC card image")
+
+    entries = gc_parse_card_entries(body)
+    if not entries:
+        raise HTTPException(status_code=400, detail="No GC saves found in card image")
+
+    cid = _console_id_from_request(request, console_id)
+    timestamp = int(time.time())
+    imported = [_store_gc_single_game(code, gci, timestamp, cid) for code, gci in entries]
+    return {"status": "ok", "imported": imported}
 
 
 @router.post("/saves/{title_id}/ps1-card")

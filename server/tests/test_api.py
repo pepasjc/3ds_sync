@@ -1171,6 +1171,43 @@ class TestPs2VmcImport:
         assert r.status_code == 400
 
 
+class TestGcVmcImport:
+    def _make_card(self, game_code="GM8E", fill=0x5A):
+        import struct
+
+        from app.services.gc_cards import gc_card_from_gci
+
+        de = bytearray(b"\x00" * 64)
+        de[0:4] = game_code.encode("ascii")
+        de[4:6] = b"01"
+        struct.pack_into(">H", de, 54, 99)   # source first_block
+        struct.pack_into(">H", de, 56, 1)    # 1 block
+        gci = bytes(de) + bytes([fill]) * 8192
+        return gc_card_from_gci(gci), gci
+
+    def test_import_splits_card_into_per_game_saves(self, client, auth_headers):
+        card, gci = self._make_card("GM8E")
+        r = client.post(
+            "/api/v1/saves/gc-vmc/import",
+            content=card,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+        assert r.json()["imported"][0]["title_id"] == "GC_GM8E"
+
+        dl = client.get("/api/v1/saves/GC_GM8E/gc-card?format=gci", headers=auth_headers)
+        assert dl.status_code == 200
+        assert dl.content[64:] == gci[64:]
+
+    def test_import_rejects_non_card(self, client, auth_headers):
+        r = client.post(
+            "/api/v1/saves/gc-vmc/import",
+            content=b"not a card",
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 400
+
+
 class TestPs2Files:
     """Physical-card path: P2FD folder payload <-> stored single-game card."""
 

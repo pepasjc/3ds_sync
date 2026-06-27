@@ -76,6 +76,35 @@ void saves_fetch_server(const SyncState *state,
                         char *scratch, uint32_t scratch_size,
                         ServerSaveList *out);
 
+/* ---- VMC: full memory-card images on SD ---- */
+
+#define SAVES_MAX_VMC 64
+
+typedef struct {
+    char     path[SAVE_DIR_LEN];
+    char     filename[128];
+    uint32_t size;
+} SaveVmc;
+
+typedef struct {
+    SaveVmc items[SAVES_MAX_VMC];
+    int     count;
+    char    last_error[128];
+} SaveVmcList;
+
+/* Find full GC card images (multiple of 8 KB, ~0.5-16 MB) under sd:/VMC + sd:. */
+void saves_scan_vmc(SaveVmcList *out);
+
+/* Upload one whole card image to POST /saves/gc-vmc/import (server splits it
+ * into per-game saves). Returns 0 on success, negative on error. */
+int  saves_upload_vmc(const SyncState *state, const SaveVmc *vmc,
+                      char *msg, size_t msg_size);
+
+/* Download every server GC save as a GCI into sd:/VMC/<title_id>.gci.
+ * Returns the number pulled, or negative on error. */
+int  saves_pull_all(const SyncState *state, const ServerSaveList *server,
+                    char *msg, size_t msg_size);
+
 /* Build "GC_<gamecode>" from a 4-char game code. */
 void saves_title_id_from_gamecode(const char *gamecode, char *out, size_t out_size);
 
