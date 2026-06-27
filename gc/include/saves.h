@@ -105,6 +105,15 @@ int  saves_upload_vmc(const SyncState *state, const SaveVmc *vmc,
 int  saves_pull_all(const SyncState *state, const ServerSaveList *server,
                     char *msg, size_t msg_size);
 
+/* ---- MemCard Pro GC GameID (MMCE protocol over EXI) ---- */
+
+/* Switch the MemCard Pro GC / SD2SP2-MMCE device in the given slot (0=A, 1=B)
+ * to a game's channel.  Sends MMCE SetDiskID (0x8B 0x11) + SetDiskInfo
+ * (0x8B 0x13) over EXI.  ``gamecode`` is 4 chars, ``company`` 2 (may be ""),
+ * ``name`` the display name.  Returns 0 on success, negative on error. */
+int  saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
+                          const char *name, char *msg, size_t msg_size);
+
 /* Build "GC_<gamecode>" from a 4-char game code. */
 void saves_title_id_from_gamecode(const char *gamecode, char *out, size_t out_size);
 

@@ -610,6 +610,19 @@ static void draw_vmc(void) {
     }
 }
 
+/* ---- MemCard Pro GC GameID switch ---- */
+
+static void mcp_gameid(int port, const char *gamecode, const char *company, const char *name) {
+    if (!g_state.mmce_mode[port]) {
+        ui_error("Slot %c GameID off (enable in Config)", 'A' + port);
+        return;
+    }
+    char msg[128];
+    int rc = saves_mcp_set_gameid(port, gamecode, company, name, msg, sizeof(msg));
+    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
+    redraw();
+}
+
 static const char *hint_for(AppView v) {
     switch (v) {
         case APP_VIEW_CONFIG:    return "Up/Dn=select  L/R=change  A=edit/save        L+R+Start=quit";
@@ -618,8 +631,8 @@ static const char *hint_for(AppView v) {
         case APP_VIEW_DOWNLOADS: return "A=start/resume  X=remove  (B=pause)           L+R+Start=quit";
         case APP_VIEW_SAVES:     return "A=rescan  X=import card  Y=pull all GCIs       L+R+Start=quit";
         case APP_VIEW_CARDA:
-        case APP_VIEW_CARDB:     return "A=upload  Y=restore  X=rescan                 L+R+Start=quit";
-        case APP_VIEW_SERVER:    return "A=restore->SlotA  Y=->SlotB  X=refresh        L+R+Start=quit";
+        case APP_VIEW_CARDB:     return "A=upload  Y=restore  Z=GameID  X=rescan        L+R+Start=quit";
+        case APP_VIEW_SERVER:    return "A=restore->A  Y=->B  Z=GameID  X=refresh        L+R+Start=quit";
         default:                 return "L/R=switch view                               L+R+Start=quit";
     }
 }
@@ -768,6 +781,12 @@ int main(int argc, char **argv) {
             else if (down & PAD_BUTTON_X)     scan_card_view(0, &g_carda);
             else if (down & PAD_BUTTON_A)     upload_card_at(&g_carda, g_ca_sel);
             else if (down & PAD_BUTTON_Y)     restore_card_at(&g_carda, g_ca_sel);
+            else if (down & PAD_TRIGGER_Z) {
+                if (g_carda.count > 0 && g_ca_sel < g_carda.count) {
+                    const GcSave *s = &g_carda.items[g_ca_sel];
+                    mcp_gameid(0, s->gamecode, s->company, s->name[0] ? s->name : s->title_id);
+                }
+            }
             clamp_scroll(&g_ca_sel, &g_ca_scroll, g_carda.count);
         }
         else if (g_view == APP_VIEW_CARDB) {
@@ -778,6 +797,12 @@ int main(int argc, char **argv) {
             else if (down & PAD_BUTTON_X)     scan_card_view(1, &g_cardb);
             else if (down & PAD_BUTTON_A)     upload_card_at(&g_cardb, g_cb_sel);
             else if (down & PAD_BUTTON_Y)     restore_card_at(&g_cardb, g_cb_sel);
+            else if (down & PAD_TRIGGER_Z) {
+                if (g_cardb.count > 0 && g_cb_sel < g_cardb.count) {
+                    const GcSave *s = &g_cardb.items[g_cb_sel];
+                    mcp_gameid(1, s->gamecode, s->company, s->name[0] ? s->name : s->title_id);
+                }
+            }
             clamp_scroll(&g_cb_sel, &g_cb_scroll, g_cardb.count);
         }
         else if (g_view == APP_VIEW_SERVER) {
@@ -788,6 +813,14 @@ int main(int argc, char **argv) {
             else if (down & PAD_BUTTON_X)     fetch_server();
             else if (down & PAD_BUTTON_A)     server_restore_to(0);
             else if (down & PAD_BUTTON_Y)     server_restore_to(1);
+            else if (down & PAD_TRIGGER_Z) {
+                if (g_server.count > 0 && g_sv_sel < g_server.count) {
+                    const ServerSave *s = &g_server.items[g_sv_sel];
+                    const char *gc = strncmp(s->title_id, "GC_", 3) == 0 ? s->title_id + 3 : s->title_id;
+                    int port = g_state.mmce_mode[0] ? 0 : (g_state.mmce_mode[1] ? 1 : 0);
+                    mcp_gameid(port, gc, "", s->name[0] ? s->name : s->title_id);
+                }
+            }
             clamp_scroll(&g_sv_sel, &g_sv_scroll, g_server.count);
         }
         else if (g_view == APP_VIEW_CONFIG) config_input(down);

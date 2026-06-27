@@ -21,6 +21,7 @@
 
 #include <gccore.h>
 #include <ogc/card.h>
+#include <ogc/exi.h>
 
 static u8 g_workarea[CARD_WORKAREA_SIZE] __attribute__((aligned(32)));
 static u8 g_gci[SAVES_GCI_MAX]           __attribute__((aligned(32)));
@@ -464,4 +465,69 @@ int saves_pull_all(const SyncState *state, const ServerSaveList *server,
     }
     snprintf(msg, msg_size, "Pulled %d GCI(s), %d failed", ok, fail);
     return ok;
+}
+
+/* ---- MemCard Pro GC GameID (MMCE over EXI) ----
+ *
+ * Protocol ported from libogc2 mmce.c (Extrems): each command is a 0x8B-prefixed
+ * EXI transaction to the memory-card device.  GameID switch = SetDiskID
+ * (0x8B 0x11 + gamecode/company/disknum/gamever) then SetDiskInfo
+ * (0x8B 0x13 + 64-byte name).  GC EXI is master-clocked, so sending these to a
+ * plain Nintendo card is harmless (it ignores unknown commands) — unlike the
+ * PS2's ACK-based SIO2.  Still gated on EXI_Probe to skip empty slots.
+ */
+int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
+                         const char *name, char *msg, size_t msg_size) {
+    static const char digits[16] = "0123456789ABCDEF";
+    int chan = (port == 1) ? EXI_CHANNEL_1 : EXI_CHANNEL_0;
+
+    if (EXI_Probe(chan) <= 0) {
+        snprintf(msg, msg_size, "No device in slot %c", 'A' + port);
+        return -1;
+    }
+
+    /* --- SetDiskID: 0x8B 0x11 + gamename[4] + company[2] + disknum/gamever --- */
+    if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) {
+        snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port);
+        return -2;
+    }
+    if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+        EXI_Unlock(chan);
+        snprintf(msg, msg_size, "Slot %c select failed", 'A' + port);
+        return -3;
+    }
+    u8 cmd[12];
+    memset(cmd, 0, sizeof(cmd));
+    cmd[0] = 0x8B;
+    cmd[1] = 0x11;
+    memcpy(&cmd[2], gamecode, 4);
+    memcpy(&cmd[6], (company && company[0]) ? company : "00", 2);
+    cmd[8]  = digits[0]; cmd[9]  = digits[0];   /* disknum 00 */
+    cmd[10] = digits[0]; cmd[11] = digits[0];   /* gamever 00 */
+    bool err = false;
+    err |= !EXI_ImmEx(chan, cmd, sizeof(cmd), EXI_WRITE);
+    err |= !EXI_Deselect(chan);
+    EXI_Unlock(chan);
+    if (err) { snprintf(msg, msg_size, "SetDiskID failed"); return -4; }
+
+    /* --- SetDiskInfo: 0x8B 0x13 + 64-byte display name --- */
+    if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) { snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port); return -5; }
+    if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+        EXI_Unlock(chan);
+        snprintf(msg, msg_size, "Slot %c select2 failed", 'A' + port);
+        return -6;
+    }
+    u8 cmd2[2] = { 0x8B, 0x13 };
+    char info[64];
+    memset(info, 0, sizeof(info));
+    if (name) strncpy(info, name, sizeof(info) - 1);
+    err = false;
+    err |= !EXI_ImmEx(chan, cmd2, sizeof(cmd2), EXI_WRITE);
+    err |= !EXI_ImmEx(chan, info, sizeof(info), EXI_WRITE);
+    err |= !EXI_Deselect(chan);
+    EXI_Unlock(chan);
+    if (err) { snprintf(msg, msg_size, "SetDiskInfo failed"); return -7; }
+
+    snprintf(msg, msg_size, "GameID %.4s set on slot %c", gamecode, 'A' + port);
+    return 0;
 }
