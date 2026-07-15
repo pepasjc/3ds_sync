@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include <gccore.h>
 #include <network.h>
@@ -31,21 +32,25 @@ void http_set_wait_cb(HttpWaitFn cb) { g_wait_cb = cb; }
 #define HTTP_HEADER_WAIT_MS (10u * 60u * 1000u)   /* server-side ROM conversion */
 #define HTTP_BODY_WAIT_MS   (60u * 1000u)
 
-/* recv gated by select so a silent server can't block the app forever.
+/* Timed receive via per-call non-blocking recv (MSG_DONTWAIT), paced at
+ * vsync.  Deliberately NOT net_select(): libogc's BBA select creates and
+ * destroys a condition variable on a shared list every call while the
+ * packet IRQ walks and signals that list — the timeout path races the IRQ
+ * and hard-locks the console (reset button dead).
  * Returns >0 bytes, 0 = closed, -1 = error/timeout, -2 = user cancel. */
 static int recv_timed(int fd, void *buf, int len, uint32_t max_wait_ms) {
-    uint32_t waited = 0;
+    uint32_t waited_ms = 0, next_cb = 500;
     for (;;) {
-        fd_set rs;
-        FD_ZERO(&rs);
-        FD_SET(fd, &rs);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
-        int r = net_select(fd + 1, &rs, NULL, NULL, &tv);
-        if (r > 0)  return net_recv(fd, buf, len, 0);
-        if (r < 0)  return -1;
-        waited += 500;
-        if (g_wait_cb && g_wait_cb(waited)) return -2;
-        if (waited >= max_wait_ms) return -1;
+        int n = net_recv(fd, buf, len, MSG_DONTWAIT);
+        if (n >= 0) return n;
+        if (n != -EWOULDBLOCK && n != -EAGAIN) return -1;
+        VIDEO_WaitVSync();
+        waited_ms += 17;
+        if (waited_ms >= next_cb) {
+            next_cb += 500;
+            if (g_wait_cb && g_wait_cb(waited_ms)) return -2;
+        }
+        if (waited_ms >= max_wait_ms) return -1;
     }
 }
 
