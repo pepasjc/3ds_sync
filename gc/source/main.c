@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include <gccore.h>
 #include <ogc/card.h>
@@ -216,8 +219,41 @@ static bool edit_text(char *out, size_t cap, const char *label) {
 
 typedef enum {
     CF_SERVER = 0, CF_APIKEY, CF_NETMODE, CF_IP, CF_NM, CF_GW,
-    CF_SDDEV, CF_GAMES, CF_GIDA, CF_GIDB, CF_SAVE, CF_COUNT
+    CF_SDDEV, CF_GAMES, CF_GIDA, CF_GIDB, CF_TESTSD, CF_SAVE, CF_COUNT
 } CfgField;
+
+/* Step-by-step SD probe: reports the FIRST filesystem operation that fails
+ * (with errno) so "mounts but nothing works" cases become diagnosable. */
+static void sd_self_test(void) {
+    if (!g_state.sd_ready) {
+        ui_error("SD not mounted (sp2:%s A:%s B:%s)",
+                 g_sd_diag[0], g_sd_diag[1], g_sd_diag[2]);
+        return;
+    }
+    errno = 0;
+    DIR *d = opendir("sd:/");
+    if (!d) { ui_error("TEST opendir sd:/ FAILED errno=%d", errno); return; }
+    int n = 0;
+    while (readdir(d) != NULL) n++;
+    closedir(d);
+
+    errno = 0;
+    mkdir("sd:/3dssync", 0777);
+    FILE *fp = fopen("sd:/3dssync/probe.txt", "wb");
+    if (!fp) { ui_error("TEST root ok (%d entries); WRITE failed errno=%d", n, errno); return; }
+    fputs("ok", fp);
+    fclose(fp);
+
+    char buf[8] = {0};
+    fp = fopen("sd:/3dssync/probe.txt", "rb");
+    if (fp) { fread(buf, 1, 2, fp); fclose(fp); }
+    unlink("sd:/3dssync/probe.txt");
+
+    if (strcmp(buf, "ok") == 0)
+        ui_status("SD OK: %d root entries, write+readback OK", n);
+    else
+        ui_error("TEST write ok but READBACK failed");
+}
 
 static void draw_config(void) {
     int top = ui_list_top();
@@ -232,6 +268,7 @@ static void draw_config(void) {
     ui_text_hl(top + CF_GAMES,   g_cfg_sel == CF_GAMES,   UI_WHITE, " Games dir  : %s", g_state.games_folder);
     ui_text_hl(top + CF_GIDA,    g_cfg_sel == CF_GIDA,    UI_WHITE, " GameID A   : %s", g_state.mmce_mode[0] ? "on" : "off");
     ui_text_hl(top + CF_GIDB,    g_cfg_sel == CF_GIDB,    UI_WHITE, " GameID B   : %s", g_state.mmce_mode[1] ? "on" : "off");
+    ui_text_hl(top + CF_TESTSD,  g_cfg_sel == CF_TESTSD,  UI_CYAN,  " [ Test SD read/write ]");
     ui_text_hl(top + CF_SAVE,    g_cfg_sel == CF_SAVE,    UI_GREEN, " [ Save config to SD ]");
 
     /* SD probe diagnostics (updated on every mount attempt). */
@@ -281,6 +318,7 @@ static void config_activate(void) {
         case CF_GAMES:  edit_text(g_state.games_folder, sizeof(g_state.games_folder), "Games folder");
                         roms_set_target(g_state.sd_root, g_state.games_folder); break;
         case CF_SDDEV:  config_change(+1); apply_sd_device(); break;
+        case CF_TESTSD: sd_self_test(); break;
         case CF_NETMODE: case CF_GIDA: case CF_GIDB: config_change(+1); break;
         case CF_SAVE:
             if (!g_state.sd_ready) ui_error("No SD mounted - cannot save config");
@@ -683,7 +721,9 @@ static void mcp_gameid(int port, const char *gamecode, const char *company, cons
     }
     char msg[128];
     int rc = saves_mcp_set_gameid(port, gamecode, company, name, msg, sizeof(msg));
-    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
+    /* The device re-attaches its virtual card after a channel switch; don't
+     * auto-rescan into that window — let the user press X once it settles. */
+    if (rc < 0) ui_error("%s", msg); else ui_status("%s - X=rescan when switched", msg);
     redraw();
 }
 
@@ -905,8 +945,17 @@ int main(int argc, char **argv) {
                 if (g_server.count > 0 && g_sv_sel < g_server.count) {
                     const ServerSave *s = &g_server.items[g_sv_sel];
                     const char *gc = strncmp(s->title_id, "GC_", 3) == 0 ? s->title_id + 3 : s->title_id;
+                    /* Use the real maker code when the game is on a scanned
+                     * card — MMCE devices key channels on the full 6-char ID. */
+                    const char *company = "";
+                    for (int i = 0; i < g_carda.count && !company[0]; i++)
+                        if (!strcmp(g_carda.items[i].title_id, s->title_id))
+                            company = g_carda.items[i].company;
+                    for (int i = 0; i < g_cardb.count && !company[0]; i++)
+                        if (!strcmp(g_cardb.items[i].title_id, s->title_id))
+                            company = g_cardb.items[i].company;
                     int port = g_state.mmce_mode[0] ? 0 : (g_state.mmce_mode[1] ? 1 : 0);
-                    mcp_gameid(port, gc, "", s->name[0] ? s->name : s->title_id);
+                    mcp_gameid(port, gc, company, s->name[0] ? s->name : s->title_id);
                 }
             }
             clamp_scroll(&g_sv_sel, &g_sv_scroll, g_server.count);

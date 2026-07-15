@@ -500,6 +500,35 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
         return -1;
     }
 
+    /* --- Handshake: GetDeviceID (0x8B 0x00, 1 MHz) — mirrors Swiss/libogc2's
+     * sequence and doubles as detection: a plain card / floating bus answers
+     * all-zeros or all-ones. --- */
+    u32 dev_id = 0;
+    {
+        if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) {
+            snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port);
+            return -2;
+        }
+        if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED1MHZ)) {
+            EXI_Unlock(chan);
+            snprintf(msg, msg_size, "Slot %c select failed", 'A' + port);
+            return -3;
+        }
+        u8 hcmd[2] = { 0x8B, 0x00 };
+        bool herr = false;
+        herr |= !EXI_ImmEx(chan, hcmd, sizeof(hcmd), EXI_WRITE);
+        herr |= !EXI_ImmEx(chan, &dev_id, sizeof(dev_id), EXI_READ);
+        herr |= !EXI_Deselect(chan);
+        EXI_Unlock(chan);
+        if (herr) { snprintf(msg, msg_size, "GetDeviceID xfer failed"); return -8; }
+        if (dev_id == 0 || dev_id == 0xFFFFFFFF) {
+            snprintf(msg, msg_size,
+                     "Slot %c: no MMCE reply (id=%08lx) - plain card?",
+                     'A' + port, (unsigned long)dev_id);
+            return -9;
+        }
+    }
+
     /* --- SetDiskID: 0x8B 0x11 + gamename[4] + company[2] + disknum/gamever --- */
     if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) {
         snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port);
@@ -542,6 +571,8 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
     EXI_Unlock(chan);
     if (err) { snprintf(msg, msg_size, "SetDiskInfo failed"); return -7; }
 
-    snprintf(msg, msg_size, "GameID %.4s set on slot %c", gamecode, 'A' + port);
+    snprintf(msg, msg_size, "GameID %.4s%.2s sent, slot %c (dev %08lx)",
+             gamecode, (company && company[0]) ? company : "00",
+             'A' + port, (unsigned long)dev_id);
     return 0;
 }

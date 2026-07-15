@@ -300,9 +300,11 @@ void roms_scan_local(LocalRomList *out) {
 
     char dir[128];
     roms_games_dir(dir, sizeof(dir));
+    errno = 0;
     DIR *d = opendir(dir);
     if (!d) {
-        snprintf(out->last_error, sizeof(out->last_error), "Cannot open %s", dir);
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "Cannot open %s (errno %d)", dir, errno);
         return;
     }
 
