@@ -803,9 +803,16 @@ static void mcp_gameid(int port, const char *gamecode, const char *company, cons
     }
     char msg[128];
     int rc = saves_mcp_set_gameid(port, gamecode, company, name, msg, sizeof(msg));
-    /* The device re-attaches its virtual card after a channel switch; don't
-     * auto-rescan into that window — let the user press X once it settles. */
-    if (rc < 0) ui_error("%s", msg); else ui_status("%s - X=rescan when switched", msg);
+    if (rc < 0) { ui_error("%s", msg); redraw(); return; }
+
+    /* The device detaches its virtual card while switching channels
+     * (~0.5-1 s): mounting inside that window reads as "no card" (-3).
+     * Wait it out, then rescan automatically. */
+    ui_status("%s - switching...", msg);
+    redraw();
+    for (int i = 0; i < 150; i++) VIDEO_WaitVSync();   /* ~2.5 s NTSC */
+    scan_card_view(port, port == 0 ? &g_carda : &g_cardb);
+    mark_server_local();
     redraw();
 }
 
