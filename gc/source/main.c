@@ -394,7 +394,10 @@ static int progress_cb(uint64_t done, uint64_t total) {
 static int download_wait_cb(uint32_t ms) {
     PAD_ScanPads();
     if (PAD_ButtonsDown(0) & PAD_BUTTON_B) return 1;
-    if ((ms % 2000) == 0) {
+    /* ms==0 is the parallel loop's per-pass cancel poll — progress_cb owns
+     * the periodic redraw there; only the (single-stream) conversion wait
+     * passes a real elapsed time and wants the "waiting" status. */
+    if (ms && (ms % 2000) == 0) {
         ui_status("Waiting for server... %us (converting? B=cancel)", ms / 1000);
         redraw();
     }

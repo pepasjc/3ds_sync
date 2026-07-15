@@ -67,7 +67,7 @@ int  http_get_stream_cb(const HttpRequest *req,
  * ``total_out`` receives the full content length. */
 int  http_download_parallel(const char *server_url, const char *api_key,
                             const char *path, const char *target_path,
-                            int nconns, HttpProgressFn progress,
-                            uint64_t *total_out);
+                            uint64_t start_offset, int nconns,
+                            HttpProgressFn progress, uint64_t *total_out);
 
 #endif /* GCSYNC_HTTP_H */

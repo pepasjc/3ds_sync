@@ -428,14 +428,15 @@ typedef struct {
     int      state;     /* 0 = reading headers, 1 = body, 2 = done */
     char     hbuf[RECV_BUF_SIZE];
     int      hlen;
+    uint64_t start;     /* first file offset of this range */
     uint64_t foff;      /* file offset to write next */
     uint64_t remaining; /* body bytes still expected */
 } PConn;
 
 int http_download_parallel(const char *server_url, const char *api_key,
                            const char *path, const char *target_path,
-                           int nconns, HttpProgressFn progress,
-                           uint64_t *total_out) {
+                           uint64_t start_offset, int nconns,
+                           HttpProgressFn progress, uint64_t *total_out) {
     if (total_out) *total_out = 0;
     if (nconns < 2) nconns = 2;
     if (nconns > HTTP_MAX_CONNS) nconns = HTTP_MAX_CONNS;
@@ -463,23 +464,34 @@ int http_download_parallel(const char *server_url, const char *api_key,
     net_close(pfd);
     if (phlen == -2) return 1;
     if (pstatus != 206 || total == 0) return -9;   /* no range support -> fall back */
+    if (total_out) *total_out = total;
 
-    /* One connection per range. */
     char part[640];
     snprintf(part, sizeof(part), "%s.part", target_path);
-    int outfd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+
+    /* Already complete (resume offset == size): just finalize. */
+    if (start_offset >= total) {
+        if (rename(part, target_path) != 0) { unlink(target_path); rename(part, target_path); }
+        return 0;
+    }
+
+    /* Preserve the existing prefix when resuming; only truncate a fresh dl. */
+    int outfd = open(part, O_WRONLY | O_CREAT | (start_offset ? 0 : O_TRUNC), 0666);
     if (outfd < 0) return -2;
 
+    /* Split the remaining [start_offset, total) span across the connections. */
     PConn c[HTTP_MAX_CONNS];
-    uint64_t per = total / (uint64_t)nconns;
+    uint64_t span = total - start_offset;
+    uint64_t per = span / (uint64_t)nconns;
+    if (per == 0) { nconns = 1; per = span; }
     int rc = 0;
     int opened = 0;
     for (int i = 0; i < nconns; i++) {
-        uint64_t s = (uint64_t)i * per;
+        uint64_t s = start_offset + (uint64_t)i * per;
         uint64_t e = (i == nconns - 1) ? (total - 1) : (s + per - 1);
         c[i].fd = open_range(host, port, api_key, path, s, e);
         if (c[i].fd < 0) { rc = -1; break; }
-        c[i].state = 0; c[i].hlen = 0; c[i].foff = s; c[i].remaining = 0;
+        c[i].state = 0; c[i].hlen = 0; c[i].start = s; c[i].foff = s; c[i].remaining = 0;
         opened++;
     }
 
@@ -521,22 +533,33 @@ int http_download_parallel(const char *server_url, const char *api_key,
         }
         if (rc != 0) break;
         if (active == 0) break;   /* all done */
-        if (progress) progress(done, total);
+        if (progress) progress(start_offset + done, total);
         if (g_wait_cb && g_wait_cb(0)) { rc = 1; break; }
         if (!any_data) usleep(1000);
     }
 
-    /* Close any still-open connections. */
     for (int i = 0; i < opened; i++)
         if (c[i].state != 2) net_close(c[i].fd);
     close(outfd);
 
-    if (rc != 0) { unlink(part); return rc; }
-    if (done != total) { unlink(part); return -3; }
-    if (rename(part, target_path) != 0) {
-        unlink(target_path);
-        if (rename(part, target_path) != 0) return -2;
+    if (rc == 0 && done == span) {
+        if (rename(part, target_path) != 0) {
+            unlink(target_path);
+            if (rename(part, target_path) != 0) return -2;
+        }
+        if (progress) progress(total, total);
+        return 0;
     }
-    if (total_out) *total_out = total;
-    return 0;
+
+    /* Cancel or error: keep the .part but report the largest CONTIGUOUS
+     * prefix that is fully written (out-of-order surplus past it is
+     * overwritten on resume), so the next run resumes correctly. */
+    uint64_t prefix = start_offset;
+    for (int i = 0; i < opened; i++) {
+        if (c[i].start != prefix) break;   /* gap before this range */
+        prefix = c[i].foff;
+        if (c[i].state != 2) break;        /* range incomplete */
+    }
+    if (progress) progress(prefix, total);   /* -> resume offset for the caller */
+    return rc ? rc : -1;
 }
