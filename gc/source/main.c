@@ -148,9 +148,12 @@ static bool edit_text(char *out, size_t cap, const char *label) {
     int cur = len;
     int maxlen = (int)(cap < sizeof(buf) ? cap : sizeof(buf)) - 1;
 
+    draw_edit(label, buf, cur);
     for (;;) {
+        VIDEO_WaitVSync();
         PAD_ScanPads();
         u32 d = PAD_ButtonsDown(0);
+        if (d == 0) continue;   /* redraw only on input */
 
         if (d & (PAD_BUTTON_A | PAD_BUTTON_START)) {
             strncpy(out, buf, cap - 1); out[cap - 1] = '\0'; return true;
@@ -405,11 +408,12 @@ static bool confirm(const char *fmt, ...) {
     va_end(ap);
     char body[280];
     snprintf(body, sizeof(body), "%s\n\nA = Yes      B = No", msg);
+    ui_clear();
+    ui_draw_message("Confirm", body);
+    ui_draw_footer("A = Yes   B = No");
+    ui_flush();
     for (;;) {
-        ui_clear();
-        ui_draw_message("Confirm", body);
-        ui_draw_footer("A = Yes   B = No");
-        ui_flush();
+        VIDEO_WaitVSync();
         PAD_ScanPads();
         u32 d = PAD_ButtonsDown(0);
         if (d & PAD_BUTTON_A) return true;
@@ -674,8 +678,11 @@ static void cycle_view(int delta) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    PAD_Init();
+    /* VIDEO must come up before PAD: libogc's pad sampling is configured
+     * from the active video mode.  PAD_Init() first works on Dolphin but
+     * leaves the controller dead on real hardware. */
     ui_init();
+    PAD_Init();
 
     show_boot("Mounting SD card...");
     mount_sd(&g_state);
@@ -708,14 +715,22 @@ int main(int argc, char **argv) {
     scan_card_view(1, &g_cardb);
     if (network_is_ready(&g_state)) { fetch_catalog(); fetch_server(); }
 
+    redraw();
+
     bool running = true;
     while (running) {
+        /* Pace the loop at vsync and only redraw on input.  An unthrottled
+         * redraw-every-iteration loop outruns gxflux's frame lifecycle and
+         * wedges the GX FIFO on real hardware (screen freezes, input dead). */
+        VIDEO_WaitVSync();
         PAD_ScanPads();
         u32 down = PAD_ButtonsDown(0);
         u32 held = PAD_ButtonsHeld(0);
 
         const u32 quit_combo = PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_BUTTON_START;
         if ((held & quit_combo) == quit_combo) { running = false; }
+
+        else if (down == 0) continue;   /* nothing pressed - keep last frame */
 
         else if (down & PAD_TRIGGER_L) cycle_view(-1);
         else if (down & PAD_TRIGGER_R) cycle_view(+1);

@@ -78,7 +78,17 @@ void ui_clear(void) {
 }
 
 void ui_flush(void) {
-    gfx_frame_start();
+    /* gxflux contract: gfx_frame_start() returns false while the previous
+     * frame is still in flight (WAITDRAWDONE/WAITVSYNC — it only becomes
+     * READY at the retrace after GX draw-done).  Issuing GX commands anyway
+     * wedges the real Flipper FIFO (hard freeze on hardware; Dolphin's HLE
+     * GX masks it).  Wait a few vsyncs for READY; if it never comes, keep
+     * the previous frame instead of corrupting the pipeline. */
+    int tries = 8;
+    while (!gfx_frame_start()) {
+        if (--tries <= 0) return;
+        VIDEO_WaitVSync();
+    }
     gfx_con_draw();
     gfx_frame_end();
 }

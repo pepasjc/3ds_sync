@@ -76,6 +76,11 @@ static int connect_to(const char *host, int port) {
     int rcvbuf = 128 * 1024;
     net_setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
+    /* Bound recv so a stalled server/connection errors out instead of
+     * blocking the (single-threaded) app forever. */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    net_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
