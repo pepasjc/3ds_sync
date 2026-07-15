@@ -68,6 +68,31 @@ static void card_identity(const char *gamecode, const char *company) {
     CARD_SetCompany(company);
 }
 
+/* CARD_Read / CARD_Write process at most ONE sector per call (libogc clamps
+ * the length to the current sector), so multi-block saves must be looped a
+ * sector at a time or only the first block is transferred. */
+static u32 card_sector_size(int port) {
+    u32 ss = 0;
+    if (CARD_GetSectorSize(port, &ss) < 0 || ss == 0) ss = 8192;
+    return ss;
+}
+
+static s32 card_read_all(card_file *f, u8 *buf, u32 len, u32 ss) {
+    for (u32 off = 0; off < len; off += ss) {
+        s32 rc = CARD_Read(f, buf + off, ss, off);
+        if (rc < 0) return rc;
+    }
+    return 0;
+}
+
+static s32 card_write_all(card_file *f, const u8 *buf, u32 len, u32 ss) {
+    for (u32 off = 0; off < len; off += ss) {
+        s32 rc = CARD_Write(f, (void *)(buf + off), ss, off);
+        if (rc < 0) return rc;
+    }
+    return 0;
+}
+
 /* Mount with retries: transient EXI contention (BBA shares channel 0 with
  * slot A) and slow adapters (MemCard Pro GC) intermittently fail the first
  * attempt with CARD_ERROR_IOERROR.  Genuine no-card errors return at once. */
@@ -202,7 +227,7 @@ int saves_upload_card_game(const SyncState *state, int port, const GcSave *save,
         snprintf(msg, msg_size, "Save too big (%u KB)", (unsigned)(datalen / 1024));
         return -1;
     }
-    rc = CARD_Read(&file, g_gci + 64, datalen, 0);
+    rc = card_read_all(&file, g_gci + 64, datalen, card_sector_size(port));
     CARD_Close(&file);
     CARD_Unmount(port);
     if (rc < 0) { snprintf(msg, msg_size, "Read failed (%d)", rc); return -1; }
@@ -271,7 +296,7 @@ int saves_restore_card_game(const SyncState *state, int port, const char *title_
         return -1;
     }
 
-    rc = CARD_Write(&file, g_gci + 64, datalen, 0);
+    rc = card_write_all(&file, g_gci + 64, datalen, card_sector_size(port));
     if (rc < 0) {
         card_identity(NULL, NULL);
         CARD_Close(&file); CARD_Unmount(port);
