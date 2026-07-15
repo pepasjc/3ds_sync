@@ -661,6 +661,39 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
         if (err) { snprintf(msg, msg_size, "SetGameID failed"); return -12; }
     }
 
+    /* --- FlipperMCE-family: read the stored game name back (0x8B 0x12,
+     * response = 64 name bytes + 1 terminator — drain all 65 or the device
+     * FIFO desyncs).  Confirms on screen whether our writes actually parsed:
+     * echo OK but no switch = device-side (settings / game DB). --- */
+    if ((dev_id >> 16) == 0x3842) {
+        char echo[65];
+        memset(echo, 0, sizeof(echo));
+        if (EXI_Lock(chan, EXI_DEVICE_0, NULL)) {
+            if (EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+                u8 gcmd[3] = { 0x8B, 0x12, 0x00 };
+                bool gerr = false;
+                gerr |= !EXI_ImmEx(chan, gcmd, sizeof(gcmd), EXI_WRITE);
+                gerr |= !EXI_ImmEx(chan, echo, 65, EXI_READ);
+                EXI_Deselect(chan);
+                EXI_Unlock(chan);
+                echo[64] = '\0';
+                if (!gerr && strncmp(echo, info, sizeof(echo) - 1) == 0) {
+                    snprintf(msg, msg_size, "GameID %.4s OK+verified, slot %c",
+                             gamecode, 'A' + port);
+                    return 0;
+                }
+                if (!gerr) {
+                    snprintf(msg, msg_size,
+                             "GameID sent but echo='%.12s' != '%.12s'",
+                             echo, info);
+                    return 0;   /* commands may still have landed */
+                }
+            } else {
+                EXI_Unlock(chan);
+            }
+        }
+    }
+
     snprintf(msg, msg_size, "GameID %.4s%.2s sent, slot %c (dev %08lx)",
              gamecode, (company && company[0]) ? company : "00",
              'A' + port, (unsigned long)dev_id);
