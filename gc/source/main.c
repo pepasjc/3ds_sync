@@ -625,15 +625,18 @@ static void draw_card(const GcSaveList *list, int sel, int scroll) {
                 list->last_error[0] ? list->last_error : "No saves on this card.");
         return;
     }
-    int namew = ui_cols() - 18;
+    int namew = ui_cols() - 25;
     if (namew < 8) namew = 8;
     for (int i = 0; i < vis; i++) {
         int idx = scroll + i;
         if (idx >= list->count) break;
         const GcSave *s = &list->items[idx];
-        const char *nm = s->name[0] ? s->name : s->title_id;
+        /* Game ID first (like a real memory card), then server name or the
+         * on-card filename as description. */
+        const char *nm = s->name[0] ? s->name : s->filename;
         char line[200];
-        snprintf(line, sizeof(line), " %-*.*s %4d blk", namew, namew, nm, s->blocks);
+        snprintf(line, sizeof(line), " %s%s %-*.*s %4d blk",
+                 s->gamecode, s->company, namew, namew, nm, s->blocks);
         ui_text_hl(top + i, idx == sel, UI_WHITE, "%s", line);
     }
 }
