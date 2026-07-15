@@ -132,25 +132,12 @@ int network_download_rom_resumable(const SyncState *state,
     char path[512];
     build_rom_download_path(path, sizeof(path), rom_id, extract_fmt);
 
-    /* Split into parallel range streams to beat libogc's single-MSS TCP
-     * window (works for fresh and resumed downloads).  Servers that ignore
-     * Range return -9 and fall through to the single-stream path below.
-     * The parallel path reports absolute progress, so no progress_base. */
-    {
-        uint64_t ptotal = 0;
-        uint64_t saved_base = g_progress_base;
-        g_progress_base = 0;
-        int prc = http_download_parallel(state->server_url, state->api_key, path,
-                                         target_path, start_offset, 4,
-                                         progress_bridge, &ptotal);
-        g_progress_base = saved_base;
-        if (prc != -9) {
-            if (total_out && ptotal > 0) *total_out = ptotal;
-            if (prc == 1) return 1;                 /* paused (offset via progress cb) */
-            if (prc < 0) return (prc == -3) ? -3 : (prc == -2 ? -2 : -1);
-            return 0;
-        }
-    }
+    /* NOTE: parallel range download (http_download_parallel) is disabled — its
+     * out-of-order positioned writes to distant file offsets thrash libfat
+     * (FAT cluster-chain walk per write) and collapse to ~8 KB/s.  A
+     * FAT-friendly striped writer or a libogc2 migration (bigger TCP_WND) is
+     * the real fix; until then use the sequential single-stream path, which
+     * batches into large sequential SD writes. */
 
     char part[640];
     snprintf(part, sizeof(part), "%s.part", target_path);
