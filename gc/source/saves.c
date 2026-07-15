@@ -601,6 +601,24 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
     EXI_Unlock(chan);
     if (err) { snprintf(msg, msg_size, "SetDiskInfo failed"); return -7; }
 
+    /* --- SetGameID: 0x8B 0x1D + the same 10-byte id (gamecode + company +
+     * disknum/gamever hex).  This is the opcode the firmware keys the channel
+     * switch on (0x1D is also the id byte Swiss broadcasts over SI);
+     * SetDiskID/SetDiskInfo alone only update the device's game info. --- */
+    if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) { snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port); return -10; }
+    if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+        EXI_Unlock(chan);
+        snprintf(msg, msg_size, "Slot %c select3 failed", 'A' + port);
+        return -11;
+    }
+    u8 cmd3[2] = { 0x8B, 0x1D };
+    err = false;
+    err |= !EXI_ImmEx(chan, cmd3, sizeof(cmd3), EXI_WRITE);
+    err |= !EXI_ImmEx(chan, &cmd[2], 10, EXI_WRITE);   /* id built for SetDiskID */
+    err |= !EXI_Deselect(chan);
+    EXI_Unlock(chan);
+    if (err) { snprintf(msg, msg_size, "SetGameID failed"); return -12; }
+
     snprintf(msg, msg_size, "GameID %.4s%.2s sent, slot %c (dev %08lx)",
              gamecode, (company && company[0]) ? company : "00",
              'A' + port, (unsigned long)dev_id);

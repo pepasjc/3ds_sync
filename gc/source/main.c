@@ -770,15 +770,18 @@ static void draw_vmc(void) {
     }
 
     int rows = vis - 1;   /* banner uses the first row */
-    int namew = ui_cols() - 18;
+    int namew = ui_cols() - 25;
     if (namew < 8) namew = 8;
     for (int i = 0; i < rows; i++) {
         int idx = g_vmc_scroll + i;
         if (idx >= g_vmccard.count) break;
         const VmcfsSave *s = &g_vmccard.saves[idx];
-        const char *nm = s->name[0] ? s->name : (s->filename[0] ? s->filename : s->title_id);
+        /* Lead with the game ID (like a real memory card); the server name
+         * when known, otherwise the on-card filename, as description. */
+        const char *nm = s->name[0] ? s->name : s->filename;
         char line[200];
-        snprintf(line, sizeof(line), " %-*.*s %4d blk", namew, namew, nm, s->blocks);
+        snprintf(line, sizeof(line), " %s%s %-*.*s %4d blk",
+                 s->gamecode, s->company, namew, namew, nm, s->blocks);
         ui_text_hl(top + 1 + i, idx == g_vmc_sel, UI_WHITE, "%s", line);
     }
 }
