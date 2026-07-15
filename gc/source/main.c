@@ -522,15 +522,19 @@ static bool confirm(const char *fmt, ...) {
     }
 }
 
+/* Overlay server names, but only real ones: the server falls back to the
+ * title_id when it has no name, and the scan already filled names from the
+ * saves' own comment fields — don't clobber those. */
 static void fill_card_names(GcSaveList *list) {
     for (int i = 0; i < list->count; i++) {
-        list->items[i].name[0] = '\0';
         for (int j = 0; j < g_server.count; j++) {
-            if (strcmp(g_server.items[j].title_id, list->items[i].title_id) == 0) {
-                strncpy(list->items[i].name, g_server.items[j].name,
+            const ServerSave *sv = &g_server.items[j];
+            if (strcmp(sv->title_id, list->items[i].title_id) != 0) continue;
+            if (sv->name[0] && strcmp(sv->name, sv->title_id) != 0) {
+                strncpy(list->items[i].name, sv->name,
                         sizeof(list->items[i].name) - 1);
-                break;
             }
+            break;
         }
     }
 }
@@ -665,13 +669,14 @@ static void draw_server(int sel, int scroll) {
 
 static void fill_vmccard_names(void) {
     for (int i = 0; i < g_vmccard.count; i++) {
-        g_vmccard.saves[i].name[0] = '\0';
         for (int j = 0; j < g_server.count; j++) {
-            if (strcmp(g_server.items[j].title_id, g_vmccard.saves[i].title_id) == 0) {
-                strncpy(g_vmccard.saves[i].name, g_server.items[j].name,
+            const ServerSave *sv = &g_server.items[j];
+            if (strcmp(sv->title_id, g_vmccard.saves[i].title_id) != 0) continue;
+            if (sv->name[0] && strcmp(sv->name, sv->title_id) != 0) {
+                strncpy(g_vmccard.saves[i].name, sv->name,
                         sizeof(g_vmccard.saves[i].name) - 1);
-                break;
             }
+            break;
         }
     }
 }

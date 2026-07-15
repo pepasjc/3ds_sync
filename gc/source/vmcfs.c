@@ -21,6 +21,22 @@
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static uint32_t rd32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | p[3];
+}
+
+/* Printable copy of a 32-byte save comment (line 1 = game title). */
+static void copy_comment(const uint8_t *src, char *out, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; i < 32 && j + 1 < out_size; i++) {
+        unsigned char ch = src[i];
+        if (ch == 0) break;
+        if (ch >= 0x20 && ch < 0x7F) out[j++] = (char)ch;
+    }
+    while (j > 0 && out[j - 1] == ' ') j--;
+    out[j] = '\0';
+}
 
 static void checksums_be(const uint8_t *data, uint32_t len,
                          uint16_t *csum, uint16_t *inv) {
@@ -122,13 +138,33 @@ bool vmcfs_open(VmcfsCard *c, const char *path) {
     if (ok && rd16(alt + 4) > rd16(c->bam + 4))
         memcpy(c->bam, alt, VMCFS_BLOCK);
 
-    fclose(fp);
     if (!ok) {
+        fclose(fp);
         snprintf(c->last_error, sizeof(c->last_error), "read failed");
         return false;
     }
 
     parse_dir(c);
+
+    /* Fill display names from each save's comment field (32-byte game title
+     * at comment_addr inside the save data) — what a real card shows. */
+    for (int i = 0; i < c->count; i++) {
+        VmcfsSave *s = &c->saves[i];
+        uint32_t cmt = rd32(c->dir + s->dir_index * DENTRY + 0x3C);
+        if (cmt == 0xFFFFFFFF) continue;
+        uint32_t hop = cmt / VMCFS_BLOCK;
+        uint32_t off = cmt % VMCFS_BLOCK;
+        if (hop >= s->blocks || off + 32 > VMCFS_BLOCK) continue;
+        uint16_t block = s->first_block;
+        for (uint32_t h = 0; h < hop; h++) block = bam_get(c, block);
+        if (block < FST_BLOCKS || block >= c->total_blocks) continue;
+        uint8_t cbuf[32];
+        if (fseek(fp, (long)block * VMCFS_BLOCK + (long)off, SEEK_SET) == 0 &&
+            fread(cbuf, 1, 32, fp) == 32)
+            copy_comment(cbuf, s->name, sizeof(s->name));
+    }
+
+    fclose(fp);
     return true;
 }
 

@@ -34,6 +34,18 @@ void saves_title_id_from_gamecode(const char *gamecode, char *out, size_t out_si
     snprintf(out, out_size, "GC_%s", code);
 }
 
+/* Printable copy of a 32-byte save comment (line 1 = game title). */
+static void copy_comment(const u8 *src, char *out, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; i < 32 && j + 1 < out_size; i++) {
+        unsigned char ch = src[i];
+        if (ch == 0) break;
+        if (ch >= 0x20 && ch < 0x7F) out[j++] = (char)ch;
+    }
+    while (j > 0 && out[j - 1] == ' ') j--;
+    out[j] = '\0';
+}
+
 static const char *card_err_str(int rc) {
     switch (rc) {
         case CARD_ERROR_NOCARD:      return "no card in slot";
@@ -100,6 +112,28 @@ void saves_scan_card(int port, GcSaveList *out) {
         s->blocks = (int)(d->filelen / GC_BLOCK_SIZE);
         saves_title_id_from_gamecode(s->gamecode, s->title_id, sizeof(s->title_id));
         out->count++;
+    }
+
+    /* Fill display names from each save's comment field (the game title a
+     * real memory-card manager shows).  CARD_Read is sector-granular, so
+     * read the sector containing comment_addr and extract 32 bytes. */
+    u32 ssize = 0;
+    if (CARD_GetSectorSize(port, &ssize) < 0 || ssize == 0 || ssize > SAVES_GCI_MAX)
+        ssize = 8192;
+    for (int i = 0; i < out->count; i++) {
+        GcSave *s = &out->items[i];
+        card_file f;
+        if (CARD_Open(port, s->filename, &f) < 0) continue;
+        card_direntry de;
+        if (CARD_GetStatusEx(port, f.filenum, &de) >= 0 &&
+            de.comment_addr != 0xFFFFFFFF) {
+            u32 sec = (de.comment_addr / ssize) * ssize;
+            u32 off = de.comment_addr - sec;
+            if (off + 32 <= ssize && sec + ssize <= (u32)f.len &&
+                CARD_Read(&f, g_gci, ssize, sec) >= 0)
+                copy_comment(g_gci + off, s->name, sizeof(s->name));
+        }
+        CARD_Close(&f);
     }
     CARD_Unmount(port);
 
@@ -590,34 +624,42 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
         snprintf(msg, msg_size, "Slot %c select2 failed", 'A' + port);
         return -6;
     }
+    /* FlipperMCE's SET_GAME_NAME handler consumes bytes only up to the
+     * terminating NUL — clocking a full zero-padded 64-byte buffer leaves
+     * ~50 stale bytes in its command FIFO and desyncs the device.  Send
+     * exactly strlen+1 bytes. */
     u8 cmd2[2] = { 0x8B, 0x13 };
     char info[64];
     memset(info, 0, sizeof(info));
     if (name) strncpy(info, name, sizeof(info) - 1);
+    u32 info_len = (u32)strlen(info) + 1;
     err = false;
     err |= !EXI_ImmEx(chan, cmd2, sizeof(cmd2), EXI_WRITE);
-    err |= !EXI_ImmEx(chan, info, sizeof(info), EXI_WRITE);
+    err |= !EXI_ImmEx(chan, info, info_len, EXI_WRITE);
     err |= !EXI_Deselect(chan);
     EXI_Unlock(chan);
     if (err) { snprintf(msg, msg_size, "SetDiskInfo failed"); return -7; }
 
-    /* --- SetGameID: 0x8B 0x1D + the same 10-byte id (gamecode + company +
-     * disknum/gamever hex).  This is the opcode the firmware keys the channel
-     * switch on (0x1D is also the id byte Swiss broadcasts over SI);
-     * SetDiskID/SetDiskInfo alone only update the device's game info. --- */
-    if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) { snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port); return -10; }
-    if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+    /* --- SetGameID (0x8B 0x1D + 10-byte id): libogc2/MemCard Pro opcode.
+     * FlipperMCE-family devices (GetDeviceID answers 0x3842...) do NOT
+     * implement 0x1D — their channel switch keys on SetDiskID (0x11) — and
+     * an unknown command with trailing payload desyncs their FIFO, so skip
+     * it for them. --- */
+    if ((dev_id >> 16) != 0x3842) {
+        if (!EXI_Lock(chan, EXI_DEVICE_0, NULL)) { snprintf(msg, msg_size, "Slot %c EXI busy", 'A' + port); return -10; }
+        if (!EXI_Select(chan, EXI_DEVICE_0, EXI_SPEED16MHZ)) {
+            EXI_Unlock(chan);
+            snprintf(msg, msg_size, "Slot %c select3 failed", 'A' + port);
+            return -11;
+        }
+        u8 cmd3[2] = { 0x8B, 0x1D };
+        err = false;
+        err |= !EXI_ImmEx(chan, cmd3, sizeof(cmd3), EXI_WRITE);
+        err |= !EXI_ImmEx(chan, &cmd[2], 10, EXI_WRITE);   /* id built for SetDiskID */
+        err |= !EXI_Deselect(chan);
         EXI_Unlock(chan);
-        snprintf(msg, msg_size, "Slot %c select3 failed", 'A' + port);
-        return -11;
+        if (err) { snprintf(msg, msg_size, "SetGameID failed"); return -12; }
     }
-    u8 cmd3[2] = { 0x8B, 0x1D };
-    err = false;
-    err |= !EXI_ImmEx(chan, cmd3, sizeof(cmd3), EXI_WRITE);
-    err |= !EXI_ImmEx(chan, &cmd[2], 10, EXI_WRITE);   /* id built for SetDiskID */
-    err |= !EXI_Deselect(chan);
-    EXI_Unlock(chan);
-    if (err) { snprintf(msg, msg_size, "SetGameID failed"); return -12; }
 
     snprintf(msg, msg_size, "GameID %.4s%.2s sent, slot %c (dev %08lx)",
              gamecode, (company && company[0]) ? company : "00",
