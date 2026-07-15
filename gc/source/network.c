@@ -132,6 +132,21 @@ int network_download_rom_resumable(const SyncState *state,
     char path[512];
     build_rom_download_path(path, sizeof(path), rom_id, extract_fmt);
 
+    /* Fresh downloads: split into parallel range streams to beat libogc's
+     * single-MSS TCP window.  Resumes (start_offset>0) and servers that
+     * ignore Range fall through to the single-stream path below. */
+    if (start_offset == 0) {
+        uint64_t ptotal = 0;
+        int prc = http_download_parallel(state->server_url, state->api_key, path,
+                                         target_path, 4, progress_bridge, &ptotal);
+        if (prc != -9) {
+            if (total_out && ptotal > 0) *total_out = ptotal;
+            if (prc == 1) return 1;
+            if (prc < 0) return (prc == -3) ? -3 : (prc == -2 ? -2 : -1);
+            return 0;
+        }
+    }
+
     char part[640];
     snprintf(part, sizeof(part), "%s.part", target_path);
 

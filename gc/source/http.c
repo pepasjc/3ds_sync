@@ -371,3 +371,172 @@ int http_get_stream(const HttpRequest *req,
     if (out_fp) fflush(out_fp);
     return rc;
 }
+
+/* ---- Parallel range download ---- */
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#define HTTP_MAX_CONNS 6
+
+/* Find "\r\n\r\n" in a non-terminated byte buffer. */
+static char *find_eoh(char *buf, int len) {
+    for (int i = 0; i + 3 < len; i++)
+        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n')
+            return buf + i;
+    return NULL;
+}
+
+/* Parse "Content-Range: bytes S-E/TOTAL" -> TOTAL (0 if absent). */
+static uint64_t parse_content_range_total(const char *headers, size_t hlen) {
+    const char *needle = "content-range:";
+    size_t nlen = strlen(needle);
+    for (size_t i = 0; i + nlen < hlen; i++) {
+        bool m = true;
+        for (size_t j = 0; j < nlen; j++)
+            if (tolower((unsigned char)headers[i + j]) != needle[j]) { m = false; break; }
+        if (!m) continue;
+        const char *p = headers + i + nlen;
+        const char *slash = strchr(p, '/');
+        if (!slash || (size_t)(slash - headers) >= hlen) return 0;
+        return strtoull(slash + 1, NULL, 10);
+    }
+    return 0;
+}
+
+/* Send a bounded GET (bytes=start-end) on a fresh connection; returns fd. */
+static int open_range(const char *host, int port, const char *api_key,
+                      const char *path, uint64_t start, uint64_t end) {
+    int fd = connect_to(host, port);
+    if (fd < 0) return fd;
+    char req[1024];
+    int n = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.0\r\nHost: %s:%d\r\nX-API-Key: %s\r\n"
+        "User-Agent: gcsync/" APP_VERSION "\r\nConnection: close\r\n"
+        "Range: bytes=%llu-%llu\r\n\r\n",
+        path, host, port, api_key ? api_key : "",
+        (unsigned long long)start, (unsigned long long)end);
+    if (n < 0 || (size_t)n >= sizeof(req) || send_all(fd, req, n) < 0) {
+        net_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+typedef struct {
+    int      fd;
+    int      state;     /* 0 = reading headers, 1 = body, 2 = done */
+    char     hbuf[RECV_BUF_SIZE];
+    int      hlen;
+    uint64_t foff;      /* file offset to write next */
+    uint64_t remaining; /* body bytes still expected */
+} PConn;
+
+int http_download_parallel(const char *server_url, const char *api_key,
+                           const char *path, const char *target_path,
+                           int nconns, HttpProgressFn progress,
+                           uint64_t *total_out) {
+    if (total_out) *total_out = 0;
+    if (nconns < 2) nconns = 2;
+    if (nconns > HTTP_MAX_CONNS) nconns = HTTP_MAX_CONNS;
+
+    char host[64]; int port; char dummy[8];
+    if (parse_url(server_url, host, sizeof(host), &port, dummy, sizeof(dummy)) != 0)
+        return -1;
+
+    /* Probe: one-byte range to learn the total size and confirm 206 support.
+     * Also triggers (and caches) any server-side conversion. */
+    int pfd = connect_to(host, port);
+    if (pfd < 0) return -1;
+    {
+        char req[1024];
+        int n = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.0\r\nHost: %s:%d\r\nX-API-Key: %s\r\n"
+            "Connection: close\r\nRange: bytes=0-0\r\n\r\n",
+            path, host, port, api_key ? api_key : "");
+        if (n < 0 || send_all(pfd, req, n) < 0) { net_close(pfd); return -1; }
+    }
+    char pbuf[RECV_BUF_SIZE]; size_t ptot = 0;
+    int phlen = read_headers(pfd, pbuf, sizeof(pbuf), &ptot);
+    int pstatus = phlen >= 0 ? parse_status(pbuf) : 0;
+    uint64_t total = phlen >= 0 ? parse_content_range_total(pbuf, (size_t)phlen) : 0;
+    net_close(pfd);
+    if (phlen == -2) return 1;
+    if (pstatus != 206 || total == 0) return -9;   /* no range support -> fall back */
+
+    /* One connection per range. */
+    char part[640];
+    snprintf(part, sizeof(part), "%s.part", target_path);
+    int outfd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (outfd < 0) return -2;
+
+    PConn c[HTTP_MAX_CONNS];
+    uint64_t per = total / (uint64_t)nconns;
+    int rc = 0;
+    int opened = 0;
+    for (int i = 0; i < nconns; i++) {
+        uint64_t s = (uint64_t)i * per;
+        uint64_t e = (i == nconns - 1) ? (total - 1) : (s + per - 1);
+        c[i].fd = open_range(host, port, api_key, path, s, e);
+        if (c[i].fd < 0) { rc = -1; break; }
+        c[i].state = 0; c[i].hlen = 0; c[i].foff = s; c[i].remaining = 0;
+        opened++;
+    }
+
+    static char chunk[32768];
+    uint64_t done = 0;
+    while (rc == 0) {
+        int active = 0;
+        bool any_data = false;
+        for (int i = 0; i < opened; i++) {
+            if (c[i].state == 2) continue;
+            active++;
+            int n = net_recv(c[i].fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+            if (n == 0) { c[i].state = 2; net_close(c[i].fd); continue; }
+            if (n < 0) {
+                if (n == -EWOULDBLOCK || n == -EAGAIN) continue;
+                rc = -1; break;
+            }
+            any_data = true;
+            const char *body = chunk; int blen = n;
+            if (c[i].state == 0) {
+                int take = n; if (c[i].hlen + take > (int)sizeof(c[i].hbuf)) take = sizeof(c[i].hbuf) - c[i].hlen;
+                memcpy(c[i].hbuf + c[i].hlen, chunk, take);
+                c[i].hlen += take;
+                char *eoh = find_eoh(c[i].hbuf, c[i].hlen);
+                if (!eoh) continue;
+                int hl = (int)(eoh - c[i].hbuf) + 4;
+                if (parse_status(c[i].hbuf) != 206) { rc = -3; break; }   /* must be partial */
+                c[i].remaining = parse_content_length(c[i].hbuf, hl);
+                body = c[i].hbuf + hl; blen = c[i].hlen - hl;
+                c[i].state = 1;
+            }
+            if (blen > 0) {
+                if ((uint64_t)blen > c[i].remaining) blen = (int)c[i].remaining;
+                if (lseek(outfd, (off_t)c[i].foff, SEEK_SET) < 0 ||
+                    write(outfd, body, blen) != blen) { rc = -2; break; }
+                c[i].foff += blen; c[i].remaining -= blen; done += blen;
+                if (c[i].remaining == 0) { c[i].state = 2; net_close(c[i].fd); }
+            }
+        }
+        if (rc != 0) break;
+        if (active == 0) break;   /* all done */
+        if (progress) progress(done, total);
+        if (g_wait_cb && g_wait_cb(0)) { rc = 1; break; }
+        if (!any_data) usleep(1000);
+    }
+
+    /* Close any still-open connections. */
+    for (int i = 0; i < opened; i++)
+        if (c[i].state != 2) net_close(c[i].fd);
+    close(outfd);
+
+    if (rc != 0) { unlink(part); return rc; }
+    if (done != total) { unlink(part); return -3; }
+    if (rename(part, target_path) != 0) {
+        unlink(target_path);
+        if (rename(part, target_path) != 0) return -2;
+    }
+    if (total_out) *total_out = total;
+    return 0;
+}

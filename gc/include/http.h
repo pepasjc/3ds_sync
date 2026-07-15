@@ -57,4 +57,17 @@ int  http_get_stream_cb(const HttpRequest *req,
                         HttpProgressFn progress,
                         HttpResponseInfo *info_out);
 
+/* Parallel range download: split the resource into ``nconns`` byte-range
+ * TCP streams (each with its own tiny lwIP window, so aggregate throughput
+ * is ~nconns x a single stream) and write positioned into target_path.part,
+ * renaming to target_path on success.
+ *
+ * Returns: 0 ok / 1 paused (wait-cb cancel) / -1 net / -2 fs / -3 HTTP /
+ *          -9 range not supported (caller should fall back to single stream).
+ * ``total_out`` receives the full content length. */
+int  http_download_parallel(const char *server_url, const char *api_key,
+                            const char *path, const char *target_path,
+                            int nconns, HttpProgressFn progress,
+                            uint64_t *total_out);
+
 #endif /* GCSYNC_HTTP_H */
