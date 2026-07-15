@@ -436,6 +436,32 @@ static void run_active_download(DownloadEntry *e) {
     redraw();
 }
 
+/* One pass over the queue: run everything runnable, in order.  A download
+ * the user cancels (B -> paused) stops the run; an error moves on to the
+ * next entry. */
+static void run_download_queue(void) {
+    if (!g_state.sd_ready) { ui_error("No SD - cannot download"); return; }
+    int done = 0, failed = 0;
+    bool stopped = false;
+    for (int i = 0; i < g_downloads.count && !stopped; i++) {
+        DownloadEntry *e = &g_downloads.items[i];
+        if (e->status != DL_STATUS_QUEUED &&
+            e->status != DL_STATUS_PAUSED &&
+            e->status != DL_STATUS_ERROR)
+            continue;
+        run_active_download(e);
+        switch (e->status) {
+            case DL_STATUS_COMPLETED: done++; break;
+            case DL_STATUS_PAUSED:    stopped = true; break;   /* user cancel */
+            default:                  failed++; break;
+        }
+    }
+    if (done > 0) scan_local();
+    ui_status("Queue: %d done, %d failed%s", done, failed,
+              stopped ? ", stopped" : "");
+    redraw();
+}
+
 static void queue_selected_rom(bool run_now) {
     if (!g_state.sd_ready) { ui_error("No SD - cannot install"); return; }
     if (g_catalog.count == 0 || g_rom_sel >= g_catalog.count) return;
@@ -838,7 +864,7 @@ static const char *hint_for(AppView v) {
         case APP_VIEW_CONFIG:    return "Up/Dn=select  L/R=change  A=edit/save        L+R+Start=quit";
         case APP_VIEW_ROMS:      return "A=fetch  X=queue  Y=download now  L/R=view    L+R+Start=quit";
         case APP_VIEW_LOCAL:     return "A=rescan  X=delete  L/R=switch view           L+R+Start=quit";
-        case APP_VIEW_DOWNLOADS: return "A=start/resume  X=remove  (B=pause)           L+R+Start=quit";
+        case APP_VIEW_DOWNLOADS: return "A=start one  Y=run all  X=remove  B=pause     L+R+Start=quit";
         case APP_VIEW_SAVES:     return "A=upload  Y=restore  Z=next card  X=rescan  Start=import all";
         case APP_VIEW_CARDA:
         case APP_VIEW_CARDB:     return "A=upload  Y=restore  Z=GameID  X=rescan        L+R+Start=quit";
@@ -993,6 +1019,7 @@ int main(int argc, char **argv) {
             else if (down & PAD_BUTTON_A) {
                 if (c > 0 && g_dl_sel < c) run_active_download(&g_downloads.items[g_dl_sel]);
             }
+            else if (down & PAD_BUTTON_Y) run_download_queue();
             else if (down & PAD_BUTTON_X) {
                 if (c > 0 && g_dl_sel < c) {
                     downloads_remove(&g_downloads, g_downloads.items[g_dl_sel].rom_id);
