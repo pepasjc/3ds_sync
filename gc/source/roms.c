@@ -27,11 +27,12 @@ void roms_set_target(const char *sd_root, const char *games_folder) {
         g_sd_root[sizeof(g_sd_root) - 1] = '\0';
     }
     if (games_folder && games_folder[0]) {
-        /* normalise to a leading-slash, no-trailing-slash folder */
+        /* normalise to a leading-slash, no-trailing-slash folder;
+         * "/" (SD root — the GC Loader convention) becomes "". */
         snprintf(g_games_folder, sizeof(g_games_folder), "%s%s",
                  games_folder[0] == '/' ? "" : "/", games_folder);
         size_t n = strlen(g_games_folder);
-        while (n > 1 && g_games_folder[n - 1] == '/') g_games_folder[--n] = '\0';
+        while (n > 0 && g_games_folder[n - 1] == '/') g_games_folder[--n] = '\0';
     }
     snprintf(g_downloads_file, sizeof(g_downloads_file),
              "%s%s/downloads.dat", g_sd_root, APP_DATA_SUBDIR);
@@ -293,18 +294,13 @@ static bool is_rom_ext(const char *fname) {
     return false;
 }
 
-void roms_scan_local(LocalRomList *out) {
-    if (!out) return;
-    out->count = 0;
-    out->last_error[0] = '\0';
-
-    char dir[128];
-    roms_games_dir(dir, sizeof(dir));
+static void scan_local_dir(const char *dir, LocalRomList *out) {
     errno = 0;
     DIR *d = opendir(dir);
     if (!d) {
-        snprintf(out->last_error, sizeof(out->last_error),
-                 "Cannot open %s (errno %d)", dir, errno);
+        if (out->last_error[0] == '\0')
+            snprintf(out->last_error, sizeof(out->last_error),
+                     "Cannot open %s (errno %d)", dir, errno);
         return;
     }
 
@@ -328,7 +324,23 @@ void roms_scan_local(LocalRomList *out) {
         out->count++;
     }
     closedir(d);
+}
 
-    if (out->count == 0)
-        snprintf(out->last_error, sizeof(out->last_error), "No ISOs in %s", dir);
+void roms_scan_local(LocalRomList *out) {
+    if (!out) return;
+    out->count = 0;
+    out->last_error[0] = '\0';
+
+    /* Scan the configured install folder AND the SD root — GC Loader users
+     * commonly keep ISOs at the root of the card. */
+    char dir[128];
+    roms_games_dir(dir, sizeof(dir));
+    scan_local_dir(dir, out);
+    if (strcmp(dir, SD_ROOT) != 0)
+        scan_local_dir(SD_ROOT, out);
+
+    if (out->count > 0) out->last_error[0] = '\0';
+    else if (out->last_error[0] == '\0')
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "No ISOs in %s or sd:/", dir);
 }

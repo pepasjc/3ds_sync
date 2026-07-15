@@ -21,7 +21,8 @@ typedef struct {
     const char *path;           /* "/api/v1/..." */
     const char *method;         /* "GET" / "POST" */
     uint64_t    range_start;    /* optional Range header; 0 = none */
-    const uint8_t *body;        /* optional request body */
+    const uint8_t *body;        /* optional request body (in RAM) */
+    FILE          *body_fp;     /* or streamed from a file (body_len bytes) */
     uint32_t       body_len;
     const char    *body_content_type;
 } HttpRequest;

@@ -408,36 +408,36 @@ void saves_scan_vmc(SaveVmcList *out) {
     if (!out) return;
     out->count = 0;
     out->last_error[0] = '\0';
+    /* Swiss's memory-card emulation images live in sd:/swiss/saves
+     * (MemoryCardA.USA.raw etc., 16 MB) — scan there first. */
+    scan_vmc_dir(SD_ROOT "/swiss/saves", out);
     scan_vmc_dir(VMC_DIR, out);
     scan_vmc_dir(SD_ROOT, out);
     if (out->count == 0)
         snprintf(out->last_error, sizeof(out->last_error),
-                 "No card images in %s or sd:/", VMC_DIR);
+                 "No card images in swiss/saves, VMC/ or sd:/");
 }
 
 int saves_upload_vmc(const SyncState *state, const SaveVmc *vmc, char *msg, size_t msg_size) {
     if (!state || !vmc) return -1;
     FILE *fp = fopen(vmc->path, "rb");
     if (!fp) { snprintf(msg, msg_size, "Open %s failed", vmc->filename); return -1; }
-    uint8_t *buf = malloc(vmc->size);
-    if (!buf) { fclose(fp); snprintf(msg, msg_size, "Out of memory (%u KB)", vmc->size / 1024); return -1; }
-    size_t rd = fread(buf, 1, vmc->size, fp);
-    fclose(fp);
-    if (rd != vmc->size) { free(buf); snprintf(msg, msg_size, "Read %s short", vmc->filename); return -1; }
 
+    /* Stream the image from SD — swiss cards are 16 MB, too big to buffer
+     * comfortably in the Cube's 24 MB main RAM. */
     HttpRequest req = {0};
     req.server_url        = state->server_url;
     req.api_key           = state->api_key;
     req.path              = "/api/v1/saves/gc-vmc/import";
     req.method            = "POST";
-    req.body              = buf;
+    req.body_fp           = fp;
     req.body_len          = vmc->size;
     req.body_content_type = "application/octet-stream";
 
     static uint8_t resp[4096];
     int status = 0;
     int n = http_get_buf(&req, resp, sizeof(resp), &status);
-    free(buf);
+    fclose(fp);
     if (n >= 0 && status == 200) {
         int games = 0;
         for (char *p = (char *)resp; (p = strstr(p, "title_id")) != NULL; p++) games++;

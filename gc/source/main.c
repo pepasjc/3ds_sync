@@ -867,7 +867,8 @@ int main(int argc, char **argv) {
             else if (down & PAD_BUTTON_RIGHT) g_local_sel += ui_list_visible();
             else if (down & PAD_BUTTON_A)     scan_local();
             else if (down & PAD_BUTTON_X) {
-                if (c > 0 && g_local_sel < c) {
+                if (c > 0 && g_local_sel < c &&
+                    confirm("Delete %s\nfrom the SD card?", g_local.items[g_local_sel].filename)) {
                     if (unlink(g_local.items[g_local_sel].path) == 0) {
                         ui_status("Deleted: %s", g_local.items[g_local_sel].filename);
                         scan_local();

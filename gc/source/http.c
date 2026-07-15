@@ -106,6 +106,25 @@ static int send_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
+/* Send the request body: from RAM (req->body) or streamed from a file
+ * (req->body_fp) so 16 MB card images don't need a 16 MB heap buffer. */
+static int send_body(int fd, const HttpRequest *req) {
+    if (req->body_len == 0) return 0;
+    if (req->body_fp) {
+        static char chunk[32768];
+        uint32_t remaining = req->body_len;
+        while (remaining) {
+            size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+            size_t rd = fread(chunk, 1, want, req->body_fp);
+            if (rd == 0) return -1;
+            if (send_all(fd, chunk, rd) < 0) return -1;
+            remaining -= (uint32_t)rd;
+        }
+        return 0;
+    }
+    return send_all(fd, req->body, req->body_len);
+}
+
 static int build_request(char *out, size_t out_size,
                          const HttpRequest *req,
                          const char *host, int port,
@@ -204,7 +223,7 @@ int http_get_buf(const HttpRequest *req,
     if (header_len < 0) { net_close(fd); return -3; }
 
     if (send_all(fd, header_buf, header_len) < 0) { net_close(fd); return -4; }
-    if (req->body_len > 0 && send_all(fd, req->body, req->body_len) < 0) {
+    if (send_body(fd, req) < 0) {
         net_close(fd); return -4;
     }
 
@@ -271,7 +290,7 @@ int http_get_stream_cb(const HttpRequest *req,
     if (header_len < 0) { net_close(fd); return -3; }
 
     if (send_all(fd, header_buf, header_len) < 0) { net_close(fd); return -4; }
-    if (req->body_len > 0 && send_all(fd, req->body, req->body_len) < 0) {
+    if (send_body(fd, req) < 0) {
         net_close(fd); return -4;
     }
 
