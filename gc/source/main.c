@@ -641,13 +641,6 @@ static const char *hint_for(AppView v) {
     }
 }
 
-static const char *placeholder_for(AppView v) {
-    switch (v) {
-        case APP_VIEW_SAVES:  return "VMC / full-card images - Phase 3b.";
-        default:              return "";
-    }
-}
-
 static void redraw(void) {
     ui_clear();
     ui_draw_header(&g_state, g_view);
@@ -660,9 +653,7 @@ static void redraw(void) {
         case APP_VIEW_CARDB:     draw_card(&g_cardb, g_cb_sel, g_cb_scroll); break;
         case APP_VIEW_SERVER:    draw_server(g_sv_sel, g_sv_scroll); break;
         case APP_VIEW_CONFIG:    draw_config(); break;
-        default:
-            ui_text(ui_list_top() + 1, 2, UI_GREY, "%s", placeholder_for(g_view));
-            break;
+        default: break;
     }
     ui_draw_footer(hint_for(g_view));
     ui_flush();

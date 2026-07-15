@@ -31,7 +31,9 @@ static const char *color_escape(int color) {
         case UI_YELLOW: return C_IYELLOW;
         case UI_CYAN:   return C_ICYAN;
         case UI_BLUE:   return C_IBLUE;
-        case UI_GREY:   return C_BLACK;    /* bold-off black reads as grey */
+        /* Non-bold white renders as light grey.  (Bold-off BLACK looked grey
+         * on Dolphin/LCD but is invisible on a real CRT.) */
+        case UI_GREY:   return C_WHITE;
         case UI_WHITE:
         default:        return C_IWHITE;
     }
@@ -49,11 +51,17 @@ void ui_init(void) {
     gfx_video_init(&rmode);
     gfx_init();
 
+    /* Inset the console into the CRT-safe area — TVs overscan ~5-8% per
+     * edge, which otherwise swallows the header (view title) and footer. */
+    f32 vw = (f32)gfx_video_get_width();
+    f32 vh = (f32)gfx_video_get_height();
+    f32 mx = vw * 0.07f;
+    f32 my = vh * 0.06f;
     gfx_screen_coords_t coords;
-    coords.x = 0.0f;
-    coords.y = 0.0f;
-    coords.w = (f32)gfx_video_get_width();
-    coords.h = (f32)gfx_video_get_height();
+    coords.x = mx;
+    coords.y = my;
+    coords.w = vw - 2.0f * mx;
+    coords.h = vh - 2.0f * my;
     gfx_con_init(&coords);
 
     g_rows = gfx_con_get_rows();
@@ -151,31 +159,47 @@ bool ui_status_is_error(void) { return g_status_err; }
 
 const char *ui_view_name(AppView view) {
     switch (view) {
-        case APP_VIEW_ROMS:      return "ROMs";
-        case APP_VIEW_LOCAL:     return "Local";
-        case APP_VIEW_DOWNLOADS: return "Downloads";
-        case APP_VIEW_SAVES:     return "VMC";
-        case APP_VIEW_CARDA:     return "Card A";
-        case APP_VIEW_CARDB:     return "Card B";
-        case APP_VIEW_SERVER:    return "Server";
-        case APP_VIEW_CONFIG:    return "Config";
+        case APP_VIEW_ROMS:      return "GAME CATALOG";
+        case APP_VIEW_LOCAL:     return "LOCAL GAMES";
+        case APP_VIEW_DOWNLOADS: return "DOWNLOADS";
+        case APP_VIEW_SAVES:     return "VMC CARDS (SD)";
+        case APP_VIEW_CARDA:     return "MEMORY CARD - SLOT A";
+        case APP_VIEW_CARDB:     return "MEMORY CARD - SLOT B";
+        case APP_VIEW_SERVER:    return "SERVER SAVES";
+        case APP_VIEW_CONFIG:    return "CONFIG";
         default:                 return "?";
     }
 }
 
 void ui_draw_header(const SyncState *state, AppView view) {
-    /* Row 0: app + view + page index.  Row 1: net / sd status. */
-    ui_text(0, 0, UI_CYAN, "gcsync v%s", APP_VERSION);
-    ui_text(0, 22, UI_WHITE, "[%d/%d] %s",
-            (int)view + 1, (int)APP_VIEW_COUNT, ui_view_name(view));
+    /* Row 0: full-width title bar naming the screen (PS2-client style). */
+    char left[96], right[16], bar[200];
+    snprintf(left,  sizeof(left),  " %s", ui_view_name(view));
+    snprintf(right, sizeof(right), "%d/%d ", (int)view + 1, (int)APP_VIEW_COUNT);
+    int w = g_cols;
+    if (w > (int)sizeof(bar) - 1) w = (int)sizeof(bar) - 1;
+    int ll = (int)strlen(left), rl = (int)strlen(right);
+    if (ll > w - rl - 1) ll = w - rl - 1;
+    memset(bar, ' ', w);
+    memcpy(bar, left, ll);
+    memcpy(bar + w - rl, right, rl);
+    bar[w] = '\0';
 
+    gfx_con_set_pos(1, 1);
+    fputs(B_BLUE, stdout);
+    fputs(C_IWHITE, stdout);
+    fputs(bar, stdout);
+    fputs(CON_COLRESET, stdout);
+
+    /* Row 1: version + net + sd status. */
     const char *net = state->net_ready
         ? (state->dhcp_ok ? state->ip : "link?")
         : "no-net";
     int net_color = (state->net_ready && state->dhcp_ok) ? UI_GREEN
                   : state->net_ready ? UI_YELLOW : UI_RED;
-    ui_text(1, 0, net_color, "net:%s", net);
-    ui_text(1, 22, state->sd_ready ? UI_GREEN : UI_RED,
+    ui_text(1, 0, UI_CYAN, "v%s", APP_VERSION);
+    ui_text(1, 10, net_color, "net:%s", net);
+    ui_text(1, 30, state->sd_ready ? UI_GREEN : UI_RED,
             "sd:%s", state->sd_ready ? sd_device_to_str(state->sd_device) : "none");
 }
 
