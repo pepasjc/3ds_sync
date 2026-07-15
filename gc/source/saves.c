@@ -442,14 +442,29 @@ void saves_scan_vmc(SaveVmcList *out) {
     if (!out) return;
     out->count = 0;
     out->last_error[0] = '\0';
+
+    /* FlipperMCE / GCMCE virtual cards: one folder per channel,
+     * sd:/MemoryCards/GC/<DL-DOL-XXXX-REGION>/<...>-1.raw (8 MB each). */
+    DIR *d = opendir(SD_ROOT "/MemoryCards/GC");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL && out->count < SAVES_MAX_VMC) {
+            if (de->d_name[0] == '.') continue;
+            char sub[SAVE_DIR_LEN];
+            snprintf(sub, sizeof(sub), SD_ROOT "/MemoryCards/GC/%s", de->d_name);
+            scan_vmc_dir(sub, out);
+        }
+        closedir(d);
+    }
+
     /* Swiss's memory-card emulation images live in sd:/swiss/saves
-     * (MemoryCardA.USA.raw etc., 16 MB) — scan there first. */
+     * (MemoryCardA.USA.raw etc., 16 MB). */
     scan_vmc_dir(SD_ROOT "/swiss/saves", out);
     scan_vmc_dir(VMC_DIR, out);
     scan_vmc_dir(SD_ROOT, out);
     if (out->count == 0)
         snprintf(out->last_error, sizeof(out->last_error),
-                 "No card images in swiss/saves, VMC/ or sd:/");
+                 "No card images found on SD");
 }
 
 int saves_upload_vmc(const SyncState *state, const SaveVmc *vmc, char *msg, size_t msg_size) {
@@ -604,13 +619,21 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
         return -3;
     }
     /* Header and payload as separate ImmEx writes — the same transfer shape
-     * as SetDiskInfo/GetGameName, which verifiably parse on FlipperMCE. */
+     * as SetDiskInfo/GetGameName, which verifiably parse on FlipperMCE.
+     *
+     * Always transmit the id uppercase: the device's game-DB lookup is
+     * case-sensitive, and a lowercase id (e.g. from a server title stored as
+     * "GC_grse") misses -> region "UNK" -> a NEW channel folder
+     * (DL-DOL-grse-UNK) instead of the existing DL-DOL-GRSE-USA. */
     u8 cmd[12];
     memset(cmd, 0, sizeof(cmd));
     cmd[0] = 0x8B;
     cmd[1] = 0x11;
-    memcpy(&cmd[2], gamecode, 4);
-    memcpy(&cmd[6], (company && company[0]) ? company : "00", 2);
+    for (int i = 0; i < 4; i++)
+        cmd[2 + i] = (u8)toupper((unsigned char)gamecode[i]);
+    const char *co = (company && company[0]) ? company : "00";
+    cmd[6] = (u8)toupper((unsigned char)co[0]);
+    cmd[7] = (u8)toupper((unsigned char)co[1]);
     cmd[8]  = digits[0]; cmd[9]  = digits[0];   /* disknum 00 */
     cmd[10] = digits[0]; cmd[11] = digits[0];   /* gamever 00 */
     bool err = false;
