@@ -24,6 +24,31 @@
 
 #define RECV_BUF_SIZE 8192
 
+/* Waiting-for-data callback (UI pump / user cancel) — see http.h. */
+static HttpWaitFn g_wait_cb = NULL;
+void http_set_wait_cb(HttpWaitFn cb) { g_wait_cb = cb; }
+
+#define HTTP_HEADER_WAIT_MS (10u * 60u * 1000u)   /* server-side ROM conversion */
+#define HTTP_BODY_WAIT_MS   (60u * 1000u)
+
+/* recv gated by select so a silent server can't block the app forever.
+ * Returns >0 bytes, 0 = closed, -1 = error/timeout, -2 = user cancel. */
+static int recv_timed(int fd, void *buf, int len, uint32_t max_wait_ms) {
+    uint32_t waited = 0;
+    for (;;) {
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(fd, &rs);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+        int r = net_select(fd + 1, &rs, NULL, NULL, &tv);
+        if (r > 0)  return net_recv(fd, buf, len, 0);
+        if (r < 0)  return -1;
+        waited += 500;
+        if (g_wait_cb && g_wait_cb(waited)) return -2;
+        if (waited >= max_wait_ms) return -1;
+    }
+}
+
 static int parse_url(const char *url, char *host_out, size_t host_size,
                      int *port_out, char *path_out, size_t path_size)
 {
@@ -164,7 +189,8 @@ static int read_headers(int fd, char *buf, size_t buf_size, size_t *total_out) {
     size_t total = 0;
     if (total_out) *total_out = 0;
     while (total + 1 < buf_size) {
-        int n = net_recv(fd, buf + total, buf_size - 1 - total, 0);
+        int n = recv_timed(fd, buf + total, buf_size - 1 - total, HTTP_HEADER_WAIT_MS);
+        if (n == -2) return -2;   /* user cancel */
         if (n <= 0) return -1;
         total += (size_t)n;
         buf[total] = '\0';
@@ -249,7 +275,7 @@ int http_get_buf(const HttpRequest *req,
         written = take;
     }
     while (written < cap) {
-        int n = net_recv(fd, out + written, cap - written, 0);
+        int n = recv_timed(fd, out + written, cap - written, HTTP_BODY_WAIT_MS);
         if (n <= 0) break;
         written += n;
     }
@@ -297,6 +323,7 @@ int http_get_stream_cb(const HttpRequest *req,
     char rbuf[RECV_BUF_SIZE];
     size_t total_read = 0;
     int  hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read);
+    if (hlen == -2) { net_close(fd); return 1; }   /* user cancel = paused */
     if (hlen < 0) { net_close(fd); return -5; }
 
     int status = parse_status(rbuf);
@@ -316,7 +343,8 @@ int http_get_stream_cb(const HttpRequest *req,
 
     static char chunk[65536];
     while (1) {
-        int n = net_recv(fd, chunk, sizeof(chunk), 0);
+        int n = recv_timed(fd, chunk, sizeof(chunk), HTTP_BODY_WAIT_MS);
+        if (n == -2) { net_close(fd); return 1; }   /* user cancel = paused */
         if (n == 0) break;
         if (n < 0)  { net_close(fd); return -8; }
         if (writer(chunk, (uint32_t)n, user) != 0) { net_close(fd); return -7; }

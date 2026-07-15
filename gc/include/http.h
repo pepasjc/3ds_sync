@@ -15,6 +15,11 @@ typedef int (*HttpProgressFn)(uint64_t downloaded, uint64_t total);
 typedef int (*HttpStreamBeginFn)(uint64_t content_length, void *user);
 typedef int (*HttpWriteFn)(const void *data, uint32_t len, void *user);
 
+/* Called every ~0.5 s while a recv is waiting for data (e.g. the server
+ * converting a ROM before responding).  Return non-zero to cancel. */
+typedef int (*HttpWaitFn)(uint32_t waited_ms);
+void http_set_wait_cb(HttpWaitFn cb);
+
 typedef struct {
     const char *server_url;     /* "http://host:port" — no trailing slash */
     const char *api_key;

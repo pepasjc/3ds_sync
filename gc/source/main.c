@@ -15,6 +15,7 @@
 #include "roms.h"
 #include "downloads.h"
 #include "saves.h"
+#include "http.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -375,6 +376,18 @@ static int progress_cb(uint64_t done, uint64_t total) {
     return g_pause_req ? 1 : 0;
 }
 
+/* Pump the UI while the server prepares a response (e.g. RVZ->ISO
+ * conversion, which can take minutes).  B cancels -> download pauses. */
+static int download_wait_cb(uint32_t ms) {
+    PAD_ScanPads();
+    if (PAD_ButtonsDown(0) & PAD_BUTTON_B) return 1;
+    if ((ms % 2000) == 0) {
+        ui_status("Waiting for server... %us (converting? B=cancel)", ms / 1000);
+        redraw();
+    }
+    return 0;
+}
+
 static void run_active_download(DownloadEntry *e) {
     if (!e) return;
     if (!g_state.sd_ready) { ui_error("No SD - cannot download"); return; }
@@ -391,14 +404,18 @@ static void run_active_download(DownloadEntry *e) {
     g_pause_req    = false;
     g_last_draw    = e->offset;
     network_set_progress64_cb(progress_cb);
+    http_set_wait_cb(download_wait_cb);
 
     e->status = DL_STATUS_ACTIVE;
     downloads_save(&g_downloads);
+    ui_status("Requesting %s... (server may convert first; B=cancel)", e->name);
+    redraw();
 
     uint64_t total = 0;
     int rc = network_download_rom_resumable(&g_state, e->rom_id, e->extract_format,
                                             e->target_path, e->offset, &total);
     network_set_progress64_cb(NULL);
+    http_set_wait_cb(NULL);
     if (total > 0) e->total = total;
 
     if (rc == 0) {
