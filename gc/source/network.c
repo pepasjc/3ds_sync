@@ -138,7 +138,9 @@ int network_download_rom_resumable(const SyncState *state,
     FILE *fp = fopen(part, start_offset > 0 ? "ab" : "wb");
     if (!fp) return -2;
 
-    static char io_buf[64 * 1024] __attribute__((aligned(32)));
+    /* Large stdio buffer so recv chunks batch into big sequential SD writes
+     * (the SD/EXI path is much faster with few large writes than many small). */
+    static char io_buf[256 * 1024] __attribute__((aligned(32)));
     setvbuf(fp, io_buf, _IOFBF, sizeof(io_buf));
 
     HttpRequest req = {0};

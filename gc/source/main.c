@@ -29,6 +29,7 @@
 #include <gccore.h>
 #include <ogc/card.h>
 #include <ogc/pad.h>
+#include <ogc/lwp_watchdog.h>   /* gettime / ticks_to_millisecs */
 #include <fat.h>
 #include <sdcard/gcsd.h>
 
@@ -58,8 +59,11 @@ static char g_scratch[256 * 1024];   /* catalog JSON page buffer */
 /* Live download progress (updated from progress_cb). */
 static volatile uint64_t g_active_done  = 0;
 static volatile uint64_t g_active_total = 0;
+static volatile uint64_t g_active_bps   = 0;
 static volatile bool     g_pause_req    = false;
 static uint64_t          g_last_draw    = 0;
+static uint64_t          g_spd_ms       = 0;
+static uint64_t          g_spd_bytes    = 0;
 
 static void redraw(void);   /* forward decl: long ops flush mid-run */
 static void scan_local(void);
@@ -369,6 +373,15 @@ static int progress_cb(uint64_t done, uint64_t total) {
     g_active_total = total;
     PAD_ScanPads();
     if (PAD_ButtonsDown(0) & PAD_BUTTON_B) g_pause_req = true;
+
+    uint64_t now = ticks_to_millisecs(gettime());
+    if (g_spd_ms == 0) { g_spd_ms = now; g_spd_bytes = done; }
+    else if (now - g_spd_ms >= 1000) {
+        g_active_bps = (done - g_spd_bytes) * 1000 / (now - g_spd_ms);
+        g_spd_ms = now;
+        g_spd_bytes = done;
+        redraw();   /* refresh the speed/ETA line once per second */
+    }
     if (done - g_last_draw >= (1U << 19) || (total && done >= total)) {
         g_last_draw = done;
         redraw();
@@ -403,6 +416,8 @@ static void run_active_download(DownloadEntry *e) {
     g_active_total = e->total;
     g_pause_req    = false;
     g_last_draw    = e->offset;
+    g_active_bps   = 0;
+    g_spd_ms       = 0;
     network_set_progress64_cb(progress_cb);
     http_set_wait_cb(download_wait_cb);
 
@@ -538,6 +553,22 @@ static void draw_downloads(void) {
         snprintf(line, sizeof(line), " %-9s %3d%% %-*.*s",
                  downloads_status_to_str(e->status), pct, namew, namew, e->name);
         ui_text_hl(top + i, idx == g_dl_sel, color, "%s", line);
+    }
+
+    /* Live speed / ETA line for whatever is downloading. */
+    for (int i = 0; i < g_downloads.count; i++) {
+        if (g_downloads.items[i].status != DL_STATUS_ACTIVE) continue;
+        char a[24], b[24];
+        human_size(g_active_done, a, sizeof(a));
+        human_size(g_active_total, b, sizeof(b));
+        uint64_t bps = g_active_bps;
+        uint64_t eta = (bps && g_active_total > g_active_done)
+                     ? (g_active_total - g_active_done) / bps : 0;
+        ui_text(ui_rows() - 3, 1, UI_CYAN,
+                "%s / %s   %llu KB/s   ETA %llu:%02llu   B=pause",
+                a, b, (unsigned long long)(bps / 1024),
+                (unsigned long long)(eta / 60), (unsigned long long)(eta % 60));
+        break;
     }
 }
 

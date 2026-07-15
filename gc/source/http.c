@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include <gccore.h>
 #include <network.h>
@@ -44,8 +45,8 @@ static int recv_timed(int fd, void *buf, int len, uint32_t max_wait_ms) {
         int n = net_recv(fd, buf, len, MSG_DONTWAIT);
         if (n >= 0) return n;
         if (n != -EWOULDBLOCK && n != -EAGAIN) return -1;
-        VIDEO_WaitVSync();
-        waited_ms += 17;
+        usleep(1000);   /* 1 ms; short so a real stall costs little */
+        waited_ms += 1;
         if (waited_ms >= next_cb) {
             next_cb += 500;
             if (g_wait_cb && g_wait_cb(waited_ms)) return -2;
