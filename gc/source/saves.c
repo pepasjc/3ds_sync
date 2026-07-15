@@ -603,6 +603,8 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
         snprintf(msg, msg_size, "Slot %c select failed", 'A' + port);
         return -3;
     }
+    /* Header and payload as separate ImmEx writes — the same transfer shape
+     * as SetDiskInfo/GetGameName, which verifiably parse on FlipperMCE. */
     u8 cmd[12];
     memset(cmd, 0, sizeof(cmd));
     cmd[0] = 0x8B;
@@ -612,7 +614,8 @@ int saves_mcp_set_gameid(int port, const char *gamecode, const char *company,
     cmd[8]  = digits[0]; cmd[9]  = digits[0];   /* disknum 00 */
     cmd[10] = digits[0]; cmd[11] = digits[0];   /* gamever 00 */
     bool err = false;
-    err |= !EXI_ImmEx(chan, cmd, sizeof(cmd), EXI_WRITE);
+    err |= !EXI_ImmEx(chan, cmd, 2, EXI_WRITE);
+    err |= !EXI_ImmEx(chan, &cmd[2], 10, EXI_WRITE);
     err |= !EXI_Deselect(chan);
     EXI_Unlock(chan);
     if (err) { snprintf(msg, msg_size, "SetDiskID failed"); return -4; }
