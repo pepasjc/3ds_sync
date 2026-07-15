@@ -60,6 +60,14 @@ static const char *card_err_str(int rc) {
     }
 }
 
+/* Scope libogc's global card identity to one save: CARD_Open matches
+ * filename AND gamecode/company when set, so duplicate filenames across
+ * games resolve to the right entry.  Reset to wildcard when done. */
+static void card_identity(const char *gamecode, const char *company) {
+    CARD_SetGamecode(gamecode);
+    CARD_SetCompany(company);
+}
+
 /* Mount with retries: transient EXI contention (BBA shares channel 0 with
  * slot A) and slow adapters (MemCard Pro GC) intermittently fail the first
  * attempt with CARD_ERROR_IOERROR.  Genuine no-card errors return at once. */
@@ -123,7 +131,8 @@ void saves_scan_card(int port, GcSaveList *out) {
     for (int i = 0; i < out->count; i++) {
         GcSave *s = &out->items[i];
         card_file f;
-        if (CARD_Open(port, s->filename, &f) < 0) continue;
+        card_identity(s->gamecode, s->company);
+        if (CARD_Open(port, s->filename, &f) < 0) { card_identity(NULL, NULL); continue; }
         card_direntry de;
         if (CARD_GetStatusEx(port, f.filenum, &de) >= 0 &&
             de.comment_addr != 0xFFFFFFFF) {
@@ -134,6 +143,7 @@ void saves_scan_card(int port, GcSaveList *out) {
                 copy_comment(g_gci + off, s->name, sizeof(s->name));
         }
         CARD_Close(&f);
+        card_identity(NULL, NULL);
     }
     CARD_Unmount(port);
 
@@ -177,7 +187,9 @@ int saves_upload_card_game(const SyncState *state, int port, const GcSave *save,
     if (rc < 0) { snprintf(msg, msg_size, "Mount slot %c failed (%d)", 'A' + port, rc); return -1; }
 
     card_file file;
+    card_identity(save->gamecode, save->company);
     rc = CARD_Open(port, save->filename, &file);
+    card_identity(NULL, NULL);
     if (rc < 0) { CARD_Unmount(port); snprintf(msg, msg_size, "Open %s failed (%d)", save->filename, rc); return -1; }
 
     /* 64-byte directory entry (GCI header) at the front of the buffer. */
@@ -231,6 +243,13 @@ int saves_restore_card_game(const SyncState *state, int port, const char *title_
     memcpy(fname, de->filename, CARD_FILENAMELEN);
     fname[CARD_FILENAMELEN] = '\0';
 
+    /* Scope the card identity to this game so the delete hits the right
+     * entry and CARD_Create stamps the correct gamecode. */
+    char gcode[5] = {0}, gco[3] = {0};
+    memcpy(gcode, de->gamecode, 4);
+    memcpy(gco,   de->company,  2);
+    card_identity(gcode, gco);
+
     /* Overwrite: a same-name file would otherwise fail create with EXIST. */
     CARD_Delete(port, fname);
 
@@ -245,14 +264,25 @@ int saves_restore_card_game(const SyncState *state, int port, const char *title_
 
     card_file file;
     rc = CARD_CreateEntry(port, &dir, &file);
-    if (rc < 0) { CARD_Unmount(port); snprintf(msg, msg_size, "Create failed: %s (%d)", card_err_str(rc), rc); return -1; }
+    if (rc < 0) {
+        card_identity(NULL, NULL);
+        CARD_Unmount(port);
+        snprintf(msg, msg_size, "Create failed: %s (%d)", card_err_str(rc), rc);
+        return -1;
+    }
 
     rc = CARD_Write(&file, g_gci + 64, datalen, 0);
-    if (rc < 0) { CARD_Close(&file); CARD_Unmount(port); snprintf(msg, msg_size, "Write failed (%d)", rc); return -1; }
+    if (rc < 0) {
+        card_identity(NULL, NULL);
+        CARD_Close(&file); CARD_Unmount(port);
+        snprintf(msg, msg_size, "Write failed (%d)", rc);
+        return -1;
+    }
 
     /* Restore icon/comment/time metadata (keeps the new block index + length). */
     CARD_SetStatusEx(port, file.filenum, de);
     CARD_Close(&file);
+    card_identity(NULL, NULL);
     CARD_Unmount(port);
 
     snprintf(msg, msg_size, "Restored %s to slot %c (%u KB)", title_id, 'A' + port,

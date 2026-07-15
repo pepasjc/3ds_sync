@@ -883,7 +883,10 @@ int main(int argc, char **argv) {
     }
     roms_set_target(g_state.sd_root, g_state.games_folder);
 
-    CARD_Init("GCSY", "8B");
+    /* NULL identity = wildcard.  A concrete gamecode/company here makes
+     * CARD_Open reject every other game's file (comment reads, uploads) and
+     * CARD_Create stamp our code onto restored saves. */
+    CARD_Init(NULL, NULL);
 
     /* Scan memory cards BEFORE the network comes up: the BBA shares EXI
      * channel 0 with slot A, and net traffic during CARD_Mount produced
