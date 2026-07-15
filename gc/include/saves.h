@@ -2,6 +2,7 @@
 #define GCSYNC_SAVES_H
 
 #include "common.h"
+#include "vmcfs.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -99,6 +100,14 @@ void saves_scan_vmc(SaveVmcList *out);
  * into per-game saves). Returns 0 on success, negative on error. */
 int  saves_upload_vmc(const SyncState *state, const SaveVmc *vmc,
                       char *msg, size_t msg_size);
+
+/* Upload one save from inside an opened card image. */
+int  saves_upload_vmc_save(const SyncState *state, VmcfsCard *card, int idx,
+                           char *msg, size_t msg_size);
+
+/* Download a game's GCI from the server and write it into the card image. */
+int  saves_restore_vmc_save(const SyncState *state, VmcfsCard *card,
+                            const char *title_id, char *msg, size_t msg_size);
 
 /* Download every server GC save as a GCI into sd:/VMC/<title_id>.gci.
  * Returns the number pulled, or negative on error. */

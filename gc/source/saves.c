@@ -481,6 +481,36 @@ int saves_pull_all(const SyncState *state, const ServerSaveList *server,
     return ok;
 }
 
+int saves_upload_vmc_save(const SyncState *state, VmcfsCard *card, int idx,
+                          char *msg, size_t msg_size) {
+    if (!state || !card || idx < 0 || idx >= card->count) return -1;
+    int n = vmcfs_read_gci(card, idx, g_gci, SAVES_GCI_MAX);
+    if (n < 0) { snprintf(msg, msg_size, "Read save failed (%d)", n); return -1; }
+    return post_gci(state, card->saves[idx].title_id, g_gci, (u32)n, msg, msg_size);
+}
+
+int saves_restore_vmc_save(const SyncState *state, VmcfsCard *card,
+                           const char *title_id, char *msg, size_t msg_size) {
+    if (!state || !card || !title_id || !title_id[0]) return -1;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/saves/%s/gc-card?format=gci", title_id);
+
+    HttpRequest req = {0};
+    req.server_url = state->server_url;
+    req.api_key    = state->api_key;
+    req.path       = path;
+    req.method     = "GET";
+
+    int status = 0;
+    int n = http_get_buf(&req, g_gci, SAVES_GCI_MAX, &status);
+    if (n < 0 || status != 200) {
+        snprintf(msg, msg_size, "Download %s failed (HTTP %d, n=%d)", title_id, status, n);
+        return -1;
+    }
+    return vmcfs_write_gci(card, g_gci, (uint32_t)n, msg, msg_size);
+}
+
 /* ---- MemCard Pro GC GameID (MMCE over EXI) ----
  *
  * Protocol ported from libogc2 mmce.c (Extrems): each command is a 0x8B-prefixed

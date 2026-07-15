@@ -39,7 +39,9 @@ static DownloadList  g_downloads;
 
 static GcSaveList     g_carda, g_cardb;     /* slot A (chan 0), slot B (chan 1) */
 static ServerSaveList g_server;
-static SaveVmcList    g_vmc;
+static SaveVmcList    g_vmc;                /* card image FILES found on SD */
+static VmcfsCard      g_vmccard;            /* currently opened card image */
+static int            g_vmc_active = 0;     /* which file is opened */
 
 static int g_cfg_sel    = 0;
 static int g_rom_sel    = 0, g_rom_scroll   = 0;
@@ -61,6 +63,7 @@ static uint64_t          g_last_draw    = 0;
 static void redraw(void);   /* forward decl: long ops flush mid-run */
 static void scan_local(void);
 static void scan_vmc_view(void);
+static void fill_vmccard_names(void);
 
 /* ---- helpers ---- */
 
@@ -561,6 +564,7 @@ static void fetch_server(void) {
     mark_server_local();
     fill_card_names(&g_carda);
     fill_card_names(&g_cardb);
+    fill_vmccard_names();
     if (g_server.count > 0) ui_status("Server: %d GC save(s)", g_server.count);
     else ui_error("%s", g_server.last_error);
     redraw();
@@ -654,23 +658,90 @@ static void draw_server(int sel, int scroll) {
     }
 }
 
-/* ---- VMC (full card images on SD) ---- */
+/* ---- VMC (saves inside card images on SD) ---- */
+
+static void fill_vmccard_names(void) {
+    for (int i = 0; i < g_vmccard.count; i++) {
+        g_vmccard.saves[i].name[0] = '\0';
+        for (int j = 0; j < g_server.count; j++) {
+            if (strcmp(g_server.items[j].title_id, g_vmccard.saves[i].title_id) == 0) {
+                strncpy(g_vmccard.saves[i].name, g_server.items[j].name,
+                        sizeof(g_vmccard.saves[i].name) - 1);
+                break;
+            }
+        }
+    }
+}
+
+/* Open card file ``idx`` from the scan list and list its saves. */
+static void open_vmc_card(int idx) {
+    if (g_vmc.count == 0) { g_vmccard.count = 0; return; }
+    if (idx < 0) idx = 0;
+    if (idx >= g_vmc.count) idx = g_vmc.count - 1;
+    g_vmc_active = idx;
+    g_vmc_sel = 0;
+    g_vmc_scroll = 0;
+    if (!vmcfs_open(&g_vmccard, g_vmc.items[idx].path)) {
+        ui_error("Open %s failed: %s", g_vmc.items[idx].filename, g_vmccard.last_error);
+        g_vmccard.count = 0;
+        return;
+    }
+    fill_vmccard_names();
+    ui_status("%s: %d save(s)", g_vmccard.filename, g_vmccard.count);
+}
 
 static void scan_vmc_view(void) {
     if (!g_state.sd_ready) { ui_error("Storage not ready"); return; }
     ui_status("Scanning card images...");
     redraw();
     saves_scan_vmc(&g_vmc);
-    if (g_vmc.count > 0) ui_status("VMC: %d card image(s)", g_vmc.count);
-    else ui_status("%s", g_vmc.last_error);
+    if (g_vmc.count == 0) { g_vmccard.count = 0; ui_status("%s", g_vmc.last_error); }
+    else open_vmc_card(g_vmc_active);
     redraw();
 }
 
-static void upload_vmc_at(int sel) {
+static void cycle_vmc_card(void) {
+    if (g_vmc.count < 1) return;
+    open_vmc_card((g_vmc_active + 1) % g_vmc.count);
+    redraw();
+}
+
+static void upload_vmc_save_at(int sel) {
     if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
-    if (g_vmc.count == 0 || sel >= g_vmc.count) return;
-    const SaveVmc *v = &g_vmc.items[sel];
-    if (!confirm("Import card image\n%s\nto server (split per game)?", v->filename)) return;
+    if (g_vmccard.count == 0 || sel >= g_vmccard.count) return;
+    const VmcfsSave *s = &g_vmccard.saves[sel];
+    if (!confirm("Upload %s\nfrom %s to the server?", s->title_id, g_vmccard.filename))
+        return;
+    ui_status("Uploading %s...", s->title_id);
+    redraw();
+    char msg[128];
+    int rc = saves_upload_vmc_save(&g_state, &g_vmccard, sel, msg, sizeof(msg));
+    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
+    redraw();
+}
+
+static void restore_vmc_save_at(int sel) {
+    if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
+    if (g_vmccard.count == 0 || sel >= g_vmccard.count) return;
+    const char *tid = g_vmccard.saves[sel].title_id;
+    if (!confirm("Restore %s from server\ninto %s?\nOverwrites the save in the image.",
+                 tid, g_vmccard.filename))
+        return;
+    ui_status("Restoring %s...", tid);
+    redraw();
+    char msg[128];
+    int rc = saves_restore_vmc_save(&g_state, &g_vmccard, tid, msg, sizeof(msg));
+    fill_vmccard_names();
+    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
+    redraw();
+}
+
+static void import_whole_vmc(void) {
+    if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
+    if (g_vmc.count == 0) return;
+    const SaveVmc *v = &g_vmc.items[g_vmc_active];
+    if (!confirm("Import ALL saves from\n%s\nto the server (split per game)?", v->filename))
+        return;
     ui_status("Importing %s...", v->filename);
     redraw();
     char msg[128];
@@ -680,35 +751,35 @@ static void upload_vmc_at(int sel) {
     redraw();
 }
 
-static void pull_all_vmc(void) {
-    if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
-    if (g_server.count == 0) fetch_server();
-    if (!confirm("Download ALL %d server GC saves\nas .gci into sd:/VMC/ ?", g_server.count)) return;
-    ui_status("Pulling GCIs...");
-    redraw();
-    char msg[128];
-    int rc = saves_pull_all(&g_state, &g_server, msg, sizeof(msg));
-    if (rc < 0) ui_error("%s", msg); else ui_status("%s", msg);
-    scan_vmc_view();
-}
-
 static void draw_vmc(void) {
     int top = ui_list_top(), vis = ui_list_visible();
     if (g_vmc.count == 0) {
         ui_text(top + 1, 2, UI_GREY, "%s",
-                g_vmc.last_error[0] ? g_vmc.last_error : "No card images. Put .raw cards in sd:/VMC.");
+                g_vmc.last_error[0] ? g_vmc.last_error : "No card images found.");
         return;
     }
-    int namew = ui_cols() - 10;
+
+    /* Card banner row: which image is open + cycle position. */
+    ui_text(top, 1, UI_CYAN, "Card %d/%d: %s (%d saves)  [Z=next card]",
+            g_vmc_active + 1, g_vmc.count, g_vmccard.filename, g_vmccard.count);
+
+    if (g_vmccard.count == 0) {
+        ui_text(top + 2, 2, UI_GREY, "%s",
+                g_vmccard.last_error[0] ? g_vmccard.last_error : "No saves in this image.");
+        return;
+    }
+
+    int rows = vis - 1;   /* banner uses the first row */
+    int namew = ui_cols() - 18;
     if (namew < 8) namew = 8;
-    for (int i = 0; i < vis; i++) {
+    for (int i = 0; i < rows; i++) {
         int idx = g_vmc_scroll + i;
-        if (idx >= g_vmc.count) break;
-        const SaveVmc *v = &g_vmc.items[idx];
-        char sz[16]; human_size(v->size, sz, sizeof(sz));
+        if (idx >= g_vmccard.count) break;
+        const VmcfsSave *s = &g_vmccard.saves[idx];
+        const char *nm = s->name[0] ? s->name : (s->filename[0] ? s->filename : s->title_id);
         char line[200];
-        snprintf(line, sizeof(line), " %-*.*s %7s", namew, namew, v->filename, sz);
-        ui_text_hl(top + i, idx == g_vmc_sel, UI_WHITE, "%s", line);
+        snprintf(line, sizeof(line), " %-*.*s %4d blk", namew, namew, nm, s->blocks);
+        ui_text_hl(top + 1 + i, idx == g_vmc_sel, UI_WHITE, "%s", line);
     }
 }
 
@@ -733,7 +804,7 @@ static const char *hint_for(AppView v) {
         case APP_VIEW_ROMS:      return "A=fetch  X=queue  Y=download now  L/R=view    L+R+Start=quit";
         case APP_VIEW_LOCAL:     return "A=rescan  X=delete  L/R=switch view           L+R+Start=quit";
         case APP_VIEW_DOWNLOADS: return "A=start/resume  X=remove  (B=pause)           L+R+Start=quit";
-        case APP_VIEW_SAVES:     return "A=rescan  X=import card  Y=pull all GCIs       L+R+Start=quit";
+        case APP_VIEW_SAVES:     return "A=upload  Y=restore  Z=next card  X=rescan  Start=import all";
         case APP_VIEW_CARDA:
         case APP_VIEW_CARDB:     return "A=upload  Y=restore  Z=GameID  X=rescan        L+R+Start=quit";
         case APP_VIEW_SERVER:    return "A=restore->A  Y=->B  Z=GameID  X=refresh        L+R+Start=quit";
@@ -825,7 +896,7 @@ int main(int argc, char **argv) {
     else
         ui_status("SD ready (%s); network not up", sd_device_to_str(g_state.sd_device));
 
-    if (g_state.sd_ready) { scan_local(); saves_scan_vmc(&g_vmc); }
+    if (g_state.sd_ready) { scan_local(); saves_scan_vmc(&g_vmc); open_vmc_card(0); }
     if (network_is_ready(&g_state)) { fetch_catalog(); fetch_server(); }
 
     redraw();
@@ -893,14 +964,26 @@ int main(int argc, char **argv) {
             clamp_scroll(&g_dl_sel, &g_dl_scroll, g_downloads.count);
         }
         else if (g_view == APP_VIEW_SAVES) {
+            int vis = ui_list_visible() - 1;   /* banner row */
+            if (vis < 1) vis = 1;
             if      (down & PAD_BUTTON_UP)    g_vmc_sel--;
             else if (down & PAD_BUTTON_DOWN)  g_vmc_sel++;
-            else if (down & PAD_BUTTON_LEFT)  g_vmc_sel -= ui_list_visible();
-            else if (down & PAD_BUTTON_RIGHT) g_vmc_sel += ui_list_visible();
-            else if (down & PAD_BUTTON_A)     scan_vmc_view();
-            else if (down & PAD_BUTTON_X)     upload_vmc_at(g_vmc_sel);
-            else if (down & PAD_BUTTON_Y)     pull_all_vmc();
-            clamp_scroll(&g_vmc_sel, &g_vmc_scroll, g_vmc.count);
+            else if (down & PAD_BUTTON_LEFT)  g_vmc_sel -= vis;
+            else if (down & PAD_BUTTON_RIGHT) g_vmc_sel += vis;
+            else if (down & PAD_TRIGGER_Z)    cycle_vmc_card();
+            else if (down & PAD_BUTTON_X)     scan_vmc_view();
+            else if (down & PAD_BUTTON_A)     upload_vmc_save_at(g_vmc_sel);
+            else if (down & PAD_BUTTON_Y)     restore_vmc_save_at(g_vmc_sel);
+            else if (down & PAD_BUTTON_START) import_whole_vmc();
+            /* clamp against save count with the banner-reduced window */
+            if (g_vmccard.count == 0) { g_vmc_sel = 0; g_vmc_scroll = 0; }
+            else {
+                if (g_vmc_sel < 0) g_vmc_sel = 0;
+                if (g_vmc_sel >= g_vmccard.count) g_vmc_sel = g_vmccard.count - 1;
+                if (g_vmc_sel < g_vmc_scroll) g_vmc_scroll = g_vmc_sel;
+                if (g_vmc_sel >= g_vmc_scroll + vis) g_vmc_scroll = g_vmc_sel - vis + 1;
+                if (g_vmc_scroll < 0) g_vmc_scroll = 0;
+            }
         }
         else if (g_view == APP_VIEW_CARDA) {
             if      (down & PAD_BUTTON_UP)    g_ca_sel--;
