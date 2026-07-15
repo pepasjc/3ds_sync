@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <gccore.h>
 #include <ogc/card.h>
@@ -47,6 +48,19 @@ static const char *card_err_str(int rc) {
     }
 }
 
+/* Mount with retries: transient EXI contention (BBA shares channel 0 with
+ * slot A) and slow adapters (MemCard Pro GC) intermittently fail the first
+ * attempt with CARD_ERROR_IOERROR.  Genuine no-card errors return at once. */
+static int card_mount_retry(int port) {
+    int rc = CARD_ERROR_NOCARD;
+    for (int i = 0; i < 4; i++) {
+        rc = CARD_Mount(port, g_workarea, NULL);
+        if (rc >= 0 || rc == CARD_ERROR_NOCARD) break;
+        usleep(80 * 1000);
+    }
+    return rc;
+}
+
 /* ---- scan ---- */
 
 void saves_scan_card(int port, GcSaveList *out) {
@@ -55,7 +69,7 @@ void saves_scan_card(int port, GcSaveList *out) {
     out->port = port;
     out->last_error[0] = '\0';
 
-    int rc = CARD_Mount(port, g_workarea, NULL);
+    int rc = card_mount_retry(port);
     if (rc < 0) {
         snprintf(out->last_error, sizeof(out->last_error),
                  "Slot %c: %s (%d)", 'A' + port, card_err_str(rc), rc);
@@ -125,7 +139,7 @@ int saves_upload_card_game(const SyncState *state, int port, const GcSave *save,
                            char *msg, size_t msg_size) {
     if (!state || !save) return -1;
 
-    int rc = CARD_Mount(port, g_workarea, NULL);
+    int rc = card_mount_retry(port);
     if (rc < 0) { snprintf(msg, msg_size, "Mount slot %c failed (%d)", 'A' + port, rc); return -1; }
 
     card_file file;
@@ -176,7 +190,7 @@ int saves_restore_card_game(const SyncState *state, int port, const char *title_
     card_direntry *de = (card_direntry *)g_gci;
     u32 datalen = (u32)n - 64;
 
-    int rc = CARD_Mount(port, g_workarea, NULL);
+    int rc = card_mount_retry(port);
     if (rc < 0) { snprintf(msg, msg_size, "Mount slot %c failed (%d)", 'A' + port, rc); return -1; }
 
     char fname[CARD_FILENAMELEN + 1];

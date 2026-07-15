@@ -56,6 +56,8 @@ static volatile bool     g_pause_req    = false;
 static uint64_t          g_last_draw    = 0;
 
 static void redraw(void);   /* forward decl: long ops flush mid-run */
+static void scan_local(void);
+static void scan_vmc_view(void);
 
 /* ---- helpers ---- */
 
@@ -88,10 +90,40 @@ static const DISC_INTERFACE *sd_iface(SdDevice dev) {
     }
 }
 
-static bool mount_sd(SyncState *st) {
-    static const SdDevice order[] = { SD_DEV_SP2, SD_DEV_GECKO_A, SD_DEV_GECKO_B };
-    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-        if (fatMountSimple(SD_MOUNT_NAME, sd_iface(order[i]))) {
+/* Per-device probe result shown in the Config view: distinguishes "nothing in
+ * the port" from "card detected but the filesystem didn't mount" (libfat is
+ * FAT12/16/32 only — exFAT cards read as the latter). */
+static char g_sd_diag[SD_DEV_COUNT][16] = { "?", "?", "?" };
+
+static bool try_mount_dev(SdDevice dev) {
+    const DISC_INTERFACE *io = sd_iface(dev);
+    if (!io->startup() || !io->isInserted()) {
+        snprintf(g_sd_diag[dev], sizeof(g_sd_diag[dev]), "none");
+        return false;
+    }
+    if (fatMountSimple(SD_MOUNT_NAME, io)) {
+        snprintf(g_sd_diag[dev], sizeof(g_sd_diag[dev]), "MOUNTED");
+        return true;
+    }
+    /* Device answered but no FAT volume — almost always exFAT/NTFS. */
+    snprintf(g_sd_diag[dev], sizeof(g_sd_diag[dev]), "notFAT32");
+    return false;
+}
+
+/* Mount trying ``pref`` first, then the other devices.  Updates state. */
+static bool mount_sd_preferring(SyncState *st, SdDevice pref) {
+    if (st->sd_ready) {
+        fatUnmount(SD_ROOT);
+        st->sd_ready = false;
+    }
+    SdDevice order[SD_DEV_COUNT];
+    int n = 0;
+    order[n++] = pref;
+    for (int d = 0; d < SD_DEV_COUNT; d++)
+        if ((SdDevice)d != pref) order[n++] = (SdDevice)d;
+
+    for (int i = 0; i < n; i++) {
+        if (try_mount_dev(order[i])) {
             st->sd_ready  = true;
             st->sd_device = order[i];
             strncpy(st->sd_root, SD_ROOT, sizeof(st->sd_root) - 1);
@@ -99,8 +131,11 @@ static bool mount_sd(SyncState *st) {
             return true;
         }
     }
-    st->sd_ready = false;
     return false;
+}
+
+static bool mount_sd(SyncState *st) {
+    return mount_sd_preferring(st, SD_DEV_SP2);
 }
 
 static void show_boot(const char *msg) {
@@ -198,6 +233,30 @@ static void draw_config(void) {
     ui_text_hl(top + CF_GIDA,    g_cfg_sel == CF_GIDA,    UI_WHITE, " GameID A   : %s", g_state.mmce_mode[0] ? "on" : "off");
     ui_text_hl(top + CF_GIDB,    g_cfg_sel == CF_GIDB,    UI_WHITE, " GameID B   : %s", g_state.mmce_mode[1] ? "on" : "off");
     ui_text_hl(top + CF_SAVE,    g_cfg_sel == CF_SAVE,    UI_GREEN, " [ Save config to SD ]");
+
+    /* SD probe diagnostics (updated on every mount attempt). */
+    ui_text(top + CF_COUNT + 1, 1, UI_GREY,
+            "sp2:%s  geckoA:%s  geckoB:%s",
+            g_sd_diag[SD_DEV_SP2], g_sd_diag[SD_DEV_GECKO_A], g_sd_diag[SD_DEV_GECKO_B]);
+    ui_text(top + CF_COUNT + 2, 1, UI_GREY,
+            "notFAT32 = card seen but no FAT volume (exFAT unsupported)");
+}
+
+/* Remount the SD on the (newly chosen) device and refresh SD-backed views. */
+static void apply_sd_device(void) {
+    ui_status("Mounting SD on %s...", sd_device_to_str(g_state.sd_device));
+    redraw();
+    if (mount_sd_preferring(&g_state, g_state.sd_device)) {
+        roms_set_target(g_state.sd_root, g_state.games_folder);
+        roms_ensure_target_dirs();
+        downloads_load(&g_downloads);
+        scan_local();
+        saves_scan_vmc(&g_vmc);
+        ui_status("SD mounted on %s", sd_device_to_str(g_state.sd_device));
+    } else {
+        ui_error("No FAT SD found (sp2:%s A:%s B:%s)",
+                 g_sd_diag[0], g_sd_diag[1], g_sd_diag[2]);
+    }
 }
 
 static void config_change(int dir) {
@@ -221,7 +280,8 @@ static void config_activate(void) {
         case CF_GW:     edit_text(g_state.static_gateway, sizeof(g_state.static_gateway), "Gateway"); break;
         case CF_GAMES:  edit_text(g_state.games_folder, sizeof(g_state.games_folder), "Games folder");
                         roms_set_target(g_state.sd_root, g_state.games_folder); break;
-        case CF_NETMODE: case CF_SDDEV: case CF_GIDA: case CF_GIDB: config_change(+1); break;
+        case CF_SDDEV:  config_change(+1); apply_sd_device(); break;
+        case CF_NETMODE: case CF_GIDA: case CF_GIDB: config_change(+1); break;
         case CF_SAVE:
             if (!g_state.sd_ready) ui_error("No SD mounted - cannot save config");
             else if (config_save(&g_state)) ui_status("Config saved to SD");
@@ -677,16 +737,41 @@ int main(int argc, char **argv) {
 
     show_boot("Mounting SD card...");
     mount_sd(&g_state);
+    bool     mounted     = g_state.sd_ready;
+    SdDevice mounted_dev = g_state.sd_device;
 
+    /* config_load resets the whole state to defaults (wiping the runtime
+     * mount flags) before parsing sd:/3dssync/config.txt — restore the mount
+     * result afterwards, then honor the configured device preference. */
     char err[256] = {0};
     config_load(&g_state, err, sizeof(err));
     config_load_console_id(&g_state);
+    SdDevice want = g_state.sd_device;
+
+    g_state.sd_ready = mounted;
+    if (mounted) g_state.sd_device = mounted_dev;
+
+    if (mounted && want != mounted_dev) {
+        show_boot("Remounting SD on configured device...");
+        mount_sd_preferring(&g_state, want);
+    } else if (!mounted) {
+        /* First attempt found nothing; retry preferring the configured
+         * device (some adapters need a second probe after power-on). */
+        mount_sd_preferring(&g_state, want);
+    }
     roms_set_target(g_state.sd_root, g_state.games_folder);
+
+    CARD_Init("GCSY", "8B");
+
+    /* Scan memory cards BEFORE the network comes up: the BBA shares EXI
+     * channel 0 with slot A, and net traffic during CARD_Mount produced
+     * EXI I/O errors (-5) on real hardware. */
+    g_view = APP_VIEW_ROMS;
+    scan_card_view(0, &g_carda);
+    scan_card_view(1, &g_cardb);
 
     show_boot("Bringing up network (BBA)...");
     network_init(&g_state);
-
-    CARD_Init("GCSY", "8B");
 
     if (g_state.sd_ready) {
         roms_ensure_target_dirs();
@@ -700,10 +785,7 @@ int main(int argc, char **argv) {
     else
         ui_status("SD ready (%s); network not up", sd_device_to_str(g_state.sd_device));
 
-    g_view = APP_VIEW_ROMS;
     if (g_state.sd_ready) { scan_local(); saves_scan_vmc(&g_vmc); }
-    scan_card_view(0, &g_carda);
-    scan_card_view(1, &g_cardb);
     if (network_is_ready(&g_state)) { fetch_catalog(); fetch_server(); }
 
     redraw();
