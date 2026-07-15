@@ -486,8 +486,16 @@ static void queue_selected_rom(bool run_now) {
     DownloadEntry *e = downloads_upsert_from_catalog(&g_downloads, &g_catalog.items[g_rom_sel]);
     if (!e) { ui_error("Download list full"); return; }
     downloads_save(&g_downloads);
-    if (run_now) run_active_download(e);
-    else ui_status("Queued: %s", e->name);
+    if (run_now) {
+        /* Switch to the Downloads view so progress/speed are visible — a
+         * download started from the catalog otherwise runs behind the ROM
+         * list with only a status line, which reads as "frozen". */
+        g_dl_sel = (int)(e - g_downloads.items);
+        g_view = APP_VIEW_DOWNLOADS;
+        run_active_download(e);
+    } else {
+        ui_status("Queued: %s", e->name);
+    }
 }
 
 /* ---- View rendering ---- */
