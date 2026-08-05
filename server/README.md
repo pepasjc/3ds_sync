@@ -92,6 +92,30 @@ The `decrypted-cci` wrapper requires FUSE: `sudo apt install fuse3 libfuse-dev`.
 If FUSE isn't available, only the CIA button in the web UI will work; the
 CCI button will return a 503 with actionable instructions.
 
+### Already-decrypted `.3ds` dumps
+
+Every 3DS tool decides whether to decrypt from the NCCH crypto flags at
+`NCCH+0x188`. Many "decrypted" dumps hold plaintext data but were never
+re-flagged, so `ninfs` / `3dsconv` decrypt plaintext into garbage — which
+surfaces as `pyctr.type.exefs.BadOffsetError: offset is not a multiple of
+0x200` or as `Expected exactly one CIA output, found 0`.
+
+The server probes the NCSD/NCCH headers before converting
+(`app/services/ctr_rom.py`) and:
+
+* **`?extract=decrypted_cci` on an already-decrypted ROM** — no converter runs
+  at all. A correctly flagged ROM is streamed straight through under the
+  `.cci` name; a stale-flagged one is copied with its crypto flags corrected.
+  This works even when no CCI converter (or FUSE) is configured.
+* **`?extract=cia` on a stale-flagged ROM** — the converter is handed a
+  flag-corrected copy so `3dsconv` skips its decryption pass.
+
+Detection is heuristic but conservative: it trusts an explicit `NoCrypto`
+flag, otherwise it looks for a plaintext ExeFS header (32 reserved zero bytes
+plus 0x200-aligned, ASCII-named entries) and falls back to the ExHeader's
+ASCII application title. Anything it can't confirm is treated as encrypted and
+goes down the normal converter path.
+
 ---
 
 ## Running as a Service (Raspberry Pi / Linux)

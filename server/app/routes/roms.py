@@ -212,7 +212,7 @@ def _save_to_cache_by_key(temp_output: Path, label: str, key: str, output_ext: s
 # never holds more than this much in RAM at a time, so 4GB ROMs over slow
 # WAN links cost ~1MB of process memory regardless of file size.
 _STREAM_CHUNK = 1 << 20
-from app.services import rom_scanner
+from app.services import ctr_rom, rom_scanner
 
 router = APIRouter()
 
@@ -1097,8 +1097,27 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
             cached, 'application/x-3ds-rom', download_name=download_name
         )
 
+    # Already-decrypted source + decrypted-CCI request = nothing to convert.
+    # A raw .3ds whose NCCH headers already say NoCrypto IS a decrypted .cci,
+    # so stream it straight through under the .cci name instead of paying for
+    # a ninfs mount and a multi-GB copy.  (ZIP sources still need extracting,
+    # so they take the ``_run`` path below.)
+    source_info = None
+    if source_path.suffix.lower() in _3DS_CART_EXTENSIONS:
+        source_info = ctr_rom.probe(source_path)
+        if fmt == 'decrypted_cci' and source_info.decrypted and source_info.flags_marked:
+            return _stream_file_response(
+                source_path, 'application/x-3ds-rom', download_name=download_name
+            )
+
+    # A decrypted source only needs a flag fix-up for CCI output, which is a
+    # plain copy — don't demand a configured converter for it.
+    converter_optional = (
+        fmt == 'decrypted_cci' and source_info is not None and source_info.decrypted
+    )
+
     command_template = getattr(settings, spec['setting'])
-    if not command_template:
+    if not command_template and not converter_optional:
         return Response(
             status_code=503,
             content=(
@@ -1124,9 +1143,28 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
         output_name = f"{stem}{spec['output_ext']}"
         output_path = tmp / output_name
 
+        # Every 3DS tool decides whether to decrypt from the NCCH crypto flags.
+        # Dumps that were decrypted without patching those flags make ninfs and
+        # 3dsconv "decrypt" plaintext into garbage — pyctr raises BadOffsetError,
+        # 3dsconv silently emits no CIA.  Detect that up front.
+        info = source_info if input_path == source_path else ctr_rom.probe(input_path)
+        converter_input = input_path
+
+        if info.decrypted:
+            if fmt == 'decrypted_cci':
+                # Nothing to decrypt: copy through, correcting the flags so
+                # emulators don't try to decrypt plaintext either.
+                ctr_rom.write_decrypted_copy(input_path, output_path, info)
+                return output_path
+            if info.needs_flag_patch:
+                # Hand the converter a flag-corrected copy so it skips its
+                # (destructive) decryption pass.
+                converter_input = tmp / f"{stem}.dec{input_path.suffix or '.3ds'}"
+                ctr_rom.write_decrypted_copy(input_path, converter_input, info)
+
         cmd = _expand_command_template(
             command_template,
-            input=str(input_path),
+            input=str(converter_input),
             output=str(output_path),
             output_dir=str(tmp),
             stem=stem,
@@ -1138,12 +1176,17 @@ async def _extract_3ds(source_path: Path, system: str, fmt: str) -> Response:
             timeout=1800,
         )
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or '3DS conversion failed')
+            raise RuntimeError(
+                (result.stderr.strip() or result.stdout.strip() or '3DS conversion failed')
+                + f" [source: {info.describe()}]"
+            )
 
         final_path = output_path if output_path.is_file() else _find_single_output(tmp, spec['output_ext'])
         if final_path is None or not final_path.is_file():
             raise RuntimeError(
-                f"converter completed but did not produce a {spec['output_ext']} file"
+                f"converter completed but did not produce a {spec['output_ext']} file; "
+                f"source: {info.describe()}"
+                f"{_format_converter_log(result)}"
             )
         return final_path
 

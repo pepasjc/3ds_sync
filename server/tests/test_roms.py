@@ -259,6 +259,76 @@ def rom_client_cci_zip(rom_dir, client, auth_headers):
     rom_scanner._catalog = None
 
 
+@pytest.fixture()
+def rom_client_3ds_raw(rom_dir, client, auth_headers):
+    """Raw (unzipped) .3ds carts with real NCSD headers: one properly flagged
+    decrypted dump, one decrypted-but-still-flagged-encrypted dump, and one
+    encrypted dump."""
+    from app.services import rom_db, rom_scanner
+
+    from .test_ctr_rom import _build_cart
+
+    original_rom_dir = settings.rom_dir
+    original_interval = settings.rom_scan_interval
+    original_cia_cmd = settings.rom_3ds_cia_command
+    original_decrypted_cci_cmd = settings.rom_3ds_decrypted_cci_command
+
+    settings.rom_dir = rom_dir
+    settings.rom_scan_interval = 0
+    settings.rom_3ds_cia_command = json.dumps(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[2]).write_bytes(b'CIA:' + Path(sys.argv[1]).read_bytes())"
+            ),
+            "{input}",
+            "{output}",
+        ]
+    )
+    settings.rom_3ds_decrypted_cci_command = json.dumps(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[2]).write_bytes(b'DCCI:' + Path(sys.argv[1]).read_bytes())"
+            ),
+            "{input}",
+            "{output}",
+        ]
+    )
+
+    rom_db.init_db(settings.save_dir)
+    _load_server_game_name_data()
+
+    (rom_dir / "n3ds").mkdir()
+    carts = {
+        "Flagged": _build_cart(decrypted=True, no_crypto_flag=True),
+        "Stale": _build_cart(decrypted=True, no_crypto_flag=False),
+        "Encrypted": _build_cart(decrypted=False, no_crypto_flag=False),
+    }
+    for name, data in carts.items():
+        (rom_dir / "n3ds" / f"{name} (USA).3ds").write_bytes(data)
+
+    rom_scanner.init(rom_dir)
+
+    yield client, carts
+
+    settings.rom_dir = original_rom_dir
+    settings.rom_scan_interval = original_interval
+    settings.rom_3ds_cia_command = original_cia_cmd
+    settings.rom_3ds_decrypted_cci_command = original_decrypted_cci_cmd
+    rom_scanner._catalog = None
+
+
+def _rom_id_for(client, auth_headers, name_prefix: str) -> str:
+    roms = client.get("/api/v1/roms?system=3DS", headers=auth_headers).json()["roms"]
+    match = next(r for r in roms if r["name"].startswith(name_prefix))
+    return match["rom_id"]
+
+
 class TestRomCatalog:
     def test_dat_normalizer_uses_aliases_for_translated_titles(self, tmp_path):
         from app.services.dat_normalizer import DatNormalizer
@@ -1393,6 +1463,61 @@ class TestRomDownload:
         assert resp.headers["content-disposition"].endswith(
             'filename="Pilotwings Resort (USA).cci"'
         )
+
+    def test_decrypted_cci_of_already_decrypted_rom_skips_the_converter(
+        self, rom_client_3ds_raw, auth_headers
+    ):
+        """A .3ds whose NCCH headers already say NoCrypto IS a decrypted .cci —
+        serve it verbatim instead of running ninfs over it."""
+        client, carts = rom_client_3ds_raw
+        rom_id = _rom_id_for(client, auth_headers, "Flagged")
+
+        resp = client.get(f"/api/v1/roms/{rom_id}?extract=decrypted_cci", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.content == carts["Flagged"]          # no 'DCCI:' prefix
+        assert resp.headers["content-disposition"].endswith('filename="Flagged (USA).cci"')
+
+    def test_decrypted_cci_patches_stale_crypto_flags(self, rom_client_3ds_raw, auth_headers):
+        """Plaintext data + 'still encrypted' flags: copy through, fixing the
+        flags, rather than letting ninfs decrypt plaintext into garbage."""
+        from app.services import ctr_rom
+
+        client, carts = rom_client_3ds_raw
+        rom_id = _rom_id_for(client, auth_headers, "Stale")
+
+        resp = client.get(f"/api/v1/roms/{rom_id}?extract=decrypted_cci", headers=auth_headers)
+        assert resp.status_code == 200
+        assert not resp.content.startswith(b"DCCI:")
+        assert len(resp.content) == len(carts["Stale"])
+
+        flags_at = 0x4000 + ctr_rom.NCCH_FLAGS_OFFSET
+        assert resp.content[flags_at + 7] & ctr_rom.FLAG_NO_CRYPTO
+        assert resp.content[flags_at + 3] == 0x00
+
+    def test_cia_conversion_gets_flag_corrected_input(self, rom_client_3ds_raw, auth_headers):
+        """3dsconv trusts the crypto flags, so it must never see a plaintext
+        ROM that claims to be encrypted."""
+        from app.services import ctr_rom
+
+        client, carts = rom_client_3ds_raw
+        rom_id = _rom_id_for(client, auth_headers, "Stale")
+
+        resp = client.get(f"/api/v1/roms/{rom_id}?extract=cia", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.content.startswith(b"CIA:")
+
+        seen_by_converter = resp.content[len(b"CIA:"):]
+        flags_at = 0x4000 + ctr_rom.NCCH_FLAGS_OFFSET
+        assert seen_by_converter[flags_at + 7] & ctr_rom.FLAG_NO_CRYPTO
+        assert seen_by_converter != carts["Stale"]
+
+    def test_cia_conversion_of_encrypted_rom_is_untouched(self, rom_client_3ds_raw, auth_headers):
+        client, carts = rom_client_3ds_raw
+        rom_id = _rom_id_for(client, auth_headers, "Encrypted")
+
+        resp = client.get(f"/api/v1/roms/{rom_id}?extract=cia", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.content == b"CIA:" + carts["Encrypted"]
 
     def test_download_xbox_iso_as_cci_zip(self, tmp_path, client, auth_headers):
         """ISO source + ?extract=cci runs the configured converter, then
