@@ -46,6 +46,14 @@ _SERIAL_STRIP_RE = re.compile(r"[^A-Z0-9]")
 # Hex title_id format for the NDS prefix_hex_serial strategy output.
 _HEX_TITLE_ID_RE = re.compile(r"^[0-9A-F]{16}$")
 
+# Systems whose sync_id suffix is a 4-char *gamecode*, not a slug.  These are
+# case-insensitive identifiers (the code is stamped uppercase on the disc, e.g.
+# ``DL-DOL-GRSE-USA``), so they must be canonicalised to uppercase or the same
+# game arrives under two keys: the GC/Wii U homebrew and the server's VMC
+# import emit ``GC_GRSE`` while the Dolphin scanners emit ``GC_grse``.
+_CODE_FORM_SYSTEMS = frozenset({"GC", "WII"})
+_CODE_FORM_TITLE_ID_RE = re.compile(r"^([A-Za-z0-9]{2,8})_([A-Za-z0-9]{4})$")
+
 
 @dataclass
 class ResolveInput:
@@ -104,6 +112,34 @@ def canonicalize_serial(serial: str) -> str:
 def is_hex_title_id(value: str) -> bool:
     """True when ``value`` looks like a 16-char hex title_id."""
     return bool(value) and bool(_HEX_TITLE_ID_RE.match(value.upper()))
+
+
+def is_code_form_title_id(title_id: str) -> bool:
+    """True for gamecode-form sync_ids (``GC_GRSE``, ``WII_RMCE``), any casing."""
+    if not title_id:
+        return False
+    m = _CODE_FORM_TITLE_ID_RE.match(title_id.strip())
+    return m is not None and m.group(1).upper() in _CODE_FORM_SYSTEMS
+
+
+def canonicalize_code_form_title_id(title_id: str) -> str:
+    """Uppercase gamecode-form sync_ids (``GC_grse`` → ``GC_GRSE``).
+
+    Only ``SYSTEM_xxxx`` IDs whose system is in :data:`_CODE_FORM_SYSTEMS` and
+    whose suffix is exactly four alphanumerics are touched.  Real slug IDs
+    (``GBA_zelda_the_minish_cap``) keep their lowercase slug — uppercasing
+    those would orphan every save already stored under the slug form.
+
+    Safe to call on any string; non-matching input is returned unchanged.
+    """
+    if not title_id:
+        return title_id
+    m = _CODE_FORM_TITLE_ID_RE.match(title_id.strip())
+    if m is None:
+        return title_id
+    if m.group(1).upper() not in _CODE_FORM_SYSTEMS:
+        return title_id
+    return title_id.strip().upper()
 
 
 def nds_gamecode_to_sync_id(gamecode: str, prefix: str = "00048000") -> Optional[str]:
@@ -322,8 +358,10 @@ def canonicalize_slug_title_id(
 __all__ = [
     "ResolveInput",
     "ResolveResult",
+    "canonicalize_code_form_title_id",
     "canonicalize_serial",
     "canonicalize_slug_title_id",
+    "is_code_form_title_id",
     "is_hex_title_id",
     "nds_gamecode_to_sync_id",
     "resolve",

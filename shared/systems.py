@@ -57,6 +57,7 @@ SYSTEM_CHOICES: list[str] = sorted(
         "VB",
         "VITA",
         "WII",
+        "WIIU",
         "WSWAN",
         "WSWANC",
         "XBOX",
@@ -185,6 +186,7 @@ SYSTEM_CODES: frozenset[str] = frozenset(SYSTEM_CHOICES) | frozenset(
         "3DS",
         "VITA",
         "WII",
+        "WIIU",      # Nintendo Wii U
         "NSW",       # Nintendo Switch
         "NEOCD",     # Neo Geo CD
         "PS3",       # already in SYSTEM_CHOICES; listed here for clarity

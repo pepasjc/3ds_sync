@@ -35,6 +35,7 @@ from systems import (
     SYSTEM_DEFAULT_SAVE_EXT,
 )
 from shared.rom_id import make_title_id, normalize_rom_name
+from shared.sync_id import canonicalize_code_form_title_id
 
 # ---------------------------------------------------------------------------
 # ROM name normalization helpers layered on top of shared.rom_id
@@ -1206,10 +1207,27 @@ _REMOTE_HASH_CACHE_DIRTY = False
 _SAROO_META: dict[str, dict] = {}
 
 
+def _canonicalize_state_keys(state: dict[str, str]) -> dict[str, str]:
+    """Fold gamecode-form keys (GC_grse) onto their canonical form (GC_GRSE).
+
+    Builds before the GC title-id canonicalisation wrote lowercase keys.  Left
+    alone, every GameCube game would lose its last_synced_hash on upgrade and
+    come back as a spurious conflict.  An existing canonical entry wins.
+    """
+    out: dict[str, str] = {}
+    for key, value in state.items():
+        canonical = canonicalize_code_form_title_id(key)
+        if canonical == key or canonical not in state:
+            out[canonical] = value
+    return out
+
+
 def _load_state() -> dict[str, str]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return _canonicalize_state_keys(
+                json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            )
         except Exception:
             pass
     return {}
@@ -1221,7 +1239,7 @@ def _save_state(state: dict[str, str]) -> None:
 
 def _update_state(title_id: str, hash_val: str) -> None:
     state = _load_state()
-    state[title_id] = hash_val
+    state[canonicalize_code_form_title_id(title_id)] = hash_val
     _save_state(state)
 
 
@@ -1417,7 +1435,7 @@ def _memcard_hash_cache_key_from_path(
     if not resolved_title:
         if resolved_system == "GC":
             gc_code = _gc_code_from_folder(parent)
-            resolved_title = f"GC_{gc_code.lower()}" if gc_code else ""
+            resolved_title = f"GC_{gc_code.upper()}" if gc_code else ""
         else:
             resolved_title = parent
 
@@ -4218,7 +4236,7 @@ def _hash_memcard_file_cached(path: Path, system: str, title_id: str) -> str:
 
 
 def _hash_memcard_gc_file_cached(path: Path, gc_code: str) -> str:
-    title_id = f"GC_{gc_code.lower()}"
+    title_id = f"GC_{gc_code.upper()}"
     try:
         stat = path.stat()
     except OSError:
@@ -4315,7 +4333,7 @@ def _hash_ftp_gc_card_cached(
     profile_scope: str,
 ) -> str:
     entry = _ftp_file_with_metadata(ftp, entry)
-    title_id = f"GC_{gc_code.lower()}"
+    title_id = f"GC_{gc_code.upper()}"
     cache_keys = [
         _remote_hash_cache_key(profile_scope, entry.path),
         _memcard_hash_cache_key("GC", title_id, entry.name),
@@ -4423,7 +4441,7 @@ def _scan_memcard_pro_ftp(
                     save_hash = ""
                 results.append(
                     SaveFile(
-                        title_id=f"GC_{gc_code.lower()}",
+                        title_id=f"GC_{gc_code.upper()}",
                         path=remote_path,
                         hash=save_hash,
                         mtime=slot1.mtime or time.time(),
@@ -4589,7 +4607,7 @@ def _scan_memcard_pro(
             if slot1 is None:
                 continue
 
-            title_id = f"GC_{gc_code.lower()}"
+            title_id = f"GC_{gc_code.upper()}"
             # Hash only the extracted GCI bytes so the hash matches what
             # we actually upload to the server (and what Dolphin stores).
             save_hash = _hash_memcard_gc_file_cached(slot1, gc_code)

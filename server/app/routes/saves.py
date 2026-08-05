@@ -13,7 +13,10 @@ from app.models.save import (
     validate_any_title_id,
 )
 from app.services import dat_normalizer, game_names, storage
-from shared.sync_id import canonicalize_slug_title_id
+from shared.sync_id import (
+    canonicalize_code_form_title_id,
+    canonicalize_slug_title_id,
+)
 from app.services.ps1_cards import (
     create_vmp,
     ensure_raw_slot_files,
@@ -1019,6 +1022,9 @@ async def upload_save(
         bundle_tid = canonicalize_slug_title_id(
             bundle_tid, serial_lookup=norm.lookup_serial
         )
+    # Gamecode-form IDs (GC_grse) are case-insensitive — uppercase them so
+    # storage keys off the same directory as the canonicalised URL ID.
+    bundle_tid = canonicalize_code_form_title_id(bundle_tid)
     if bundle_tid.upper() != title_id.upper():
         raise HTTPException(
             status_code=400,

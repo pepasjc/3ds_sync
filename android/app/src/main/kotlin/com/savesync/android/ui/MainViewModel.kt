@@ -535,7 +535,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         (entry.systemName == "3DS" && hex16TitleIdRegex.matches(entry.titleId)) ||
                         ((entry.systemName == "PS1" || entry.systemName == "PS2") && !entry.titleId.contains('_')) ||
                         (entry.systemName == "SAT" && entry.titleId.startsWith("SAT_")) ||
-                        (entry.systemName == "GC" && entry.titleId.startsWith("GC_"))
+                        (entry.systemName == "GC" && entry.titleId.startsWith("GC_", ignoreCase = true))
                     }
                     val gameNameTriple =
                         if (productCodeEntries.isNotEmpty()) {
@@ -2030,7 +2030,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         api.getPs1CardMeta(titleId, slot = 0)
                     systemName == "PS2" && !titleId.contains('_') ->
                         api.getPs2CardMeta(titleId, format = "ps2")
-                    systemName == "GC" && titleId.startsWith("GC_") ->
+                    systemName == "GC" && titleId.startsWith("GC_", ignoreCase = true) ->
                         api.getGcCardMeta(titleId)
                     else -> api.getSaveMeta(titleId)
                 }

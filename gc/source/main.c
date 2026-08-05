@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp — GC_ title ids are case-insensitive */
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -614,8 +615,8 @@ static void fill_card_names(GcSaveList *list) {
     for (int i = 0; i < list->count; i++) {
         for (int j = 0; j < g_server.count; j++) {
             const ServerSave *sv = &g_server.items[j];
-            if (strcmp(sv->title_id, list->items[i].title_id) != 0) continue;
-            if (sv->name[0] && strcmp(sv->name, sv->title_id) != 0) {
+            if (strcasecmp(sv->title_id, list->items[i].title_id) != 0) continue;
+            if (sv->name[0] && strcasecmp(sv->name, sv->title_id) != 0) {
                 strncpy(list->items[i].name, sv->name,
                         sizeof(list->items[i].name) - 1);
             }
@@ -629,9 +630,9 @@ static void mark_server_local(void) {
         ServerSave *s = &g_server.items[i];
         s->local = false;
         for (int j = 0; j < g_carda.count && !s->local; j++)
-            if (strcmp(g_carda.items[j].title_id, s->title_id) == 0) s->local = true;
+            if (strcasecmp(g_carda.items[j].title_id, s->title_id) == 0) s->local = true;
         for (int j = 0; j < g_cardb.count && !s->local; j++)
-            if (strcmp(g_cardb.items[j].title_id, s->title_id) == 0) s->local = true;
+            if (strcasecmp(g_cardb.items[j].title_id, s->title_id) == 0) s->local = true;
     }
 }
 
@@ -756,8 +757,8 @@ static void fill_vmccard_names(void) {
     for (int i = 0; i < g_vmccard.count; i++) {
         for (int j = 0; j < g_server.count; j++) {
             const ServerSave *sv = &g_server.items[j];
-            if (strcmp(sv->title_id, g_vmccard.saves[i].title_id) != 0) continue;
-            if (sv->name[0] && strcmp(sv->name, sv->title_id) != 0) {
+            if (strcasecmp(sv->title_id, g_vmccard.saves[i].title_id) != 0) continue;
+            if (sv->name[0] && strcasecmp(sv->name, sv->title_id) != 0) {
                 strncpy(g_vmccard.saves[i].name, sv->name,
                         sizeof(g_vmccard.saves[i].name) - 1);
             }
@@ -1135,15 +1136,15 @@ int main(int argc, char **argv) {
             else if (down & PAD_TRIGGER_Z) {
                 if (g_server.count > 0 && g_sv_sel < g_server.count) {
                     const ServerSave *s = &g_server.items[g_sv_sel];
-                    const char *gc = strncmp(s->title_id, "GC_", 3) == 0 ? s->title_id + 3 : s->title_id;
+                    const char *gc = strncasecmp(s->title_id, "GC_", 3) == 0 ? s->title_id + 3 : s->title_id;
                     /* Use the real maker code when the game is on a scanned
                      * card — MMCE devices key channels on the full 6-char ID. */
                     const char *company = "";
                     for (int i = 0; i < g_carda.count && !company[0]; i++)
-                        if (!strcmp(g_carda.items[i].title_id, s->title_id))
+                        if (!strcasecmp(g_carda.items[i].title_id, s->title_id))
                             company = g_carda.items[i].company;
                     for (int i = 0; i < g_cardb.count && !company[0]; i++)
-                        if (!strcmp(g_cardb.items[i].title_id, s->title_id))
+                        if (!strcasecmp(g_cardb.items[i].title_id, s->title_id))
                             company = g_cardb.items[i].company;
                     int port = g_state.mmce_mode[0] ? 0 : (g_state.mmce_mode[1] ? 1 : 0);
                     mcp_gameid(port, gc, company, s->name[0] ? s->name : s->title_id);

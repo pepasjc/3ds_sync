@@ -1207,6 +1207,76 @@ class TestGcVmcImport:
         )
         assert r.status_code == 400
 
+    def test_lowercase_gc_title_id_hits_the_same_save(self, client, auth_headers):
+        """The Dolphin scanners emit GC_gm8e while the GC/Wii U homebrew and
+        this import emit GC_GM8E.  Both must address one storage key or the
+        same game duplicates on the server."""
+        card, gci = self._make_card("GM8E")
+        r = client.post(
+            "/api/v1/saves/gc-vmc/import",
+            content=card,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+
+        dl = client.get("/api/v1/saves/GC_gm8e/gc-card?format=gci", headers=auth_headers)
+        assert dl.status_code == 200
+        assert dl.content[64:] == gci[64:]
+
+        # And only one title is listed, under the canonical uppercase ID.
+        titles = client.get("/api/v1/titles", headers=auth_headers).json()
+        gc_ids = [
+            t["title_id"] for t in titles["titles"] if t["title_id"].upper().startswith("GC_")
+        ]
+        assert gc_ids == ["GC_GM8E"]
+
+    def test_lowercase_gc_upload_lands_on_canonical_id(self, client, auth_headers):
+        """A lowercase-ID upload must not create a second directory."""
+        card, _ = self._make_card("GM4E")
+        r = client.post(
+            "/api/v1/saves/GC_gm4e/gc-card?format=raw",
+            content=card,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code == 200
+
+        meta = client.get("/api/v1/saves/GC_GM4E/meta", headers=auth_headers)
+        assert meta.status_code == 200
+        assert meta.json()["title_id"] == "GC_GM4E"
+
+
+class TestCodeFormTitleIdCanonicalisation:
+    """GC_/WII_ IDs carry a 4-char gamecode, which is case-insensitive.
+    Real slug IDs (GBA_zelda_the_minish_cap) must keep their lowercase slug."""
+
+    def test_gamecode_form_is_uppercased(self):
+        from app.models.save import validate_any_title_id
+
+        assert validate_any_title_id("GC_grse") == "GC_GRSE"
+        assert validate_any_title_id("GC_GRSE") == "GC_GRSE"
+        assert validate_any_title_id("gc_grse") == "GC_GRSE"
+        assert validate_any_title_id("WII_rmce") == "WII_RMCE"
+
+    def test_slug_ids_keep_their_case(self):
+        from app.models.save import validate_any_title_id
+
+        assert (
+            validate_any_title_id("GBA_zelda_the_minish_cap")
+            == "GBA_zelda_the_minish_cap"
+        )
+        # A 4-char slug on a slug-strategy system is NOT a gamecode.
+        assert validate_any_title_id("GBA_doom") == "GBA_doom"
+        assert validate_any_title_id("SAT_GS-9188") == "SAT_GS-9188"
+
+    def test_is_code_form_predicate(self):
+        from shared.sync_id import is_code_form_title_id
+
+        assert is_code_form_title_id("GC_grse") is True
+        assert is_code_form_title_id("WII_RMCE") is True
+        assert is_code_form_title_id("GBA_doom") is False
+        assert is_code_form_title_id("GC_zelda_wind_waker") is False
+        assert is_code_form_title_id("") is False
+
 
 class TestPs2Files:
     """Physical-card path: P2FD folder payload <-> stored single-game card."""

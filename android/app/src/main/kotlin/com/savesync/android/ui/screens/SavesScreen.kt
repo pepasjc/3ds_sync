@@ -796,6 +796,7 @@ fun systemChipColor(systemName: String): Color {
         "N64"             -> Color(0xFF558B2F)
         "GC"              -> Color(0xFF7B1FA2)
         "WII"             -> Color(0xFF00838F)
+        "WIIU"            -> Color(0xFF006064)
         "PS1", "PSX"      -> Color(0xFF1A237E)
         "PS2"             -> Color(0xFF0D47A1)
         "PSP", "PPSSPP"   -> Color(0xFF01579B)

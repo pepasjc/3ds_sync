@@ -885,7 +885,7 @@ def lookup_names_typed(product_codes: list[str]) -> dict[str, tuple[str, str]]:
             continue
 
         # GC/Wii emulator format: GC_xxxx (e.g. GC_gbze → game code GBZE)
-        if code_upper.startswith("GC_") and len(code_upper) >= 6:
+        if code_upper.startswith("GC_") and len(code_upper) >= 7:
             game_code = code_upper[3:7]
             name = _wii_names.get(game_code)
             if name:

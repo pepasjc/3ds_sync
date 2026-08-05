@@ -1,7 +1,16 @@
 """Configuration management for the Steam Deck SaveSync client."""
 
 import json
+import sys
 from pathlib import Path
+
+# Make the repo root importable so 'shared' can be found when config.py is
+# imported before main.py's own sys.path bootstrap (e.g. from tests).
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from shared.sync_id import canonicalize_code_form_title_id  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".config" / "savesync" / "steamdeck.json"
 STATE_PATH = Path.home() / ".config" / "savesync" / "steamdeck_state.json"
@@ -131,12 +140,27 @@ def save_config(config: dict) -> None:
         json.dump(config, f, indent=2)
 
 
+def _canonicalize_state_keys(state: dict) -> dict:
+    """Fold gamecode-form keys (GC_grse) onto their canonical form (GC_GRSE).
+
+    Builds before the GC title-id canonicalisation wrote lowercase keys.  Left
+    alone, every GameCube game would lose its last_synced_hash on upgrade and
+    come back as a spurious conflict.  An existing canonical entry wins.
+    """
+    out: dict = {}
+    for key, value in state.items():
+        canonical = canonicalize_code_form_title_id(key)
+        if canonical == key or canonical not in state:
+            out[canonical] = value
+    return out
+
+
 def load_sync_state() -> dict:
     """Load last-synced hashes per title_id."""
     if STATE_PATH.exists():
         try:
             with open(STATE_PATH) as f:
-                return json.load(f)
+                return _canonicalize_state_keys(json.load(f))
         except Exception:
             pass
     return {}

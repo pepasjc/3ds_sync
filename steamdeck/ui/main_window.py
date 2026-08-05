@@ -179,7 +179,7 @@ class ServerWorker(QObject):
         the card's display_name as a stand-in filename when there is no
         rom_filename available.
         """
-        skip_systems = {"GC", "PS3", "PSP", "WII", "NSW", "?"}
+        skip_systems = {"GC", "PS3", "PSP", "WII", "WIIU", "NSW", "?"}
         disc_systems = _DISC_SLUG_SYSTEMS
         needs_lookup: list[tuple[GameEntry, str]] = []
         rom_entries: list[dict[str, str]] = []
@@ -246,7 +246,10 @@ class ServerWorker(QObject):
                 or bool(_PRODUCT_CODE_RE.match(name))
                 or bool(_HEX16_RE.match(name))
                 or bool(_HEX8_RE.match(name))
-                or entry.title_id.startswith("GC_")  # GCI descriptions < server DB
+                # GCI descriptions < server DB.  Case-insensitive: saves
+                # scanned before the GC_<CODE> canonicalisation may still be
+                # cached under the old lowercase form.
+                or entry.title_id.upper().startswith("GC_")
             )
             if not needs_name:
                 continue

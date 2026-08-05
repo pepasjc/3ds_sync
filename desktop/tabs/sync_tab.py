@@ -523,7 +523,7 @@ class SyncTab(QWidget):
         for st in statuses:
             save = st.save
             is_ps_code = _PS_TITLE_ID_RE.match(save.title_id)
-            is_gc_code = save.system == "GC" and save.title_id.startswith("GC_")
+            is_gc_code = save.system == "GC" and save.title_id.upper().startswith("GC_")
             if not is_ps_code and not is_gc_code:
                 continue
             if is_ps_code and not self._looks_like_raw_code_label(
@@ -1215,7 +1215,10 @@ class SyncTab(QWidget):
                 # Title ID is GC_xxxx; reconstruct the DL-DOL-XXXX-USA folder.
                 # We can't know the exact region suffix from the title_id alone,
                 # so we look for an existing matching folder, or default to -USA.
-                gc_code = st.save.title_id[3:].upper()  # e.g. "GBZE"
+                tid = st.save.title_id
+                if not tid.upper().startswith("GC_"):
+                    return None
+                gc_code = tid[3:7].upper()  # e.g. "GBZE"
                 existing = (
                     next(
                         (
