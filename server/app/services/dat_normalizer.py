@@ -54,6 +54,8 @@ _DAT_SYSTEM_MAP: list[tuple[str, str]] = [
     # Nintendo home
     ("gamecube", "GC"),
     ("nintendo - gamecube", "GC"),
+    ("nintendo - wii u", "WIIU"),  # must come before the plain Wii entry
+    ("wii u", "WIIU"),
     ("nintendo - wii", "WII"),
     # Sony
     ("playstation2", "PS2"),

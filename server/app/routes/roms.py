@@ -207,6 +207,46 @@ def _save_to_cache_by_key(temp_output: Path, label: str, key: str, output_ext: s
         return temp_output
 
 
+# ── Directory-shaped conversion cache ───────────────────────────────────────
+#
+# Most conversions produce one file, but the Wii WBFS split produces a set of
+# them (Foo.wbfs + Foo.wbf1 + ...) plus a manifest.  Those live together in a
+# cache *directory* keyed exactly like the single-file variants.
+
+def _cached_output_dir(source_path: Path, fmt: str) -> Path | None:
+    cache = _conversion_cache_dir()
+    if cache is None:
+        return None
+    key = _conversion_cache_key(source_path, fmt)
+    return cache / f"{source_path.stem}_{key}_{fmt}"
+
+
+def _lookup_cached_dir(source_path: Path, fmt: str) -> Path | None:
+    """Return a completed cache directory, or ``None``.
+
+    A directory only counts as a hit once its manifest.json exists — that is
+    written last, so a half-finished conversion (crash, power cut) is never
+    mistaken for a usable result.
+    """
+    candidate = _cached_output_dir(source_path, fmt)
+    if candidate is None:
+        return None
+    return candidate if (candidate / "manifest.json").is_file() else None
+
+
+def _save_dir_to_cache(temp_dir: Path, source_path: Path, fmt: str) -> Path:
+    cached = _cached_output_dir(source_path, fmt)
+    if cached is None:
+        return temp_dir
+    try:
+        if cached.exists():
+            shutil.rmtree(cached, ignore_errors=True)
+        shutil.move(str(temp_dir), str(cached))
+        return cached
+    except OSError:
+        return temp_dir
+
+
 # Chunk size for streamed Range responses. 1 MiB is a good balance between
 # syscall overhead and keeping memory bounded — a single in-flight request
 # never holds more than this much in RAM at a time, so 4GB ROMs over slow
@@ -835,6 +875,100 @@ async def download_bundle_file(
     return _serve_full(requested, file_size, content_type)
 
 
+# ── Wii split-WBFS endpoints ─────────────────────────────────────────────────
+#
+# MUST stay above the /roms/{rom_key:path} catch-all below, otherwise the
+# catch-all swallows "<id>/wbfs-manifest" as a rom key.
+
+def _resolve_rom_source(rom_key: str) -> tuple[object | None, Path | None, Response | None]:
+    """Look up a catalog entry + its on-disk file, or an error Response."""
+    catalog = rom_scanner.get()
+    if not catalog:
+        return None, None, Response(status_code=404, content="No ROM catalog available")
+
+    entry = catalog.get(rom_key)
+    if not entry:
+        for e in catalog.list_all():
+            if e.title_id == rom_key:
+                entry = e
+                break
+    if not entry:
+        return None, None, Response(status_code=404, content=f"ROM not found: {rom_key}")
+    if getattr(entry, 'is_bundle', False):
+        return entry, None, Response(status_code=400,
+                                     content="Bundle entries have no WBFS conversion")
+
+    rom_dir = settings.rom_dir
+    if not rom_dir:
+        return entry, None, Response(status_code=404, content="ROM directory not configured")
+
+    file_path = rom_dir / entry.path
+    if not file_path.is_file():
+        return entry, None, Response(status_code=404, content="ROM file not found on disk")
+    return entry, file_path, None
+
+
+async def _wbfs_cache_for(rom_key: str) -> tuple[Path | None, Response | None]:
+    entry, file_path, err = _resolve_rom_source(rom_key)
+    if err is not None:
+        return None, err
+
+    def _run() -> tuple[Path | None, str | None]:
+        return _build_wbfs_dir(file_path, entry.name)
+
+    try:
+        cache_dir, error = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except subprocess.TimeoutExpired:
+        return None, Response(status_code=504,
+                              content="WBFS conversion timed out (>30 min)")
+    if error:
+        # Missing converter is an environment problem, not a bad request.
+        status = 503 if 'not found' in error else 500
+        return None, Response(status_code=status, content=error)
+    return cache_dir, None
+
+
+@router.get("/roms/{rom_key}/wbfs-manifest")
+async def rom_wbfs_manifest(rom_key: str):
+    """Convert a Wii ROM to split WBFS and return the part list.
+
+    The first call for a given ROM runs RVZ → ISO → split WBFS, which takes
+    minutes on a dual-layer disc; clients should use a long timeout.  Later
+    calls are served from the conversion cache.
+    """
+    cache_dir, err = await _wbfs_cache_for(rom_key)
+    if err is not None:
+        return JSONResponse(status_code=err.status_code,
+                            content={"detail": bytes(err.body).decode(errors="replace")})
+
+    manifest = json.loads((cache_dir / "manifest.json").read_text(encoding="utf-8"))
+    return manifest
+
+
+@router.api_route("/roms/{rom_key}/wbfs/{filename}", methods=["GET", "HEAD"])
+async def download_wbfs_part(
+    rom_key: str,
+    filename: str,
+    range_header: Optional[str] = Header(None, alias="Range"),
+):
+    """Stream one split WBFS part, with Range support so a part resumes."""
+    if not _WBFS_PART_RE.match(filename):
+        return Response(status_code=400, content="Bad WBFS part name")
+
+    cache_dir, err = await _wbfs_cache_for(rom_key)
+    if err is not None:
+        return err
+
+    part = cache_dir / filename
+    if not part.is_file():
+        return Response(status_code=404, content=f"WBFS part not found: {filename}")
+
+    file_size = part.stat().st_size
+    if range_header:
+        return _serve_range(part, file_size, 'application/octet-stream', range_header)
+    return _serve_full(part, file_size, 'application/octet-stream')
+
+
 # ── Download endpoint ────────────────────────────────────────────────────────
 
 @router.api_route("/roms/{rom_key:path}", methods=["GET", "HEAD"])
@@ -1064,6 +1198,148 @@ async def _extract_rvz(rvz_path: Path, stem: str) -> Response:
 
     cached_path = _save_to_cache(iso_path, rvz_path, 'rvz', '.iso')
     return _stream_file_response(cached_path, 'application/x-iso9660-image', cleanup_dir=tmpdir)
+
+
+# ── Wii RVZ/ISO → split WBFS (FAT32-friendly USB-loader layout) ─────────────
+#
+# Wii discs are up to 8.5 GB, so a single file cannot live on FAT32.  USB
+# Loader GX / WiiFlow read wit's split WBFS layout instead:
+#
+#   <wbfs>/<Name> [ID6]/<ID6>.wbfs      first 4 GiB-32 KiB chunk
+#   <wbfs>/<Name> [ID6]/<ID6>.wbf1      next chunk, and so on
+#
+# The parts are cached as a directory and served individually with Range
+# support, so an interrupted 8 GB transfer resumes at the byte — which a
+# streaming ZIP could never do.
+
+_WBFS_PART_RE = re.compile(r'^[A-Z0-9]{6}\.wbf[s0-9]$')
+_WBFS_CONVERT_TIMEOUT = 1800   # RVZ→ISO→split for a dual-layer Wii disc
+
+
+def _wit_binary() -> str | None:
+    return shutil.which('wit') or shutil.which('wit.exe')
+
+
+def _ensure_iso_for_wbfs(source_path: Path) -> tuple[Path | None, str | None, str | None]:
+    """Return (iso_path, tmpdir_to_cleanup, error).
+
+    An .iso source is used in place.  An .rvz source is decompressed with
+    DolphinTool, reusing (and populating) the same 'rvz'→'.iso' cache entry
+    the plain ``?extract=rvz`` download uses, so asking for WBFS after an ISO
+    download — or the other way round — costs one conversion, not two.
+    """
+    suffix = source_path.suffix.lower()
+    if suffix == '.iso':
+        return source_path, None, None
+    if suffix != '.rvz':
+        return None, None, f"Cannot build WBFS from {suffix or 'this file'}; need .rvz or .iso"
+
+    cached = _lookup_cached_output(source_path, 'rvz', '.iso')
+    if cached is not None:
+        return cached, None, None
+
+    dolphin_tool = (
+        shutil.which('DolphinTool')
+        or shutil.which('dolphin-tool')
+        or (Path('/usr/games/dolphin-tool').is_file() and '/usr/games/dolphin-tool')
+    )
+    if not dolphin_tool:
+        return None, None, (
+            "DolphinTool not found. Install Dolphin emulator and ensure DolphinTool "
+            "is on PATH (Linux: dolphin-tool, Windows: DolphinTool.exe)."
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix='wbfs_iso_', dir=_conversion_tmp_dir())
+    iso_path = Path(tmpdir) / (source_path.stem + '.iso')
+    r = subprocess.run(
+        [dolphin_tool, 'convert', '-f', 'iso', '-i', str(source_path), '-o', str(iso_path)],
+        capture_output=True, text=True, timeout=_WBFS_CONVERT_TIMEOUT,
+    )
+    if r.returncode != 0 or not iso_path.is_file():
+        _cleanup_dir(tmpdir)
+        return None, None, (r.stderr.strip() or r.stdout.strip() or 'DolphinTool failed')
+
+    # Park it in the shared rvz→iso cache; on success the returned path is
+    # the cached one and the tmpdir is no longer needed.
+    cached_path = _save_to_cache(iso_path, source_path, 'rvz', '.iso')
+    if cached_path != iso_path:
+        _cleanup_dir(tmpdir)
+        return cached_path, None, None
+    return iso_path, tmpdir, None
+
+
+def _wit_id6(wit: str, iso_path: Path) -> str | None:
+    try:
+        r = subprocess.run([wit, 'id6', str(iso_path)],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.SubprocessError:
+        return None
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        candidate = line.strip().upper()
+        if len(candidate) == 6 and candidate.isalnum():
+            return candidate
+    return None
+
+
+def _build_wbfs_dir(source_path: Path, display_name: str) -> tuple[Path | None, str | None]:
+    """Convert ``source_path`` into a cached directory of split WBFS parts.
+
+    Returns (cache_dir, error).  Blocking — call from an executor.
+    """
+    existing = _lookup_cached_dir(source_path, 'wbfs')
+    if existing is not None:
+        return existing, None
+
+    wit = _wit_binary()
+    if not wit:
+        return None, (
+            "wit (Wiimms ISO Tools) not found. Install it and ensure 'wit' is on "
+            "PATH (Debian/Ubuntu: the wit package or wiimms-iso-tools release)."
+        )
+
+    iso_path, iso_tmpdir, err = _ensure_iso_for_wbfs(source_path)
+    if err:
+        return None, err
+
+    tmpdir = tempfile.mkdtemp(prefix='wbfs_split_', dir=_conversion_tmp_dir())
+    try:
+        game_id = _wit_id6(wit, iso_path) or 'RXXX01'
+        out_path = Path(tmpdir) / f"{game_id}.wbfs"
+        r = subprocess.run(
+            [wit, 'copy', '--wbfs', '--split', '--split-size=4g-32k',
+             str(iso_path), str(out_path)],
+            capture_output=True, text=True, timeout=_WBFS_CONVERT_TIMEOUT,
+        )
+        if r.returncode != 0:
+            return None, (r.stderr.strip() or r.stdout.strip() or 'wit copy failed')
+
+        parts = sorted(p for p in Path(tmpdir).iterdir()
+                       if _WBFS_PART_RE.match(p.name))
+        if not parts:
+            return None, "wit produced no .wbfs output"
+
+        manifest = {
+            "game_id": game_id,
+            "name": display_name,
+            "files": [{"name": p.name, "size": p.stat().st_size} for p in parts],
+        }
+        (Path(tmpdir) / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8")
+
+        cached = _save_dir_to_cache(Path(tmpdir), source_path, 'wbfs')
+        if cached != Path(tmpdir):
+            tmpdir = None   # ownership moved into the cache
+        return cached, None
+    finally:
+        if tmpdir:
+            # Only reached when caching is disabled or the move failed; in
+            # both cases the caller keeps using the temp directory, so leave
+            # it in place and let the OS temp sweep handle it.
+            pass
+        if iso_tmpdir:
+            _cleanup_dir(iso_tmpdir)
 
 
 # ── Nintendo 3DS cart image → CIA / CCI variants ────────────────────────────

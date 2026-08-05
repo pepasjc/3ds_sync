@@ -26,6 +26,7 @@ _vita_names: dict[str, str] = {}  # keyed by full product code e.g. "PCSE00082"
 _wii_names: dict[
     str, str
 ] = {}  # 4-char GC/Wii game code -> name e.g. "GALE" -> "Super Smash Bros. Melee"
+_wiiu_names: dict[str, str] = {}  # 4-char Wii U product code -> name e.g. "AMKE"
 _ps3_names: dict[str, str] = {}  # keyed by 9-char product code e.g. "BLJM61131"
 _xbox_names: dict[str, str] = {}  # keyed by 8-char hex Xbox Title ID e.g. "4D530004"
 
@@ -43,6 +44,7 @@ _3ds_title_priority: dict[str, tuple[int, int]] = {}
 _3ds_title_id_priority: dict[str, tuple[int, int]] = {}
 _ds_priority: dict[str, tuple[int, int]] = {}
 _wii_priority: dict[str, tuple[int, int]] = {}
+_wiiu_priority: dict[str, tuple[int, int]] = {}
 _ps3_priority: dict[str, tuple[int, int]] = {}
 _xbox_priority: dict[str, tuple[int, int]] = {}
 
@@ -235,6 +237,9 @@ _3DS_HIGH_PREFIXES = {
     "00047",
 }
 _NDS_HIGH_PREFIXES = {"00048"}
+# Wii U titles are 00050000xxxxxxxx.  3DS is 00040..., DSiWare 00048..., so
+# there is no collision with the 16-hex families above.
+_WIIU_HIGH_PREFIX = "00050"
 
 
 def _detect_playstation_platform_heuristic(title_id: str) -> str | None:
@@ -325,10 +330,12 @@ def detect_platform(title_id: str) -> str:
 
     tid = title_id.upper().strip()
 
-    # 16-char hex = 3DS or NDS
+    # 16-char hex = 3DS, NDS or Wii U
     if len(tid) == 16 and all(c in "0123456789ABCDEF" for c in tid):
         if tid[:5] in _NDS_HIGH_PREFIXES:
             return "NDS"
+        if tid[:5] == _WIIU_HIGH_PREFIX:
+            return "WIIU"
         return "3DS"
 
     # 8-char hex = original Xbox Title ID (e.g. "4D530004" Halo: Combat Evolved)
@@ -455,6 +462,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
       - Nintendo - Nintendo DSi*.dat      → serial is already 4-char → _ds_names
       - Nintendo - GameCube*.dat          → extract 4-char code from DL-DOL-XXXX-RGN → _wii_names
       - Nintendo - Wii*.dat               → extract 4-char code from RVL-XXXX-RGN → _wii_names
+      - Nintendo - Wii U*.dat             → bare 4/6-char product code → _wiiu_names
 
     psn=True marks this DAT as a lower-priority PSN source so that retail entries
     (loaded with psn=False) are never overwritten by their PSN equivalents.
@@ -472,6 +480,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         _3ds_serial_to_title_id, \
         _ds_names, \
         _wii_names, \
+        _wiiu_names, \
         _ps3_names
     global \
         _psx_priority, \
@@ -484,6 +493,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         _3ds_title_id_priority, \
         _ds_priority, \
         _wii_priority, \
+        _wiiu_priority, \
         _ps3_priority
 
     if not dat_path.exists():
@@ -528,6 +538,15 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         target = _wii_names
         priority = _wii_priority
         mode = "gc_code"  # extract 4-char code from DL-DOL-XXXX-RGN (index 2)
+    elif "wii u" in fname:
+        # Wii U serials in the gametdb DAT are bare product codes (AMKE,
+        # ADRP4Q) with no RVL- prefix, and they are a DIFFERENT namespace from
+        # the Wii/GameCube codes — so they get their own dict.  This branch
+        # MUST precede the "nintendo - wii" test below, which would otherwise
+        # swallow "Nintendo - Wii U.dat" and parse it as RVL-XXXX-RGN.
+        target = _wiiu_names
+        priority = _wiiu_priority
+        mode = "wiiu_code"
     elif "nintendo - wii" in fname:
         target = _wii_names
         priority = _wii_priority
@@ -614,10 +633,39 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
             if len(parts) >= 2 and len(parts[1]) == 4 and parts[1].isalnum():
                 return parts[1]
             return None
+        if mode == "wiiu_code":
+            # Already a bare product code: 4 chars (SNKE) or 6 (ADRP4Q).
+            # Key on the leading 4 so both spellings of a title collapse.
+            code = serial.upper()
+            if len(code) in (4, 6) and code.isalnum():
+                return code[:4]
+            return None
         return None
+
+    # Most DATs keep the whole rom entry on one line:
+    #     rom ( name "Foo (USA).iso" size ... )
+    # The gametdb Wii U DAT spreads it over several instead:
+    #     rom (
+    #         name "Foo (USA).wux"
+    #         serial "ADRP4Q"
+    #     )
+    # Its inner ``name`` would otherwise overwrite the game's own name (and
+    # reset the serial), yielding entries called "Foo (USA).wux".  Track the
+    # nested block and ignore everything inside it.
+    in_rom_block = False
 
     with open(dat_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            stripped = line.strip()
+
+            if in_rom_block:
+                if stripped == ")":
+                    in_rom_block = False
+                continue
+            if stripped.startswith("rom (") and not stripped.endswith(")"):
+                in_rom_block = True
+                continue
+
             m = _NAME_RE.match(line)
             if m:
                 current_name = m.group(1)
@@ -842,6 +890,26 @@ def lookup_names_typed(product_codes: list[str]) -> dict[str, tuple[str, str]]:
             name = _wii_names.get(game_code)
             if name:
                 result[code] = (name, "GC")
+            continue
+
+        # vWii saves from the Wii U client: WII_xxxx, where xxxx is the ASCII
+        # game code decoded from the NAND title id (WII_RMCE = Mario Kart Wii).
+        # The Wii DAT already keys _wii_names by exactly that code.
+        if code_upper.startswith("WII_") and len(code_upper) >= 7:
+            game_code = code_upper[4:8]
+            name = _wii_names.get(game_code)
+            if name:
+                result[code] = (name, "WII")
+            continue
+
+        # Wii U ROM ids: WIIU_xxxx.  Wii U *saves* are 16-hex title ids whose
+        # low word is not the product code, so they are resolved from the
+        # console's own meta.xml instead — this branch is for catalog entries.
+        if code_upper.startswith("WIIU_") and len(code_upper) >= 8:
+            game_code = code_upper[5:9]
+            name = _wiiu_names.get(game_code)
+            if name:
+                result[code] = (name, "WIIU")
             continue
 
         if len(code_upper) >= 10 and "-" in code_upper:

@@ -1920,3 +1920,134 @@ class TestSyncRomAvailable:
         assert resp.status_code == 200
         body = resp.json()
         assert title_id in body["rom_available"]
+
+
+# ── Wii split-WBFS conversion ───────────────────────────────────────────────
+
+
+@pytest.fixture()
+def rom_client_wii(rom_dir, client, auth_headers, tmp_path):
+    """Catalog with a single Wii ISO plus a writable conversion cache."""
+    from app.services import rom_db, rom_scanner
+
+    original_rom_dir = settings.rom_dir
+    original_interval = settings.rom_scan_interval
+    original_tmp = settings.tmp_dir
+
+    settings.rom_dir = rom_dir
+    settings.rom_scan_interval = 0
+    settings.tmp_dir = tmp_path / "conv_tmp"
+
+    rom_db.init_db(settings.save_dir)
+
+    (rom_dir / "wii").mkdir()
+    (rom_dir / "wii" / "Mario Kart Wii (USA).iso").write_bytes(b"WIIDISC" * 64)
+
+    rom_scanner.init(rom_dir)
+
+    yield client
+
+    settings.rom_dir = original_rom_dir
+    settings.rom_scan_interval = original_interval
+    settings.tmp_dir = original_tmp
+    rom_scanner._catalog = None
+
+
+def _wii_rom_id(client, auth_headers):
+    r = client.get("/api/v1/roms?system=WII", headers=auth_headers)
+    assert r.status_code == 200
+    roms = r.json()["roms"]
+    assert roms, "expected the Wii ISO in the catalog"
+    return roms[0]["rom_id"]
+
+
+def _install_fake_wit(monkeypatch, part_bytes):
+    """Stand in for the wit binary.
+
+    ``wit id6`` prints an ID6; ``wit copy --wbfs --split`` writes the split
+    parts next to the requested output path.  Everything else in the pipeline
+    (cache dir, manifest, Range serving) is the real code.
+    """
+    from app.routes import roms as roms_mod
+    import subprocess as _sp
+
+    monkeypatch.setattr(roms_mod, "_wit_binary", lambda: "wit")
+
+    real_run = _sp.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "wit":
+            if cmd[1] == "id6":
+                return _sp.CompletedProcess(cmd, 0, stdout="RMCE01\n", stderr="")
+            if cmd[1] == "copy":
+                out = Path(cmd[-1])
+                out.write_bytes(part_bytes[0])
+                out.with_suffix(".wbf1").write_bytes(part_bytes[1])
+                return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(roms_mod.subprocess, "run", fake_run)
+
+
+class TestWbfsExtract:
+    def test_manifest_503_without_wit(self, rom_client_wii, auth_headers, monkeypatch):
+        from app.routes import roms as roms_mod
+
+        monkeypatch.setattr(roms_mod, "_wit_binary", lambda: None)
+        rom_id = _wii_rom_id(rom_client_wii, auth_headers)
+
+        r = rom_client_wii.get(
+            f"/api/v1/roms/{quote(rom_id, safe='')}/wbfs-manifest",
+            headers=auth_headers,
+        )
+        assert r.status_code == 503
+        assert "wit" in r.json()["detail"].lower()
+
+    def test_manifest_lists_split_parts(self, rom_client_wii, auth_headers, monkeypatch):
+        _install_fake_wit(monkeypatch, (b"A" * 100, b"B" * 50))
+        rom_id = _wii_rom_id(rom_client_wii, auth_headers)
+
+        r = rom_client_wii.get(
+            f"/api/v1/roms/{quote(rom_id, safe='')}/wbfs-manifest",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["game_id"] == "RMCE01"
+        names = {f["name"]: f["size"] for f in body["files"]}
+        assert names == {"RMCE01.wbfs": 100, "RMCE01.wbf1": 50}
+
+    def test_part_download(self, rom_client_wii, auth_headers, monkeypatch):
+        _install_fake_wit(monkeypatch, (b"A" * 100, b"B" * 50))
+        rom_id = _wii_rom_id(rom_client_wii, auth_headers)
+        base = f"/api/v1/roms/{quote(rom_id, safe='')}/wbfs"
+
+        r = rom_client_wii.get(f"{base}/RMCE01.wbfs", headers=auth_headers)
+        assert r.status_code == 200
+        assert r.content == b"A" * 100
+
+        r = rom_client_wii.get(f"{base}/RMCE01.wbf1", headers=auth_headers)
+        assert r.status_code == 200
+        assert r.content == b"B" * 50
+
+    def test_part_supports_range_resume(self, rom_client_wii, auth_headers, monkeypatch):
+        _install_fake_wit(monkeypatch, (b"0123456789" * 10, b"B" * 50))
+        rom_id = _wii_rom_id(rom_client_wii, auth_headers)
+
+        r = rom_client_wii.get(
+            f"/api/v1/roms/{quote(rom_id, safe='')}/wbfs/RMCE01.wbfs",
+            headers={**auth_headers, "Range": "bytes=90-"},
+        )
+        assert r.status_code == 206
+        assert r.content == b"0123456789"
+        assert r.headers["content-range"] == "bytes 90-99/100"
+
+    def test_bad_part_name_rejected(self, rom_client_wii, auth_headers, monkeypatch):
+        _install_fake_wit(monkeypatch, (b"A" * 10, b"B" * 10))
+        rom_id = _wii_rom_id(rom_client_wii, auth_headers)
+
+        r = rom_client_wii.get(
+            f"/api/v1/roms/{quote(rom_id, safe='')}/wbfs/..%2Fsecret.txt",
+            headers=auth_headers,
+        )
+        assert r.status_code in (400, 404)

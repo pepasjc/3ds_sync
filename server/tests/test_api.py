@@ -1322,3 +1322,45 @@ class TestPs1VmcImport:
             headers={**auth_headers, "Content-Type": "application/octet-stream"},
         )
         assert r.status_code == 400
+
+
+class TestWiiUTitles:
+    """`/titles?console_type=WIIU` is how the Wii U client lists its saves.
+
+    Also covers WII_<code>, the vWii id scheme, which resolves through the
+    existing emulator-style SYSTEM_slug parser with no server change.
+    """
+
+    def test_titles_filter_wiiu(self, client, auth_headers):
+        wiiu = _make_ps1_bundle_bytes(title_id="0005000010143500")
+        client.post(
+            "/api/v1/saves/0005000010143500",
+            content=wiiu,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        threeds = _make_ps1_bundle_bytes(title_id="0004000000055D00")
+        client.post(
+            "/api/v1/saves/0004000000055D00",
+            content=threeds,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+
+        r = client.get("/api/v1/titles?console_type=WIIU", headers=auth_headers)
+        assert r.status_code == 200
+        titles = r.json()["titles"]
+        assert [t["title_id"] for t in titles] == ["0005000010143500"]
+        assert titles[0]["console_type"] == "WIIU"
+
+    def test_titles_filter_vwii(self, client, auth_headers):
+        vwii = _make_ps1_bundle_bytes(title_id="WII_RMCE")
+        client.post(
+            "/api/v1/saves/WII_RMCE",
+            content=vwii,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+
+        r = client.get("/api/v1/titles?console_type=WII", headers=auth_headers)
+        assert r.status_code == 200
+        titles = r.json()["titles"]
+        assert [t["title_id"] for t in titles] == ["WII_RMCE"]
+        assert titles[0]["console_type"] == "WII"

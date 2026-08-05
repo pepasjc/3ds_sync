@@ -130,6 +130,7 @@ ALL_CONSOLE_TYPES: list[str] = ["All"] + sorted(
         "VB",
         "VITA",
         "WII",
+        "WIIU",
         "WSWAN",
         "WSWANC",
         "XBOX",

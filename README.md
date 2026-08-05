@@ -9,6 +9,7 @@ Sync save files between consoles, handhelds, and emulators through a self-hosted
 | `server/` | FastAPI server — stores saves and history |
 | `3ds/` | Nintendo 3DS homebrew client |
 | `ds/` | Nintendo DS / DSi homebrew client |
+| `wiiu/` | Wii U homebrew client (Aroma) — GameCube/Nintendont, vWii and Wii U saves |
 | `psp/` | PSP homebrew client |
 | `vita/` | PS Vita homebrew client |
 | `ps2/` | PlayStation 2 homebrew client — ⚠️ work in progress, not functional yet |

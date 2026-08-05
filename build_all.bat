@@ -1,7 +1,7 @@
 @echo off
 REM Build script for 3dssync - builds all or specific versions
 REM Usage: build_all.bat [targets...]
-REM   Targets: 3ds, nds, gc, android, ps2, ps3, psp, vita, xbox, all (default: all)
+REM   Targets: 3ds, nds, gc, wiiu, android, ps2, ps3, psp, vita, xbox, all (default: all)
 REM Example: build_all.bat ps2 ps3 psp
 REM
 REM A failing target no longer aborts the run: every requested target is
@@ -18,6 +18,7 @@ set BUILD_ALL=0
 set BUILD_3DS=0
 set BUILD_NDS=0
 set BUILD_GC=0
+set BUILD_WIIU=0
 set BUILD_ANDROID=0
 set BUILD_PS2=0
 set BUILD_PS3=0
@@ -39,6 +40,8 @@ if /i "%ARG%"=="3ds" set BUILD_3DS=1
 if /i "%ARG%"=="nds" set BUILD_NDS=1
 if /i "%ARG%"=="gc" set BUILD_GC=1
 if /i "%ARG%"=="gamecube" set BUILD_GC=1
+if /i "%ARG%"=="wiiu" set BUILD_WIIU=1
+if /i "%ARG%"=="wii-u" set BUILD_WIIU=1
 if /i "%ARG%"=="android" set BUILD_ANDROID=1
 if /i "%ARG%"=="ps2" set BUILD_PS2=1
 if /i "%ARG%"=="ps3" set BUILD_PS3=1
@@ -53,6 +56,7 @@ if "%BUILD_ALL%"=="1" (
     set BUILD_3DS=1
     set BUILD_NDS=1
     set BUILD_GC=1
+    set BUILD_WIIU=1
     set BUILD_ANDROID=1
     set BUILD_PS2=1
     set BUILD_PS3=1
@@ -69,6 +73,7 @@ if "%BUILD_ALL%"=="1" (
     if "!BUILD_3DS!"=="1" echo   - 3DS
     if "!BUILD_NDS!"=="1" echo   - NDS
     if "!BUILD_GC!"=="1" echo   - GameCube
+    if "!BUILD_WIIU!"=="1" echo   - Wii U
     if "!BUILD_ANDROID!"=="1" echo   - Android
     if "!BUILD_PS2!"=="1" echo   - PS2
     if "!BUILD_PS3!"=="1" echo   - PS3
@@ -136,6 +141,22 @@ if "!BUILD_GC!"=="1" (
         copy gc\gcsync.dol "%OUTPUT_DIR%\gcsync.dol"
         echo [GameCube build complete!]
         set OK_LIST=!OK_LIST! GameCube
+    )
+)
+
+REM Build Wii U client (wut / Aroma)
+if "!BUILD_WIIU!"=="1" (
+    echo.
+    echo [Building Wii U client...]
+    C:\devkitpro\msys2\usr\bin\bash.exe --login /e/projects/3dssync/wiiu/build.sh clean
+    if errorlevel 1 (
+        echo [ERROR] Wii U build failed!
+        set FAIL_LIST=!FAIL_LIST! WiiU
+    ) else (
+        copy wiiu\wiiusync.rpx "%OUTPUT_DIR%\wiiusync.rpx"
+        copy wiiu\wiiusync.wuhb "%OUTPUT_DIR%\wiiusync.wuhb"
+        echo [Wii U build complete!]
+        set OK_LIST=!OK_LIST! WiiU
     )
 )
 

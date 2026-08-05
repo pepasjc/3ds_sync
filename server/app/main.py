@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
         dats_dir / "Nintendo - GameCube.dat"
     )
     count_wii += game_names.load_libretro_dat_to_dicts(dats_dir / "Nintendo - Wii.dat")
+    count_wiiu = game_names.load_libretro_dat_to_dicts(
+        dats_dir / "Nintendo - Wii U.dat"
+    )
 
     # Load libretro DATs (replace legacy .txt files for PS1/PSP/Vita/3DS/DS)
     # Retail DATs are loaded first (psn=False); PSN DATs second (psn=True) so
@@ -81,7 +84,7 @@ async def lifespan(app: FastAPI):
     )
     print(
         f"Loaded {count_3ds_title_ids} 3DS TitleIDs + {count_3ds} 3DS codes + {count_ds} DS + "
-        f"{count_psp} PSP + {count_vita} Vita + {count_psx} PSX + {count_ps2} PS2 + {count_sat} Saturn + {count_ps3} PS3 + {count_wii} GC/Wii + {count_xbox} Xbox game names "
+        f"{count_psp} PSP + {count_vita} Vita + {count_psx} PSX + {count_ps2} PS2 + {count_sat} Saturn + {count_ps3} PS3 + {count_wii} GC/Wii + {count_wiiu} Wii U + {count_xbox} Xbox game names "
         f"({count_psn_retail} PSN→retail mappings, {count_sat_slugs} Saturn slug mappings, {count_sat_archives} Saturn archive mappings)"
     )
 
