@@ -110,11 +110,30 @@ The server probes the NCSD/NCCH headers before converting
 * **`?extract=cia` on a stale-flagged ROM** — the converter is handed a
   flag-corrected copy so `3dsconv` skips its decryption pass.
 
-Detection is heuristic but conservative: it trusts an explicit `NoCrypto`
-flag, otherwise it looks for a plaintext ExeFS header (32 reserved zero bytes
-plus 0x200-aligned, ASCII-named entries) and falls back to the ExHeader's
-ASCII application title. Anything it can't confirm is treated as encrypted and
-goes down the normal converter path.
+Per partition, in order: an explicit `NoCrypto` flag, a plaintext ExeFS header
+(32 reserved zero bytes plus 0x200-aligned, ASCII-named entries), the
+ExHeader's ASCII application title, or the RomFS `IVFC` magic. A partition
+with none of those regions present is *unknown*, not encrypted.
+
+**The verdict comes from partition 0 alone.** Real decrypted dumps commonly
+decrypt only the executable CXI and leave the manual / DLP / update partitions
+(p1, p2, p6, p7) encrypted — and partition 0 is the only one emulators boot or
+3dsconv puts in a CIA. Those extra partitions travel through byte-identical and
+keep their original flags; claiming `NoCrypto` on genuinely encrypted data
+would make an emulator read ciphertext as content.
+
+The probe doubles as a CLI for diagnosing a ROM in place:
+
+```bash
+cd server && uv run python -m app.services.ctr_rom "/roms/n3ds/Game (USA).3ds"
+```
+
+```text
+Game (USA).3ds: decrypted, flags still say encrypted (2 partition(s): ...)
+  p0 @0x4000 flags=0000000001030000 exheader=0x400 exefs=0xc000 romfs=0x11b000 -> plaintext ExeFS header
+  p7 @0x1b6f1a00 flags=0000000001050000 exheader=0x0 exefs=0x0 romfs=0x1b6f1c00 -> encrypted
+  verdict: decrypted=True flags_marked=False needs_flag_patch=True
+```
 
 ---
 

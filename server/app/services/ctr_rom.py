@@ -39,7 +39,16 @@ NCCH_MAGIC_OFFSET = 0x100
 NCCH_EXHEADER_SIZE_OFFSET = 0x180
 NCCH_FLAGS_OFFSET = 0x188
 NCCH_EXEFS_OFFSET = 0x1A0
+NCCH_ROMFS_OFFSET = 0x1B0
 NCCH_HEADER_SIZE = 0x200
+
+# A RomFS section opens with an IVFC header: "IVFC" + magic number 0x00010000.
+IVFC_MAGIC = b"IVFC\x00\x00\x01\x00"
+
+# Per-partition verdicts.
+PLAINTEXT = 'plaintext'
+ENCRYPTED = 'encrypted'
+UNKNOWN = 'unknown'
 
 # flags[3] selects the secondary key slot, flags[7] carries the booleans.
 FLAG_CRYPTO_METHOD = 3
@@ -60,9 +69,14 @@ class NcchPartition:
     flags: bytes         # the 8 raw bytes at NCCH+0x188
     exefs_offset: int    # absolute byte offset, 0 when the partition has none
     exefs_size: int
+    romfs_offset: int    # absolute byte offset, 0 when the partition has none
     exheader_size: int
-    plaintext: bool = False
+    state: str = UNKNOWN
     reason: str = ""
+
+    @property
+    def plaintext(self) -> bool:
+        return self.state == PLAINTEXT
 
     @property
     def no_crypto(self) -> bool:
@@ -90,8 +104,8 @@ class CartInfo:
 
     path: Path
     is_ncsd: bool = False
-    decrypted: bool = False       # every partition's data is plaintext
-    flags_marked: bool = False    # ...and every header already says NoCrypto
+    decrypted: bool = False       # the executable partition is plaintext
+    flags_marked: bool = False    # ...and its header already says NoCrypto
     partitions: list[NcchPartition] = field(default_factory=list)
     detail: str = ""
 
@@ -104,7 +118,9 @@ class CartInfo:
             return f"not an NCSD cart image ({self.detail})"
         state = "decrypted" if self.decrypted else "encrypted"
         marked = "flags say NoCrypto" if self.flags_marked else "flags still say encrypted"
-        return f"{state}, {marked} ({len(self.partitions)} partition(s))"
+        return (
+            f"{state}, {marked} ({len(self.partitions)} partition(s): {self.detail})"
+        )
 
 
 def probe(path: Path | str) -> CartInfo:
@@ -147,7 +163,12 @@ def probe(path: Path | str) -> CartInfo:
         info.detail = info.detail or "no readable NCCH partitions"
         return info
 
-    info.decrypted = all(p.plaintext for p in info.partitions)
+    # Partition 0 is the executable CXI — the only one emulators boot and the
+    # only one 3dsconv puts in a CIA.  Real-world "decrypted" dumps routinely
+    # leave the update / manual / DLP partitions encrypted, so those must not
+    # veto the verdict; they simply travel through unchanged.
+    executable = next((p for p in info.partitions if p.index == 0), None)
+    info.decrypted = executable is not None and executable.plaintext
     info.flags_marked = info.decrypted and not any(p.needs_flag_patch for p in info.partitions)
     info.detail = '; '.join(f"p{p.index}:{p.reason}" for p in info.partitions)
     return info
@@ -161,6 +182,7 @@ def _read_partition(fh, index: int, offset: int, size: int) -> NcchPartition | N
     if ncch[NCCH_MAGIC_OFFSET:NCCH_MAGIC_OFFSET + 4] != NCCH_MAGIC:
         return None
     exefs_media_offset, exefs_media_size = struct.unpack_from('<II', ncch, NCCH_EXEFS_OFFSET)
+    romfs_media_offset = struct.unpack_from('<I', ncch, NCCH_ROMFS_OFFSET)[0]
     exheader_size = struct.unpack_from('<I', ncch, NCCH_EXHEADER_SIZE_OFFSET)[0]
     return NcchPartition(
         index=index,
@@ -169,34 +191,56 @@ def _read_partition(fh, index: int, offset: int, size: int) -> NcchPartition | N
         flags=ncch[NCCH_FLAGS_OFFSET:NCCH_FLAGS_OFFSET + 8],
         exefs_offset=offset + exefs_media_offset * MEDIA_UNIT if exefs_media_offset else 0,
         exefs_size=exefs_media_size * MEDIA_UNIT,
+        romfs_offset=offset + romfs_media_offset * MEDIA_UNIT if romfs_media_offset else 0,
         exheader_size=exheader_size,
     )
 
 
 def _classify(fh, partition: NcchPartition, file_size: int) -> None:
-    """Decide whether ``partition``'s payload is plaintext, cheapest test first."""
+    """Decide whether ``partition``'s payload is plaintext, cheapest test first.
+
+    Ends on one of three verdicts.  ``UNKNOWN`` matters: a CFA partition with no
+    ExeFS, no ExHeader and a RomFS past the end of a trimmed dump gives us
+    nothing to test, and guessing "encrypted" there would wrongly condemn the
+    whole cart.
+    """
     if partition.no_crypto:
-        partition.plaintext = True
+        partition.state = PLAINTEXT
         partition.reason = "NoCrypto flag"
         return
 
+    testable = False
+
     if partition.exefs_offset and partition.exefs_offset + NCCH_HEADER_SIZE <= file_size:
+        testable = True
         fh.seek(partition.exefs_offset)
         if _exefs_header_is_plaintext(fh.read(NCCH_HEADER_SIZE)):
-            partition.plaintext = True
+            partition.state = PLAINTEXT
             partition.reason = "plaintext ExeFS header"
             return
 
     if partition.exheader_size:
         exheader_offset = partition.offset + NCCH_HEADER_SIZE
         if exheader_offset + 8 <= file_size:
+            testable = True
             fh.seek(exheader_offset)
             if _exheader_is_plaintext(fh.read(8)):
-                partition.plaintext = True
+                partition.state = PLAINTEXT
                 partition.reason = "plaintext ExHeader title"
                 return
 
-    partition.reason = "encrypted"
+    # Manual / update / DLP partitions are CFAs: no ExeFS, no ExHeader, just a
+    # RomFS.  Its IVFC header is the only plaintext marker they have.
+    if partition.romfs_offset and partition.romfs_offset + len(IVFC_MAGIC) <= file_size:
+        testable = True
+        fh.seek(partition.romfs_offset)
+        if fh.read(len(IVFC_MAGIC)) == IVFC_MAGIC:
+            partition.state = PLAINTEXT
+            partition.reason = "plaintext RomFS (IVFC)"
+            return
+
+    partition.state = ENCRYPTED if testable else UNKNOWN
+    partition.reason = partition.state
 
 
 def _exefs_header_is_plaintext(header: bytes) -> bool:
@@ -251,8 +295,11 @@ def write_decrypted_copy(src: Path | str, dst: Path | str, info: CartInfo | None
     """Copy ``src`` to ``dst``, rewriting each NCCH's crypto flags to NoCrypto.
 
     Used for ROMs whose data is already plaintext but whose headers still claim
-    encryption.  The payload is copied byte for byte; only 8 bytes per partition
-    header change, which is exactly what a decryptor would have written.
+    encryption.  The payload is copied byte for byte; only 8 bytes per plaintext
+    partition's header change, which is exactly what a decryptor would have
+    written.  Partitions that really are still encrypted (commonly the update
+    partition of a "decrypted" dump) keep their flags — mislabelling those would
+    make an emulator read ciphertext as content.
     """
     src = Path(src)
     dst = Path(dst)
@@ -273,3 +320,38 @@ def write_decrypted_copy(src: Path | str, dst: Path | str, info: CartInfo | None
             fout.seek(partition.offset + NCCH_FLAGS_OFFSET)
             fout.write(partition.patched_flags())
     return info
+
+
+def _main(argv: list[str]) -> int:
+    """``python -m app.services.ctr_rom <rom.3ds>...`` — diagnostics.
+
+    Prints exactly what the conversion endpoint sees, so a ROM that converts
+    badly on the server can be inspected in place without touching the API.
+    """
+    if not argv:
+        print(f"usage: python -m {__name__} <rom.3ds> [...]")
+        return 2
+
+    for arg in argv:
+        info = probe(arg)
+        print(f"{Path(arg).name}: {info.describe()}")
+        for partition in info.partitions:
+            print(
+                f"  p{partition.index} @ {partition.offset:#x} "
+                f"flags={partition.flags.hex()} "
+                f"exheader={partition.exheader_size:#x} "
+                f"exefs={partition.exefs_offset:#x} "
+                f"romfs={partition.romfs_offset:#x} "
+                f"-> {partition.reason}"
+            )
+        print(
+            f"  verdict: decrypted={info.decrypted} "
+            f"flags_marked={info.flags_marked} needs_flag_patch={info.needs_flag_patch}"
+        )
+    return 0
+
+
+if __name__ == '__main__':   # pragma: no cover
+    import sys
+
+    raise SystemExit(_main(sys.argv[1:]))

@@ -266,7 +266,7 @@ def rom_client_3ds_raw(rom_dir, client, auth_headers):
     encrypted dump."""
     from app.services import rom_db, rom_scanner
 
-    from .test_ctr_rom import _build_cart
+    from .test_ctr_rom import _build_cart, _build_cart_from, cfa, cxi
 
     original_rom_dir = settings.rom_dir
     original_interval = settings.rom_scan_interval
@@ -308,6 +308,9 @@ def rom_client_3ds_raw(rom_dir, client, auth_headers):
         "Flagged": _build_cart(decrypted=True, no_crypto_flag=True),
         "Stale": _build_cart(decrypted=True, no_crypto_flag=False),
         "Encrypted": _build_cart(decrypted=False, no_crypto_flag=False),
+        # How real decrypted dumps look: plaintext game partition, encrypted
+        # manual + update partitions.
+        "Retail": _build_cart_from([cxi(0, plaintext=True), cfa(1), cfa(7)]),
     }
     for name, data in carts.items():
         (rom_dir / "n3ds" / f"{name} (USA).3ds").write_bytes(data)
@@ -1510,6 +1513,29 @@ class TestRomDownload:
         flags_at = 0x4000 + ctr_rom.NCCH_FLAGS_OFFSET
         assert seen_by_converter[flags_at + 7] & ctr_rom.FLAG_NO_CRYPTO
         assert seen_by_converter != carts["Stale"]
+
+    def test_retail_dump_with_encrypted_update_partition_converts(
+        self, rom_client_3ds_raw, auth_headers
+    ):
+        """Regression: an encrypted manual/update partition must not make the
+        whole cart look encrypted — that sent real decrypted dumps into ninfs
+        and 3dsconv, which then decrypted plaintext into garbage."""
+        from app.services import ctr_rom
+
+        client, carts = rom_client_3ds_raw
+        rom_id = _rom_id_for(client, auth_headers, "Retail")
+
+        resp = client.get(f"/api/v1/roms/{rom_id}?extract=decrypted_cci", headers=auth_headers)
+        assert resp.status_code == 200
+        assert not resp.content.startswith(b"DCCI:")           # converter skipped
+
+        flags_at = 0x4000 + ctr_rom.NCCH_FLAGS_OFFSET
+        assert resp.content[flags_at + 7] & ctr_rom.FLAG_NO_CRYPTO
+
+        cia = client.get(f"/api/v1/roms/{rom_id}?extract=cia", headers=auth_headers)
+        assert cia.status_code == 200
+        seen_by_converter = cia.content[len(b"CIA:"):]
+        assert seen_by_converter[flags_at + 7] & ctr_rom.FLAG_NO_CRYPTO
 
     def test_cia_conversion_of_encrypted_rom_is_untouched(self, rom_client_3ds_raw, auth_headers):
         client, carts = rom_client_3ds_raw
