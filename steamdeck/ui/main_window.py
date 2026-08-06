@@ -64,7 +64,13 @@ from scanner.installed_roms import (
 )
 from scanner.rom_target import resolve_rom_target_dir
 from sync_client import SyncClient, _find_server_save
-from config import load_config, save_config, DOWNLOADS_DB_PATH
+from config import (
+    CEMU_SAVE_DIR_KEY,
+    load_config,
+    save_config,
+    save_dir_override as _save_dir_override,
+    DOWNLOADS_DB_PATH,
+)
 from download_manager import DownloadManager
 from . import theme
 from .catalog_view import CatalogView
@@ -98,11 +104,13 @@ class ScanWorker(QObject):
         emulation_path: str,
         rom_scan_dir: str = "",
         saturn_sync_format: str = "mednafen",
+        save_dir_overrides: Optional[dict] = None,
     ):
         super().__init__()
         self._path = emulation_path
         self._rom_scan_dir = rom_scan_dir
         self._saturn_sync_format = saturn_sync_format
+        self._save_dir_overrides = dict(save_dir_overrides or {})
 
     def run(self):
         results = scan_all(
@@ -110,6 +118,7 @@ class ScanWorker(QObject):
             rom_scan_dir=self._rom_scan_dir,
             progress_cb=self.progress.emit,
             saturn_sync_format=self._saturn_sync_format,
+            save_dir_overrides=self._save_dir_overrides,
         )
         self.finished.emit(results)
 
@@ -161,11 +170,18 @@ class ServerWorker(QObject):
 
     finished = pyqtSignal(list)  # updated list[GameEntry]
 
-    def __init__(self, entries: list[GameEntry], client: SyncClient, emulation_path: str):
+    def __init__(
+        self,
+        entries: list[GameEntry],
+        client: SyncClient,
+        emulation_path: str,
+        save_dir_overrides: Optional[dict] = None,
+    ):
         super().__init__()
         self._entries = entries
         self._client = client
         self._emulation_path = Path(emulation_path)
+        self._save_dir_overrides = dict(save_dir_overrides or {})
 
     def _enrich_title_ids(self):
         """
@@ -374,7 +390,14 @@ class ServerWorker(QObject):
         )
         seen_ids = {entry.title_id for entry in updated}
         updated.extend(
-            cemu.build_server_only_entries(server_saves, seen_ids, self._emulation_path)
+            cemu.build_server_only_entries(
+                server_saves,
+                seen_ids,
+                self._emulation_path,
+                save_dir_override=_save_dir_override(
+                    self._save_dir_overrides, CEMU_SAVE_DIR_KEY
+                ),
+            )
         )
 
         # Wii U saves reach the server named after their own title id: no DAT
@@ -801,6 +824,7 @@ class MainWindow(QMainWindow):
             self._config["emulation_path"],
             self._config.get("rom_scan_dir", ""),
             saturn_sync_format=self._config.get("saturn_sync_format", "mednafen"),
+            save_dir_overrides=self._config.get("save_dir_overrides") or {},
         )
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
@@ -824,6 +848,7 @@ class MainWindow(QMainWindow):
             list(entries),
             self._client,
             self._config["emulation_path"],
+            save_dir_overrides=self._config.get("save_dir_overrides") or {},
         )
         self._server_worker.moveToThread(self._server_thread)
         self._server_thread.started.connect(self._server_worker.run)

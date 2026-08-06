@@ -24,6 +24,10 @@ DOWNLOADS_DB_PATH = Path.home() / ".config" / "savesync" / "steamdeck_downloads.
 
 SATURN_SYNC_FORMATS = ("mednafen", "yabause", "yabasanshiro")
 
+# ``save_dir_overrides`` key for the Cemu folder.  Same spelling Android uses
+# for ``CemuEmulator.EMULATOR_KEY`` so a config is readable across both.
+CEMU_SAVE_DIR_KEY = "Cemu"
+
 DEFAULT_CONFIG = {
     "host": "192.168.1.100",
     "port": 8000,
@@ -36,6 +40,13 @@ DEFAULT_CONFIG = {
     # inside ``scanner/rom_target.py``.  Mirrors Android's
     # ``romDirOverrides`` in SettingsStore.
     "rom_dir_overrides": {},
+    # Per-emulator save folder overrides, keyed by emulator name ("Cemu").
+    # Mirrors Android's ``saveDirOverrides`` in SettingsStore.  Only Cemu
+    # reads one today: EmuDeck installs Cemu outside the Emulation folder
+    # (Proton prefix, flatpak data dir, a second install on an SD card), so
+    # the candidate search can miss it entirely and there was no way to say
+    # where it actually lives.
+    "save_dir_overrides": {},
     # Saturn emulator format for local saves.  Server storage stays on
     # Beetle/Mednafen canonical; this just controls how the Steam Deck
     # writes Saturn saves out locally, matching Android's SettingsStore.
@@ -66,6 +77,41 @@ def normalize_rom_dir_overrides(value) -> dict:
             continue
         result[k.strip().upper()] = path
     return result
+
+
+def normalize_save_dir_overrides(value) -> dict:
+    """Coerce ``save_dir_overrides`` to ``{emulator name: stripped path}``.
+
+    Keys keep their case — they name an emulator ("Cemu"), matching Android's
+    ``saveDirOverrides`` keys — so lookups go through
+    :func:`save_dir_override`, which compares case-insensitively.
+    """
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for k, v in value.items():
+        if not isinstance(k, str):
+            continue
+        name = k.strip()
+        path = str(v or "").strip()
+        if not name or not path:
+            continue
+        result[name] = path
+    return result
+
+
+def save_dir_override(overrides, emulator: str) -> str:
+    """The configured save folder for [emulator], or ``""``.
+
+    Case-insensitive: a hand-edited config with ``"cemu"`` should still work.
+    """
+    if not isinstance(overrides, dict):
+        return ""
+    wanted = emulator.strip().lower()
+    for key, path in overrides.items():
+        if isinstance(key, str) and key.strip().lower() == wanted:
+            return str(path or "").strip()
+    return ""
 
 
 def find_emulation_path() -> str:
@@ -129,6 +175,9 @@ def load_config() -> dict:
     )
     config["rom_dir_overrides"] = normalize_rom_dir_overrides(
         config.get("rom_dir_overrides")
+    )
+    config["save_dir_overrides"] = normalize_save_dir_overrides(
+        config.get("save_dir_overrides")
     )
 
     return config

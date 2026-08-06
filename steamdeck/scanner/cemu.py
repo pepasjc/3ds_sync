@@ -95,13 +95,71 @@ def _mlc_candidates(emulation_path: Path) -> list[Path]:
     ]
 
 
-def resolve_mlc_root(emulation_path: Path) -> Path | None:
+def _normalize_mlc_candidate(path: Path) -> Path | None:
+    """Accept [path] as an mlc01 root, or its ``mlc01`` child, else None.
+
+    Users reasonably point at either the ``mlc01`` folder or the Cemu install
+    that contains it, so both are taken.  A folder Cemu has created but never
+    written a save to has ``usr/title`` and no ``usr/save`` yet — refusing it
+    would send a freshly-downloaded save to the guessed location instead.
+    """
+    if not path.is_dir():
+        return None
+    for candidate in (path, path / "mlc01"):
+        if not candidate.is_dir():
+            continue
+        usr = candidate / "usr"
+        if (usr / "save").is_dir() or (usr / "title").is_dir():
+            return candidate
+    return None
+
+
+def _override_mlc_root(save_dir_override: str) -> Path | None:
+    """Resolve the user's explicit Cemu folder to an ``mlc01``.
+
+    The override is a deliberate statement about where Cemu lives, so it also
+    honours a ``settings.xml`` sitting in that folder — pointing at an install
+    whose MLC was relocated elsewhere is exactly the case the candidate search
+    cannot cover.  An unrecognisable path falls through to auto-detection
+    rather than silently scanning nothing.
+    """
+    raw = (save_dir_override or "").strip()
+    if not raw:
+        return None
+
+    root = Path(raw).expanduser()
+    for settings_xml in (root / "settings.xml", root.parent / "settings.xml"):
+        configured = _mlc_path_from_settings(settings_xml)
+        resolved = _normalize_mlc_candidate(configured) if configured else None
+        if resolved is not None:
+            return resolved
+
+    resolved = _normalize_mlc_candidate(root)
+    if resolved is not None:
+        return resolved
+
+    # Named mlc01 and real, just empty — Cemu will populate it, and the user
+    # said this is the place.
+    if root.is_dir() and root.name.lower() == "mlc01":
+        return root
+    return None
+
+
+def resolve_mlc_root(
+    emulation_path: Path, save_dir_override: str = ""
+) -> Path | None:
     """Locate Cemu's ``mlc01`` directory.
 
-    A configured ``<mlc_path>`` wins over the directory guesses: users who
+    An explicit override wins over everything — EmuDeck rarely installs Cemu
+    under the Emulation folder, so the guesses below can all miss.  After that
+    a configured ``<mlc_path>`` wins over the directory guesses: users who
     moved the MLC to an SD card have a settings.xml that says so, and the
     default location is then an empty leftover.
     """
+    override = _override_mlc_root(save_dir_override)
+    if override is not None:
+        return override
+
     for settings_xml in _settings_candidates(emulation_path):
         if not settings_xml.is_file():
             continue
@@ -112,8 +170,10 @@ def resolve_mlc_root(emulation_path: Path) -> Path | None:
     return find_paths(*_mlc_candidates(emulation_path))
 
 
-def resolve_save_root(emulation_path: Path) -> Path | None:
-    mlc = resolve_mlc_root(emulation_path)
+def resolve_save_root(
+    emulation_path: Path, save_dir_override: str = ""
+) -> Path | None:
+    mlc = resolve_mlc_root(emulation_path, save_dir_override)
     if mlc is None:
         return None
     save_root = mlc / "usr" / "save" / _TITLE_HIGH
@@ -198,21 +258,25 @@ def _dir_size(save_dir: Path) -> int:
     return total
 
 
-def default_save_path(emulation_path: Path, title_id: str) -> Path:
+def default_save_path(
+    emulation_path: Path, title_id: str, save_dir_override: str = ""
+) -> Path:
     """Where a Wii U save for [title_id] belongs under Cemu's mlc01."""
     upper = title_id.upper()
     if not _TITLE_ID_RE.match(upper):
         raise ValueError(f"Invalid Wii U title_id: {title_id}")
 
-    mlc = resolve_mlc_root(emulation_path)
+    mlc = resolve_mlc_root(emulation_path, save_dir_override)
     if mlc is None:
         mlc = emulation_path / "storage" / "cemu" / "mlc01"
     return mlc / "usr" / "save" / upper[:8] / upper[8:].lower() / "user"
 
 
-def scan(emulation_path: Path) -> Generator[GameEntry, None, None]:
+def scan(
+    emulation_path: Path, save_dir_override: str = ""
+) -> Generator[GameEntry, None, None]:
     """Scan Cemu's mlc01 for Wii U saves."""
-    mlc = resolve_mlc_root(emulation_path)
+    mlc = resolve_mlc_root(emulation_path, save_dir_override)
     if mlc is None:
         return
     save_root = mlc / "usr" / "save" / _TITLE_HIGH
@@ -256,6 +320,7 @@ def build_server_only_entries(
     server_saves: dict[str, dict],
     seen_ids: set[str],
     emulation_path: Path,
+    save_dir_override: str = "",
 ) -> list[GameEntry]:
     """Placeholders for Wii U saves that exist only on the server.
 
@@ -287,13 +352,15 @@ def build_server_only_entries(
             continue
 
         try:
-            save_path = default_save_path(emulation_path, title_id)
+            save_path = default_save_path(
+                emulation_path, title_id, save_dir_override
+            )
         except ValueError:
             continue
 
         if meta_index is None:
             meta_index = build_meta_index(
-                emulation_path, resolve_mlc_root(emulation_path)
+                emulation_path, resolve_mlc_root(emulation_path, save_dir_override)
             )
         local_name, game_code = meta_index.get(title_id.upper(), (None, None))
 

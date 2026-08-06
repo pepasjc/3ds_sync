@@ -289,3 +289,115 @@ def test_server_only_entry_uses_local_meta_when_server_has_raw_id(tmp_path):
 
     assert entry.display_name == "Splatoon"
     assert entry.game_code == "WIIU_AGMP"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Explicit Cemu folder override
+#
+# EmuDeck installs Cemu outside the Emulation folder more often than not, so
+# every path below is one auto-detection cannot reach.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_override_points_at_mlc01(tmp_path):
+    emulation = tmp_path / "Emulation"
+    mlc = tmp_path / "sdcard" / "cemu-install" / "mlc01"
+    save_dir = _make_save(mlc)
+
+    entry = next(iter(cemu.scan(emulation, save_dir_override=str(mlc))))
+    assert entry.save_path == save_dir
+
+
+def test_override_points_at_the_cemu_folder(tmp_path):
+    """The directory picker lands on the install folder as often as mlc01."""
+    emulation = tmp_path / "Emulation"
+    install = tmp_path / "Applications" / "Cemu"
+    save_dir = _make_save(install / "mlc01")
+
+    entry = next(iter(cemu.scan(emulation, save_dir_override=str(install))))
+    assert entry.save_path == save_dir
+
+
+def test_override_wins_over_a_populated_default_location(tmp_path):
+    """Two installs: the override decides which one syncs."""
+    emulation = tmp_path / "Emulation"
+    _make_save(emulation / "storage" / "cemu" / "mlc01", tidlo="10101d00")
+
+    real_mlc = tmp_path / "sdcard" / "mlc01"
+    save_dir = _make_save(real_mlc, tidlo="10143500")
+
+    results = list(cemu.scan(emulation, save_dir_override=str(real_mlc)))
+    assert [e.title_id for e in results] == ["0005000010143500"]
+    assert results[0].save_path == save_dir
+
+
+def test_override_follows_settings_xml_in_that_folder(tmp_path):
+    """Pointing at an install whose MLC was relocated still finds the saves."""
+    emulation = tmp_path / "Emulation"
+    install = tmp_path / "Applications" / "Cemu"
+    install.mkdir(parents=True)
+
+    real_mlc = tmp_path / "sdcard" / "mlc01"
+    save_dir = _make_save(real_mlc)
+    (install / "settings.xml").write_text(
+        f"<content><mlc_path>{real_mlc}</mlc_path></content>", encoding="utf-8"
+    )
+
+    entry = next(iter(cemu.scan(emulation, save_dir_override=str(install))))
+    assert entry.save_path == save_dir
+
+
+def test_override_accepts_an_mlc_with_no_saves_yet(tmp_path):
+    """A fresh install has usr/title and no usr/save — downloads still land."""
+    emulation = tmp_path / "Emulation"
+    mlc = tmp_path / "sdcard" / "mlc01"
+    (mlc / "usr" / "title").mkdir(parents=True)
+
+    path = cemu.default_save_path(
+        emulation, "0005000010143500", save_dir_override=str(mlc)
+    )
+    assert path == mlc / "usr" / "save" / "00050000" / "10143500" / "user"
+
+
+def test_unusable_override_falls_back_to_auto_detection(tmp_path):
+    """A stale path must not turn the scan into a silent no-op."""
+    emulation = tmp_path / "Emulation"
+    mlc = emulation / "storage" / "cemu" / "mlc01"
+    save_dir = _make_save(mlc)
+
+    bogus = tmp_path / "gone"
+    entry = next(iter(cemu.scan(emulation, save_dir_override=str(bogus))))
+    assert entry.save_path == save_dir
+
+
+def test_override_drives_server_only_download_path(tmp_path):
+    emulation = tmp_path / "Emulation"
+    mlc = tmp_path / "sdcard" / "mlc01"
+    (mlc / "usr" / "save").mkdir(parents=True)
+
+    server_saves = {
+        "0005000010101D00": {"title_id": "0005000010101D00", "system": "WIIU"}
+    }
+
+    entry = cemu.build_server_only_entries(
+        server_saves, set(), emulation, save_dir_override=str(mlc)
+    )[0]
+    assert entry.save_path == (
+        mlc / "usr" / "save" / "00050000" / "10101d00" / "user"
+    )
+
+
+def test_scan_all_passes_the_override_through(tmp_path):
+    """The aggregator is what the UI calls — the override has to survive it."""
+    from scanner import scan_all
+
+    emulation = tmp_path / "Emulation"
+    emulation.mkdir()
+    mlc = tmp_path / "sdcard" / "mlc01"
+    save_dir = _make_save(mlc)
+
+    results = scan_all(
+        str(emulation), save_dir_overrides={"Cemu": str(mlc)}
+    )
+    wiiu = [e for e in results if e.system == "WIIU"]
+    assert [e.save_path for e in wiiu] == [save_dir]

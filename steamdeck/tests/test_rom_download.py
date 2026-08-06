@@ -13,7 +13,11 @@ STEAMDECK_ROOT = ROOT / "steamdeck"
 if str(STEAMDECK_ROOT) not in sys.path:
     sys.path.insert(0, str(STEAMDECK_ROOT))
 
-from config import normalize_rom_dir_overrides  # noqa: E402
+from config import (  # noqa: E402
+    normalize_rom_dir_overrides,
+    normalize_save_dir_overrides,
+    save_dir_override,
+)
 from scanner.rom_target import (  # noqa: E402
     SYSTEM_ROM_DIRS,
     prepare_rom_folders,
@@ -152,6 +156,31 @@ def test_normalize_overrides_rejects_non_dict_inputs():
 
 def test_normalize_overrides_skips_non_string_keys():
     assert normalize_rom_dir_overrides({42: "/x", "PS1": "/y"}) == {"PS1": "/y"}
+
+
+# ---------------------------------------------------------------------------
+# save_dir_overrides — per-emulator save folders (Cemu)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_save_dir_overrides_keeps_key_case():
+    """Keys name an emulator, matching Android's saveDirOverrides spelling."""
+    src = {"Cemu": "  /mnt/sd2/Cemu  ", "Blank": "  "}
+    assert normalize_save_dir_overrides(src) == {"Cemu": "/mnt/sd2/Cemu"}
+
+
+def test_normalize_save_dir_overrides_rejects_malformed_inputs():
+    assert normalize_save_dir_overrides(None) == {}
+    assert normalize_save_dir_overrides("not a dict") == {}
+    assert normalize_save_dir_overrides({42: "/x", "Cemu": "/y"}) == {"Cemu": "/y"}
+
+
+def test_save_dir_override_lookup_is_case_insensitive():
+    """A hand-edited config shouldn't silently do nothing."""
+    assert save_dir_override({"cemu": "/mnt/cemu"}, "Cemu") == "/mnt/cemu"
+    assert save_dir_override({"Cemu": "/mnt/cemu"}, "cemu") == "/mnt/cemu"
+    assert save_dir_override({}, "Cemu") == ""
+    assert save_dir_override(None, "Cemu") == ""
 
 
 # ---------------------------------------------------------------------------
