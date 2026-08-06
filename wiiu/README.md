@@ -156,3 +156,17 @@ converting" wait screen in the client.
   there, so the vWii / Wii U views, and anything touching SLC/MLC, need real
   hardware.
 - GC multi-disc auto-pairing (`disc2.iso`) is not implemented yet.
+
+## License
+
+GPL-3.0-or-later, like the rest of GameSync — see [LICENSE](../LICENSE).
+
+This client links **[libmocha](https://github.com/wiiu-env/libmocha)** (Maschell
+and the wiiu-env contributors), which is **LGPL-3.0-or-later**. It is statically
+linked into the distributed `wiiusync.rpx` / `wiiusync.wuhb` and used unmodified;
+LGPL-3.0 code may be conveyed as part of a GPL-3.0 work. License text:
+[`licenses/LGPL-3.0.txt`](../licenses/LGPL-3.0.txt).
+
+Building also links devkitPPC and `wut`, covered by the GPLv3 §7 console-SDK
+linking exception described in the root [README](../README.md#license). Details:
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
