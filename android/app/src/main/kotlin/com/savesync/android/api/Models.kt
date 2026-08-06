@@ -83,6 +83,19 @@ data class NormalizeResponse(val results: List<NormalizeResult>)
 
 // ── PSP/game name lookup ──────────────────────────────────────────────────
 data class GameNameRequest(val codes: List<String>)
+
+/**
+ * Fills in server-side names for titles stored under their raw id.
+ *
+ * [codes] are product codes the server resolves through its own DATs;
+ * [names] are display names for titles no DAT covers — a Wii U save is keyed
+ * by a 16-hex title id whose low word is not the product code, so the only
+ * source is the title's meta.xml on whichever device has the game.
+ */
+data class NameHintRequest(
+    val codes: Map<String, String> = emptyMap(),
+    val names: Map<String, String> = emptyMap()
+)
 data class GameNameResponse(
     val names: Map<String, String>,
     val types: Map<String, String>,

@@ -81,6 +81,15 @@ typedef struct {
     bool sync_vwii;
     bool sync_wiiu;
 
+    /* How to leave the app.  This console (Health & Safety wrapper title)
+     * black-screens on exit, so the strategy is runtime-selectable to make
+     * the cause bisectable without a rebuild per attempt:
+     *   full     tear everything down, then SYSLaunchMenu   (default)
+     *   minimal  no teardown at all, then SYSLaunchMenu
+     *   relaunch tear down, then SYSRelaunchTitle(0, NULL)
+     *   none     tear down, issue no launch request at all  */
+    char exit_mode[16];
+
     /* libmocha / FSA state (filled by wiiusaves_init / vwiisaves_init). */
     bool mocha_ok;
     bool slc_mounted;

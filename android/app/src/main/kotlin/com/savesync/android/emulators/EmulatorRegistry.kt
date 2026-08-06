@@ -2,6 +2,7 @@ package com.savesync.android.emulators
 
 import com.savesync.android.emulators.impl.AetherSX2Emulator
 import com.savesync.android.emulators.impl.AzaharEmulator
+import com.savesync.android.emulators.impl.CemuEmulator
 import com.savesync.android.emulators.impl.DolphinEmulator
 import com.savesync.android.emulators.impl.DraSticEmulator
 import com.savesync.android.emulators.impl.DuckStationEmulator
@@ -63,6 +64,12 @@ object EmulatorCatalog {
             displayName = "Azahar",
             systemHint = "Nintendo 3DS",
             defaultPathHint = "sdmc/Nintendo 3DS/.../title/"
+        ),
+        EmulatorDescriptor(
+            key = CemuEmulator.EMULATOR_KEY,
+            displayName = "Cemu",
+            systemHint = "Nintendo Wii U",
+            defaultPathHint = "<cemu>/mlc01/ (usr/save/00050000/…)"
         ),
         EmulatorDescriptor(
             key = MelonDsEmulator.EMULATOR_KEY,
@@ -149,6 +156,12 @@ object EmulatorRegistry {
                 romScanDir = romScanDir,
                 storageBaseDir = EmudeckPaths.netherSx2Root(emudeckDir),
                 saveDirOverride = ovr(AetherSX2Emulator.EMULATOR_KEY)
+            ),
+            CemuEmulator(
+                storageBaseDir = EmudeckPaths.cemuRoot(emudeckDir),
+                saveDirOverride = ovr(CemuEmulator.EMULATOR_KEY),
+                romScanDir = romDirOverrides["WIIU"]?.takeIf { it.isNotBlank() } ?: romScanDir,
+                emudeckDir = emudeckDir
             )
         )
     }

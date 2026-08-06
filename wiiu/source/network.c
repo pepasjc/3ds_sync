@@ -11,6 +11,7 @@
 #include "http.h"
 #include "state.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -566,6 +567,27 @@ static int upload_stream_producer(HttpWriteFn write, void *write_ctx, void *user
                                 bundle_http_write, &bw, u->save_hash_hex);
 }
 
+/* Percent-encode a query-parameter value into ``out``.  Truncates rather than
+ * overflowing; a clipped name is cosmetic, a smashed stack is not. */
+static void url_encode(const char *in, char *out, size_t out_size) {
+    static const char HEX[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        unsigned char c = *p;
+        int safe = isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~';
+        size_t need = safe ? 1 : 3;
+        if (j + need + 1 > out_size) break;
+        if (safe) {
+            out[j++] = (char)c;
+        } else {
+            out[j++] = '%';
+            out[j++] = HEX[c >> 4];
+            out[j++] = HEX[c & 0x0F];
+        }
+    }
+    out[j] = '\0';
+}
+
 int network_upload_save_stream(const SyncState *state,
                                const SaveTitle *title,
                                uint32_t timestamp,
@@ -575,9 +597,29 @@ int network_upload_save_stream(const SyncState *state,
     if (!state || !title) return -1;
     if (save_hash_hex) save_hash_hex[0] = '\0';
 
-    char path[256];
-    snprintf(path, sizeof(path), "/api/v1/saves/%s?source=wiiu&console_id=%s%s",
-             title->title_id, state->console_id, force ? "&force=true" : "");
+    /* Name hints.  A 16-hex Wii U title id tells the server nothing about the
+     * game, so a save uploaded without these is listed as raw hex by every
+     * other client — the desktop app has no console NAND to read a name from.
+     * The product code is preferred (it resolves to the DAT's canonical
+     * name); the meta.xml longname is the fallback for titles the DAT lacks. */
+    char code_q[32] = "";
+    if (title->game_code[0]) {
+        char enc[24];
+        url_encode(title->game_code, enc, sizeof(enc));
+        snprintf(code_q, sizeof(code_q), "&game_code=%s", enc);
+    }
+    char name_q[3 * SAVE_NAME_MAX + 16] = "";
+    if (title->name[0]) {
+        char enc[3 * SAVE_NAME_MAX];
+        url_encode(title->name, enc, sizeof(enc));
+        snprintf(name_q, sizeof(name_q), "&game_name=%s", enc);
+    }
+
+    char path[256 + sizeof(name_q)];
+    snprintf(path, sizeof(path),
+             "/api/v1/saves/%s?source=wiiu&console_id=%s%s%s%s",
+             title->title_id, state->console_id, force ? "&force=true" : "",
+             code_q, name_q);
 
     HttpRequest req = {0};
     req.server_url        = state->server_url;

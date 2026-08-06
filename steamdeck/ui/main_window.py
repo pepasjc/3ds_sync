@@ -49,7 +49,7 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QKeyEvent
 
 from scanner.models import GameEntry, SyncStatus, STATUS_LABEL
-from scanner import scan_all, rpcs3, dolphin, citra, server_only
+from scanner import scan_all, rpcs3, dolphin, citra, cemu, server_only
 from scanner.rom_match import (
     DISC_SLUG_SYSTEMS as _DISC_SLUG_SYSTEMS,
     RomIndex as _RomIndex,
@@ -257,7 +257,11 @@ class ServerWorker(QObject):
             # Use title_id as the lookup code (server resolves by code).
             # For PS3 saves with slot suffixes (e.g. BLJS10001GAME), trim to
             # the 9-char base code so the server DB can resolve the name.
-            code = entry.title_id
+            #
+            # Wii U is the exception: its title id's low word is not the
+            # product code, so the DAT can only be keyed by the code the
+            # scanner pulled out of meta.xml (WIIU_ARDE).
+            code = entry.game_code or entry.title_id
             if (
                 entry.system == "PS3"
                 and len(code) > 9
@@ -298,6 +302,29 @@ class ServerWorker(QObject):
                 if resolved_type and entry.system == "?":
                     mapped = _PLATFORM_TO_SYSTEM.get(resolved_type, resolved_type)
                     entry.system = mapped
+
+    def _push_wiiu_name_hints(
+        self, entries: list[GameEntry], server_saves: dict[str, dict]
+    ) -> None:
+        """Send locally-resolved Wii U names/codes for server rows still raw."""
+        codes: dict[str, str] = {}
+        names: dict[str, str] = {}
+        for entry in entries:
+            if entry.system.upper() != "WIIU":
+                continue
+            info = _find_server_save(server_saves, entry.title_id)
+            if info is None:
+                continue
+            server_name = info.get("game_name") or info.get("name") or ""
+            if server_name and server_name != entry.title_id:
+                continue  # server already has a real name
+            if entry.game_code:
+                codes[entry.title_id] = entry.game_code
+            if entry.display_name and entry.display_name != entry.title_id:
+                names[entry.title_id] = entry.display_name
+
+        if codes or names:
+            self._client.push_name_hints(codes=codes, names=names)
 
     def run(self):
         # ── Pre-fetch the server's ROM catalog so we can (a) re-key local
@@ -345,6 +372,17 @@ class ServerWorker(QObject):
         updated.extend(
             citra.build_server_only_entries(server_saves, seen_ids, self._emulation_path)
         )
+        seen_ids = {entry.title_id for entry in updated}
+        updated.extend(
+            cemu.build_server_only_entries(server_saves, seen_ids, self._emulation_path)
+        )
+
+        # Wii U saves reach the server named after their own title id: no DAT
+        # can resolve a 16-hex Wii U id, so the console client has nothing to
+        # send.  This machine may have the game's meta.xml — hand the server
+        # what we read so every other client (the desktop app above all) stops
+        # showing raw hex.
+        self._push_wiiu_name_hints(updated, server_saves)
         # Generic placeholders for every other system — lets the user see
         # (and Download-ROM for) server saves on systems without a dedicated
         # scanner-level builder (PS1, PS2, PSP, GBA, SNES, NES, ...).

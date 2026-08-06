@@ -16,7 +16,14 @@ data class SaveEntry(
     val isMultiFile: Boolean = saveDir != null,
     val isServerOnly: Boolean = false,
     /** Canonical No-Intro/Redump name from DAT lookup — null if not matched */
-    val canonicalName: String? = null
+    val canonicalName: String? = null,
+    /**
+     * Product code the server can resolve a game name from when its own
+     * title-id lookup can't.  Wii U saves are keyed by a 16-hex title id whose
+     * low word is *not* the product code, so Cemu reports "WIIU_ARDE" (read
+     * from meta.xml) and the upload passes it as ``game_code``.
+     */
+    val gameCode: String? = null
 ) {
     /**
      * True when this entry is a PSP/PSX save slot directory (DATA.BIN + PARAM.SFO + etc.),
@@ -26,7 +33,14 @@ data class SaveEntry(
      */
     val isPspSlot: Boolean get() = saveDir != null && !isMultiFile
 
-    val is3dsSaveDir: Boolean get() = systemName == "3DS" && isMultiFile && saveDir != null
+    /**
+     * True for save archives that are recursive directory trees bundled with
+     * relative paths: 3DS (Azahar) and Wii U (Cemu).  Both hash as the
+     * concatenation of file contents in relative-path order, which is what the
+     * server computes for the bundle.
+     */
+    val isTreeSaveDir: Boolean
+        get() = (systemName == "3DS" || systemName == "WIIU") && isMultiFile && saveDir != null
 
     fun computeHash(): String {
         return when {
@@ -34,9 +48,9 @@ data class SaveEntry(
             // PSP slot dirs: sha256 of all file contents sorted by filename (no paths).
             // Matches the server's bundle hash and the PSP homebrew client's algorithm.
             isPspSlot -> HashUtils.sha256DirFiles(saveDir!!)
-            // 3DS save archives are recursive directory trees bundled with relative paths,
-            // but the server compares only concatenated file contents in bundle order.
-            is3dsSaveDir -> HashUtils.sha256DirTreeFiles(saveDir!!)
+            // 3DS/Wii U save archives are recursive directory trees bundled with relative
+            // paths, but the server compares only concatenated file contents in bundle order.
+            isTreeSaveDir -> HashUtils.sha256DirTreeFiles(saveDir!!)
             saveFile != null && extraFiles.isNotEmpty() -> {
                 val files = (listOf(saveFile) + extraFiles).filter { it.exists() }.sortedBy { it.name }
                 HashUtils.sha256Files(files)

@@ -1,6 +1,7 @@
 package com.savesync.android.emulators
 
 import com.savesync.android.emulators.impl.AetherSX2Emulator
+import com.savesync.android.emulators.impl.CemuEmulator
 import com.savesync.android.emulators.impl.DolphinEmulator
 import com.savesync.android.emulators.impl.DraSticEmulator
 import com.savesync.android.emulators.impl.DuckStationEmulator
@@ -38,9 +39,10 @@ class SaveDirOverrideTest {
             DolphinEmulator.EMULATOR_KEY,
             AetherSX2Emulator.EMULATOR_KEY,
             AzaharEmulator.EMULATOR_KEY,
+            CemuEmulator.EMULATOR_KEY,
         )
         // No duplicates means each constant is unique
-        assertEquals(9, keys.size)
+        assertEquals(10, keys.size)
         // No blanks, all distinct identifiers
         assertTrue(keys.all { it.isNotBlank() })
     }
@@ -57,6 +59,7 @@ class SaveDirOverrideTest {
             DolphinEmulator.EMULATOR_KEY,
             AetherSX2Emulator.EMULATOR_KEY,
             AzaharEmulator.EMULATOR_KEY,
+            CemuEmulator.EMULATOR_KEY,
         )
         val catalogKeys = EmulatorCatalog.ALL.map { it.key }
         assertEquals(constantKeys.toSet(), catalogKeys.toSet())

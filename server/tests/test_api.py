@@ -1434,3 +1434,91 @@ class TestWiiUTitles:
         titles = r.json()["titles"]
         assert [t["title_id"] for t in titles] == ["WII_RMCE"]
         assert titles[0]["console_type"] == "WII"
+
+
+class TestWiiUGameNames:
+    """A Wii U save can only be named by the client that has its meta.xml.
+
+    No DAT can resolve a 16-hex Wii U title id — its low word is not the
+    product code — so a save uploaded without a hint is listed as raw hex by
+    every client, and the desktop app (which has no console NAND or Cemu
+    install to read) can never show anything better.
+    """
+
+    WIIU_TID = "0005000010143500"
+
+    def _upload(self, client, auth_headers, params: str = "") -> None:
+        bundle = _make_bundle_bytes(
+            title_id=0x0005000010143500,
+            files=[("common/data.bin", b"wiiu save")],
+        )
+        r = client.post(
+            f"/api/v1/saves/{self.WIIU_TID}{params}",
+            content=bundle,
+            headers={**auth_headers, "Content-Type": "application/octet-stream"},
+        )
+        assert r.status_code in (200, 201)
+
+    def _stored_name(self, client, auth_headers) -> str:
+        r = client.get("/api/v1/titles?console_type=WIIU", headers=auth_headers)
+        assert r.status_code == 200
+        return r.json()["titles"][0]["game_name"]
+
+    def test_upload_without_hint_keeps_raw_id(self, client, auth_headers):
+        self._upload(client, auth_headers)
+        assert self._stored_name(client, auth_headers) == self.WIIU_TID
+
+    def test_upload_game_name_hint_is_used(self, client, auth_headers):
+        self._upload(client, auth_headers, "?game_name=Super%20Mario%203D%20World")
+        assert self._stored_name(client, auth_headers) == "Super Mario 3D World"
+
+    def test_dat_name_wins_over_client_hint(self, client, auth_headers):
+        """The DAT is authoritative — a client hint only fills a blank."""
+        game_names._wiiu_names["ARDE"] = "Canonical DAT Name"
+        try:
+            self._upload(
+                client, auth_headers, "?game_code=WIIU_ARDE&game_name=Client%20Name"
+            )
+            assert self._stored_name(client, auth_headers) == "Canonical DAT Name"
+        finally:
+            game_names._wiiu_names.pop("ARDE", None)
+
+    def test_update_names_backfills_by_name(self, client, auth_headers):
+        """Backfill for saves the console already uploaded under a raw id."""
+        self._upload(client, auth_headers)
+
+        r = client.post(
+            "/api/v1/titles/update_names",
+            json={"names": {self.WIIU_TID: "Splatoon"}},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        assert self._stored_name(client, auth_headers) == "Splatoon"
+
+    def test_update_names_backfills_by_code(self, client, auth_headers):
+        self._upload(client, auth_headers)
+        game_names._wiiu_names["ARDE"] = "Canonical DAT Name"
+        try:
+            r = client.post(
+                "/api/v1/titles/update_names",
+                json={
+                    "codes": {self.WIIU_TID: "WIIU_ARDE"},
+                    "names": {self.WIIU_TID: "Client Name"},
+                },
+                headers=auth_headers,
+            )
+            assert r.status_code == 200
+            assert self._stored_name(client, auth_headers) == "Canonical DAT Name"
+        finally:
+            game_names._wiiu_names.pop("ARDE", None)
+
+    def test_update_names_never_overwrites_a_real_name(self, client, auth_headers):
+        self._upload(client, auth_headers, "?game_name=Real%20Name")
+
+        r = client.post(
+            "/api/v1/titles/update_names",
+            json={"names": {self.WIIU_TID: "Wrong Name"}},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        assert self._stored_name(client, auth_headers) == "Real Name"

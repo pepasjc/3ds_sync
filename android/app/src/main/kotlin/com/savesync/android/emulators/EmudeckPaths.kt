@@ -26,4 +26,16 @@ object EmudeckPaths {
 
     fun ppssppRoot(emudeckDir: String): File? =
         storageDir(emudeckDir)?.let { File(it, "PPSSPP") }
+
+    /**
+     * Cemu's EmuDeck folder.  EmuDeck lowercases this one ("cemu"), so try
+     * both spellings and let the caller fall back to on-device candidates when
+     * neither exists.
+     */
+    fun cemuRoot(emudeckDir: String): File? {
+        val storage = storageDir(emudeckDir) ?: return null
+        val lower = File(storage, "cemu")
+        if (lower.isDirectory) return lower
+        return File(storage, "Cemu")
+    }
 }

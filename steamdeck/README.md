@@ -44,6 +44,7 @@ To launch from Gaming Mode, add `launch.sh` as a non-Steam game in Steam:
 | PPSSPP | PSP |
 | melonDS | NDS |
 | RPCS3 | PS3 |
+| Cemu | Wii U (`mlc01/usr/save/00050000/`) |
 
 ## Configuration
 

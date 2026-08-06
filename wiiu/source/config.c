@@ -54,6 +54,7 @@ static void config_apply_defaults(SyncState *state) {
     strncpy(state->wbfs_dir, DEFAULT_WBFS_DIR, sizeof(state->wbfs_dir) - 1);
     state->sync_vwii = true;
     state->sync_wiiu = true;
+    strncpy(state->exit_mode, "full", sizeof(state->exit_mode) - 1);
 }
 
 static bool parse_bool_value(const char *value, bool *out) {
@@ -109,6 +110,9 @@ static void parse_config_text(SyncState *state, char *text) {
                     bool en; if (parse_bool_value(val, &en)) state->sync_vwii = en;
                 } else if (!strcmp(key, "sync_wiiu")) {
                     bool en; if (parse_bool_value(val, &en)) state->sync_wiiu = en;
+                } else if (!strcmp(key, "exit_mode")) {
+                    strncpy(state->exit_mode, val, sizeof(state->exit_mode) - 1);
+                    state->exit_mode[sizeof(state->exit_mode) - 1] = '\0';
                 }
             }
         }
@@ -133,11 +137,14 @@ static void format_config_text(const SyncState *state, char *out, size_t out_siz
              "wbfs_dir=%s\n"
              "sync_vwii=%s\n"
              "sync_wiiu=%s\n"
+             "# exit_mode: full | minimal | relaunch | none\n"
+             "exit_mode=%s\n"
              "%s%s%s",
              state->server_url, state->api_key,
              state->nin_saves_dir, state->games_dir, state->wbfs_dir,
              state->sync_vwii ? "true" : "false",
              state->sync_wiiu ? "true" : "false",
+             state->exit_mode[0] ? state->exit_mode : "full",
              state->console_id[0] ? "console_id=" : "",
              state->console_id[0] ? state->console_id : "",
              state->console_id[0] ? "\n" : "");

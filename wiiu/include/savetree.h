@@ -30,12 +30,23 @@ typedef struct {
 typedef struct {
     char      title_id[TITLE_ID_LEN];   /* server key */
     char      name[SAVE_NAME_MAX];      /* display name ("" if unknown) */
+    /* Server-side name hint, "WIIU_ARDE" form, from meta.xml's
+     * <product_code>.  No DAT can name a save from a 16-hex Wii U title id
+     * (its low word is not the product code), so without this every client
+     * lists the save as raw hex.  Empty for vWii, whose WII_<code> id the
+     * server already resolves. */
+    char      game_code[16];
     char      root[SAVE_DIR_LEN];       /* absolute dir the relative paths hang off */
     int       file_count;
     int       file_cap;
     uint32_t  total_size;
     uint32_t  latest_mtime;
     SaveFile *files;                    /* heap array, file_count entries */
+    /* Non-empty when the tree could not be read.  Such a title is still
+     * listed (dropping it silently is how a missing save turns into a
+     * mystery) but must never be uploaded — a partial read would overwrite
+     * a good server copy with an incomplete one. */
+    char      error[80];
 } SaveTitle;
 
 typedef struct {

@@ -18,6 +18,7 @@
 #include "common.h"
 #include "config.h"
 #include "downloads.h"
+#include "appstate.h"
 #include "gcsaves.h"
 #include "http.h"
 #include "natives.h"
@@ -36,8 +37,11 @@
 #include <unistd.h>
 
 #include <coreinit/systeminfo.h>
+#include <coreinit/title.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
+#include <proc_ui/procui.h>
+#include <sysapp/launch.h>
 #include <vpad/input.h>
 #include <whb/log.h>
 #include <whb/log_udp.h>
@@ -157,7 +161,7 @@ static bool confirm(const char *fmt, ...) {
     char body[320];
     snprintf(body, sizeof(body), "%s\n\nA = Yes      B = No", msg);
     bool repaint = true;
-    while (WHBProcIsRunning()) {
+    while (app_running()) {
         if (repaint || ui_consume_repaint_request()) {
             ui_clear();
             ui_draw_message("Confirm", body);
@@ -213,12 +217,12 @@ static bool edit_text(char *out, size_t cap, const char *label) {
     int maxlen = (int)(cap < sizeof(buf) ? cap : sizeof(buf)) - 1;
 
     draw_edit(label, buf, cur);
-    while (WHBProcIsRunning()) {
+    while (app_running()) {
         if (ui_consume_repaint_request()) draw_edit(label, buf, cur);
         uint32_t d = pad_read(NULL);
         if (d == 0) { OSSleepTicks(OSMillisecondsToTicks(16)); continue; }
 
-        if (d & (VPAD_BUTTON_A | VPAD_BUTTON_PLUS)) {
+        if (d & VPAD_BUTTON_A) {   /* PLUS is the global quit, not "accept" */
             strncpy(out, buf, cap - 1);
             out[cap - 1] = '\0';
             return true;
@@ -345,7 +349,7 @@ static int progress_cb(uint64_t done, uint64_t total) {
     g_active_done  = done;
     g_active_total = total;
 
-    if (!WHBProcIsRunning()) return 1;   /* HOME / shutdown -> pause cleanly */
+    if (!app_running()) return 1;   /* HOME / shutdown -> pause cleanly */
     if (ui_consume_repaint_request()) redraw();
     if (pad_read(NULL) & VPAD_BUTTON_B) g_pause_req = true;
 
@@ -367,7 +371,7 @@ static int progress_cb(uint64_t done, uint64_t total) {
 /* Pump the UI while the server prepares a response (RVZ->ISO / RVZ->WBFS
  * conversion can take minutes).  B cancels. */
 static int wait_cb(uint32_t ms) {
-    if (!WHBProcIsRunning()) return 1;
+    if (!app_running()) return 1;
     if (ui_consume_repaint_request()) redraw();
     if (pad_read(NULL) & VPAD_BUTTON_B) return 1;
     if (ms && (ms % 2000) == 0) {
@@ -859,10 +863,15 @@ static void compute_plan(void) {
     static SaveTitleList merged;
     merged.title_count = 0;
     merged.last_error[0] = '\0';
+    /* Titles whose tree could not be read are excluded: hashing a partial
+     * read would tell the server the save changed and could overwrite a good
+     * copy with an incomplete one. */
     for (int i = 0; i < g_vwii.title_count && merged.title_count < SAVE_MAX_TITLES; i++)
-        merged.titles[merged.title_count++] = g_vwii.titles[i];
+        if (!g_vwii.titles[i].error[0])
+            merged.titles[merged.title_count++] = g_vwii.titles[i];
     for (int i = 0; i < g_wiiu.title_count && merged.title_count < SAVE_MAX_TITLES; i++)
-        merged.titles[merged.title_count++] = g_wiiu.titles[i];
+        if (!g_wiiu.titles[i].error[0])
+            merged.titles[merged.title_count++] = g_wiiu.titles[i];
 
     const char *platforms[2];
     int np = 0;
@@ -906,10 +915,15 @@ static void sync_all_natives(void) {
      * the other family so cross-family entries still resolve. */
     static SaveTitleList merged;
     merged.title_count = 0;
+    /* Titles whose tree could not be read are excluded: hashing a partial
+     * read would tell the server the save changed and could overwrite a good
+     * copy with an incomplete one. */
     for (int i = 0; i < g_vwii.title_count && merged.title_count < SAVE_MAX_TITLES; i++)
-        merged.titles[merged.title_count++] = g_vwii.titles[i];
+        if (!g_vwii.titles[i].error[0])
+            merged.titles[merged.title_count++] = g_vwii.titles[i];
     for (int i = 0; i < g_wiiu.title_count && merged.title_count < SAVE_MAX_TITLES; i++)
-        merged.titles[merged.title_count++] = g_wiiu.titles[i];
+        if (!g_wiiu.titles[i].error[0])
+            merged.titles[merged.title_count++] = g_wiiu.titles[i];
 
     SyncSummary sum;
     sync_run_all(&g_state, &merged, &g_plan, sync_progress, NULL, &sum);
@@ -980,9 +994,18 @@ static void draw_natives(AppView view) {
         int idx = scroll + i;
         if (idx < list->title_count) {
             SaveTitle *t = &list->titles[idx];
+            const char *nm = t->name[0] ? t->name : t->title_id;
+
+            /* An unreadable save is shown with its reason instead of being
+             * hidden, so a missing game is never a silent omission. */
+            if (t->error[0]) {
+                ui_text_hl(top + i, idx == sel, UI_RED, " ! %-*.*s %s",
+                           namew, namew, nm, t->error);
+                continue;
+            }
+
             TitleStatus st = g_plan_valid ? sync_plan_status(&g_plan, t->title_id)
                                           : TITLE_STATUS_UNKNOWN;
-            const char *nm = t->name[0] ? t->name : t->title_id;
             int color = st == TITLE_STATUS_CONFLICT ? UI_RED
                       : st == TITLE_STATUS_UP_TO_DATE ? UI_GREEN : UI_WHITE;
             ui_text_hl(top + i, idx == sel, color, " %c %-*.*s %4uf %5uK",
@@ -1005,15 +1028,15 @@ static void draw_natives(AppView view) {
 
 static const char *hint_for(AppView v) {
     switch (v) {
-        case APP_VIEW_ROMS:      return "A=fetch X=queue Y=get now MINUS=GC/WII ZL/ZR=view";
-        case APP_VIEW_LOCAL:     return "A=rescan X=delete ZL/ZR=view";
-        case APP_VIEW_DOWNLOADS: return "A=start one Y=run all X=remove B=pause";
-        case APP_VIEW_GCCARDS:   return "A=upload Y=restore ZR=next card X=rescan PLUS=import all";
-        case APP_VIEW_SERVER:    return "A=restore into card X=refresh Y=pull all GCI";
+        case APP_VIEW_ROMS:      return "A=fetch X=queue Y=get now MINUS=GC/WII  +=quit";
+        case APP_VIEW_LOCAL:     return "A=rescan X=delete  ZL/ZR=view  +=quit";
+        case APP_VIEW_DOWNLOADS: return "A=start one Y=run all X=remove B=pause  +=quit";
+        case APP_VIEW_GCCARDS:   return "A=upload Y=restore R=next card X=rescan L=import all";
+        case APP_VIEW_SERVER:    return "A=restore into card X=refresh Y=pull all GCI  +=quit";
         case APP_VIEW_VWII:
-        case APP_VIEW_WIIU:      return "A=sync X=force up Y=force down MINUS=plan PLUS=sync all";
-        case APP_VIEW_CONFIG:    return "Up/Dn=select L/R=change A=edit/save";
-        default:                 return "ZL/ZR=switch view";
+        case APP_VIEW_WIIU:      return "A=sync X=force up Y=force down MINUS=plan L=sync all";
+        case APP_VIEW_CONFIG:    return "Up/Dn=select  Left/Right=change  A=edit/save  +=quit";
+        default:                 return "ZL/ZR=switch view  +=quit";
     }
 }
 
@@ -1049,6 +1072,93 @@ static void enter_view(void) {
     }
 }
 
+/* Set from the HOME_BUTTON_DENIED callback, which runs inside ProcUI while
+ * the main loop is blocked in app_running(). */
+static volatile bool g_quit_requested = false;
+
+static uint32_t home_button_denied(void *ctx) {
+    (void)ctx;
+    g_quit_requested = true;
+    return 0;
+}
+
+/*
+ * Leave the app.
+ *
+ * WHBProcShutdown() only relaunches (SYSRelaunchTitle) when libwhb matched
+ * the running title id against its three known launcher ids.  On this console
+ * it evidently does not: the log shows the whole teardown completing, and
+ * then the screen just stays black because nothing ever asked the system to
+ * switch away.  So ask explicitly, and pump ProcUI until it reports EXITING
+ * — that is what actually performs the foreground handover.
+ */
+static void quit_to_menu(void) {
+    /* Reachable twice — once from the + / HOME handler and once after the
+     * loop falls out — and a second SYSLaunchMenu() would be a competing
+     * launch request. */
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    const char *mode = g_state.exit_mode[0] ? g_state.exit_mode : "full";
+    bool skip_teardown = (strcmp(mode, "minimal") == 0);
+
+    WHBLogPrintf("quit: closing down (exit_mode=%s, aroma=%d)",
+                 mode, (int)app_is_aroma());
+    ui_clear();
+    ui_draw_message("Save Sync", "Closing down...\n\nReturning to the Wii U Menu.");
+    ui_flush();
+    OSSleepTicks(OSMillisecondsToTicks(400));   /* let the message be seen */
+
+    if (skip_teardown) {
+        /* Only the screen has to go back — MEM1 belongs to ProcUI. */
+        WHBLogPrintf("exit: skipping teardown (minimal)");
+        ui_shutdown();
+    } else {
+
+    /*
+     * EVERYTHING is torn down here, while ProcUI is still alive.
+     *
+     * ProcUI owns the MEM1 heap that OSScreen's framebuffers come out of, and
+     * ProcUIShutdown() resets it.  Releasing our frame-heap state afterwards
+     * — which is what the old tail-of-main teardown did — frees against a
+     * heap that has already been reset, so the process faulted on its way out
+     * and never completed the handover: a black screen with a log that looked
+     * like a clean exit.
+     */
+    WHBLogPrintf("exit: freeing lists");
+    sync_plan_free(&g_plan);
+    savetree_free_list(&g_vwii);
+    savetree_free_list(&g_wiiu);
+
+    WHBLogPrintf("exit: unmounting NAND");
+    natives_shutdown(&g_state);
+
+    WHBLogPrintf("exit: network shutdown");
+    network_shutdown();
+
+    WHBLogPrintf("exit: unmounting SD");
+    WHBUnmountSdCard();
+
+    WHBLogPrintf("exit: releasing screen (MEM1) before ProcUI shuts down");
+    ui_shutdown();
+    }
+
+    if (strcmp(mode, "none") == 0) {
+        WHBLogPrintf("quit: issuing NO launch request");
+    } else if (strcmp(mode, "relaunch") == 0) {
+        WHBLogPrintf("quit: SYSRelaunchTitle");
+        SYSRelaunchTitle(0, NULL);
+    } else {
+        WHBLogPrintf("quit: SYSLaunchMenu");
+        SYSLaunchMenu();
+    }
+
+    while (app_running())
+        OSSleepTicks(OSMillisecondsToTicks(16));
+    WHBLogPrintf("quit: ProcUI reported exiting");
+}
+
 static void cycle_view(int delta) {
     int n = (int)APP_VIEW_COUNT;
     g_view = (AppView)((((int)g_view + delta) % n + n) % n);
@@ -1060,15 +1170,31 @@ static void cycle_view(int delta) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    WHBProcInit();
-
-    /* Ask the system for the HOME button overlay.  Without this the button
-     * can be treated as denied (PROCUI_CALLBACK_HOME_BUTTON_DENIED) and the
-     * press produces nothing but a blank screen. */
-    OSEnableHomeButtonMenu(TRUE);
-
+    /* Do NOT call OSEnableHomeButtonMenu(TRUE) after this.
+     *
+     * When homebrew is hosted by the Homebrew Launcher or the Health & Safety
+     * wrapper, WHBProcInit deliberately calls OSEnableHomeButtonMenu(FALSE)
+     * and registers a HOME_BUTTON_DENIED callback that clears its running
+     * flag — i.e. HOME means "quit back to the launcher", and there is no
+     * overlay.  Re-enabling the menu stops the press from being denied (so
+     * the app never quits) and asks the system for an overlay a hijacked
+     * wrapper title cannot render: a black screen either way. */
     WHBLogUdpInit();
-    WHBLogPrintf("wiiusync " APP_VERSION " starting");
+    app_init();
+
+    /* Under Aroma the HOME overlay works and app_init leaves it enabled.
+     * Everywhere else it renders black over a hijacked title, so disable it
+     * and treat the resulting DENIED callback as a quit — same path as +. */
+    if (!app_is_aroma()) {
+        OSEnableHomeButtonMenu(FALSE);
+        ProcUIRegisterCallback(PROCUI_CALLBACK_HOME_BUTTON_DENIED,
+                               home_button_denied, NULL, 100);
+    }
+
+    /* The title id decides whether libwhb relaunches for us on exit; log it so
+     * the launcher environment is never in doubt. */
+    WHBLogPrintf("wiiusync " APP_VERSION " starting (titleID %016llx)",
+                 (unsigned long long)OSGetTitleID());
     VPADInit();
     ui_init();
 
@@ -1155,7 +1281,7 @@ int main(int argc, char **argv) {
     enter_view();
     redraw();
 
-    while (WHBProcIsRunning()) {
+    while (app_running()) {
         /* Coming back from the HOME menu hands us freshly allocated, blank
          * framebuffers.  The loop otherwise only paints on input, so without
          * this the app sits on a black screen until a button is pressed. */
@@ -1168,10 +1294,20 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* PLUS quits.  Wrapper-hosted homebrew gets no HOME overlay (libwhb
+         * turns the denied HOME press into a quit), so give the user an
+         * explicit, reliable way out that does not depend on it. */
+        if ((down & VPAD_BUTTON_PLUS) || g_quit_requested) {
+            if (!g_quit_requested && !confirm("Close Save Sync?")) {
+                redraw();
+                continue;
+            }
+            quit_to_menu();
+            break;
+        }
+
         if (down & VPAD_BUTTON_ZL)      cycle_view(-1);
-        else if (down & VPAD_BUTTON_ZR && g_view != APP_VIEW_GCCARDS) cycle_view(+1);
-        else if (down & VPAD_BUTTON_L)  cycle_view(-1);
-        else if (down & VPAD_BUTTON_R)  cycle_view(+1);
+        else if (down & VPAD_BUTTON_ZR) cycle_view(+1);
 
         else if (g_view == APP_VIEW_ROMS) {
             if      (down & VPAD_BUTTON_UP)    g_rom_sel--;
@@ -1227,7 +1363,7 @@ int main(int argc, char **argv) {
             else if (down & VPAD_BUTTON_DOWN)  g_gc_sel++;
             else if (down & VPAD_BUTTON_LEFT)  g_gc_sel -= vis;
             else if (down & VPAD_BUTTON_RIGHT) g_gc_sel += vis;
-            else if (down & VPAD_BUTTON_ZR) {
+            else if (down & VPAD_BUTTON_R) {
                 if (g_cards.count > 0) { open_card((g_card_active + 1) % g_cards.count); }
             }
             else if (down & VPAD_BUTTON_X)     scan_cards();
@@ -1236,7 +1372,7 @@ int main(int argc, char **argv) {
                 if (g_card.count > 0 && g_gc_sel < g_card.count)
                     restore_gc_save(g_card.saves[g_gc_sel].title_id);
             }
-            else if (down & VPAD_BUTTON_PLUS)  import_whole_card();
+            else if (down & VPAD_BUTTON_L)     import_whole_card();
 
             if (g_card.count == 0) { g_gc_sel = 0; g_gc_scroll = 0; }
             else {
@@ -1279,7 +1415,7 @@ int main(int argc, char **argv) {
             else if (down & VPAD_BUTTON_LEFT)  (*sel) -= ui_list_visible();
             else if (down & VPAD_BUTTON_RIGHT) (*sel) += ui_list_visible();
             else if (down & VPAD_BUTTON_MINUS) { scan_natives(); compute_plan(); }
-            else if (down & VPAD_BUTTON_PLUS)  sync_all_natives();
+            else if (down & VPAD_BUTTON_L)     sync_all_natives();
             else if (down & VPAD_BUTTON_A)     native_action(g_view, 0);
             else if (down & VPAD_BUTTON_X)     native_action(g_view, 1);
             else if (down & VPAD_BUTTON_Y)     native_action(g_view, 2);
@@ -1290,15 +1426,17 @@ int main(int argc, char **argv) {
         redraw();
     }
 
-    sync_plan_free(&g_plan);
-    savetree_free_list(&g_vwii);
-    savetree_free_list(&g_wiiu);
-    natives_shutdown(&g_state);
-    network_shutdown();
-    ui_shutdown();
-    WHBUnmountSdCard();
+    /* HOME is the normal way out of wrapper-hosted homebrew, so the teardown
+     * below runs on every exit.  Unmounting NAND and the SD card is not
+     * instant; keep the screen alive and say what is happening, otherwise the
+     * user just sees an unexplained black gap before the launcher returns. */
+    /* quit_to_menu() has already torn everything down (it has to, while
+     * ProcUI is still alive).  The loop can also fall out on its own — the
+     * ProcUI EXITING path — so run it here too; every step is idempotent. */
+    quit_to_menu();
+
     WHBLogPrintf("wiiusync exiting");
     WHBLogUdpDeinit();
-    WHBProcShutdown();
+    app_shutdown();
     return 0;
 }

@@ -12,6 +12,7 @@ import androidx.work.WorkManager
 import com.savesync.android.SaveSyncApp
 import com.savesync.android.api.ApiClient
 import com.savesync.android.api.GameNameRequest
+import com.savesync.android.api.NameHintRequest
 import com.savesync.android.api.NormalizeRequest
 import com.savesync.android.api.NormalizeRomEntry
 import com.savesync.android.api.RomEntry
@@ -27,6 +28,7 @@ import com.savesync.android.emulators.EmudeckPaths
 import com.savesync.android.emulators.Ps1CardSerial
 import com.savesync.android.emulators.SaveEntry
 import com.savesync.android.emulators.impl.AzaharEmulator
+import com.savesync.android.emulators.impl.CemuEmulator
 import com.savesync.android.emulators.impl.DolphinEmulator
 import com.savesync.android.emulators.impl.MelonDsEmulator
 import com.savesync.android.emulators.impl.PpssppEmulator
@@ -646,6 +648,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                     val localTitleIds = localSaves.map { it.titleId }.toSet()
 
+                    // No DAT can name a Wii U save: its 16-hex title id's low
+                    // word is not the product code, so one uploaded by the Wii
+                    // U console reaches the server named after its own id and
+                    // every client shows raw hex.  This device read the game's
+                    // meta.xml — hand that to the server so the desktop app
+                    // and every other client get a real name too.
+                    pushWiiuNameHints(api, localSaves, titlesResponse.titles)
+
                     serverOnlySaves = try {
                         // Server titles not present locally (after alias remapping above)
                         val unmatchedServerTitles = titlesResponse.titles
@@ -818,7 +828,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 )
                             }
 
-                        val specialFallbackIds = (ps1ServerOnly + ps2ServerOnly + pspServerOnly + gcServerOnly + threedssServerOnly)
+                        val wiiuServerOnly = stillUnanchoredTitles
+                            .mapNotNull { titleInfo ->
+                                buildWiiuServerOnlyEntry(
+                                    titleInfo,
+                                    currentSettings.saveDirOverrides,
+                                    currentSettings.emudeckDir,
+                                    canonicalNames
+                                )
+                            }
+
+                        val specialFallbackIds = (ps1ServerOnly + ps2ServerOnly + pspServerOnly + gcServerOnly + threedssServerOnly + wiiuServerOnly)
                             .mapTo(mutableSetOf()) { it.titleId }
 
                         // If a save has no local ROM/save anchor yet, still surface it when the
@@ -834,7 +854,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 )
                             }
 
-                        matchedServerOnly + ps1ServerOnly + ps2ServerOnly + pspServerOnly + gcServerOnly + threedssServerOnly + romCatalogServerOnly
+                        matchedServerOnly + ps1ServerOnly + ps2ServerOnly + pspServerOnly + gcServerOnly + threedssServerOnly + wiiuServerOnly + romCatalogServerOnly
                     } catch (e: Exception) {
                         emptyList()
                     }
@@ -1267,6 +1287,127 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ?: titleInfo.game_name?.takeIf { it != displayName }
                 ?: titleInfo.name?.takeIf { it != displayName }
         )
+    }
+
+    /**
+     * Push locally-resolved Wii U names/codes for server rows still stored
+     * under their raw title id.  Best-effort: a failure just means the other
+     * clients keep showing hex until the next scan.
+     */
+    private suspend fun pushWiiuNameHints(
+        api: SaveSyncApi,
+        localSaves: List<SaveEntry>,
+        serverTitles: List<com.savesync.android.api.TitleInfo>
+    ) {
+        val unnamedServerIds = serverTitles
+            .filter { info ->
+                val name = info.game_name ?: info.name
+                name.isNullOrBlank() || name == info.title_id
+            }
+            .mapTo(mutableSetOf()) { it.title_id }
+        if (unnamedServerIds.isEmpty()) return
+
+        val codes = mutableMapOf<String, String>()
+        val names = mutableMapOf<String, String>()
+        for (entry in localSaves) {
+            if (entry.systemName != "WIIU") continue
+            if (entry.titleId !in unnamedServerIds) continue
+            entry.gameCode?.let { codes[entry.titleId] = it }
+            if (entry.displayName != entry.titleId) names[entry.titleId] = entry.displayName
+        }
+        if (codes.isEmpty() && names.isEmpty()) return
+
+        try {
+            api.updateGameNames(NameHintRequest(codes = codes, names = names))
+        } catch (_: Exception) {
+            // Cosmetic only — names resolve on the next successful scan.
+        }
+    }
+
+    /**
+     * Wii U saves live at ``<mlc01>/usr/save/00050000/<tidlo>/user/`` and the
+     * server's title_id gives us the whole path, so a server-only row is
+     * directly downloadable — no ROM required, same as the 3DS builder.
+     */
+    private fun buildWiiuServerOnlyEntry(
+        titleInfo: com.savesync.android.api.TitleInfo,
+        saveDirOverrides: Map<String, String>,
+        emudeckDir: String,
+        canonicalNames: Map<String, String> = emptyMap()
+    ): SaveEntry? {
+        val system = normalizeSystemCode(
+            titleInfo.platform
+                ?: titleInfo.system
+                ?: titleInfo.consoleType
+                ?: ""
+        )
+        if (system != "WIIU") return null
+        if (!hex16TitleIdRegex.matches(titleInfo.title_id)) return null
+
+        val saveDir = CemuEmulator.defaultSaveDir(
+            storageBaseDir = EmudeckPaths.cemuRoot(emudeckDir),
+            saveDirOverride = saveDirOverrides[CemuEmulator.EMULATOR_KEY]
+                ?.takeIf { it.isNotBlank() },
+            externalRoot = Environment.getExternalStorageDirectory(),
+            titleId = titleInfo.title_id
+        ) ?: return null
+
+        // A save uploaded by the Wii U console arrives named after its own
+        // title id, so prefer any real server name but fall back to this
+        // device's meta.xml before showing raw hex.
+        val serverName = (titleInfo.game_name ?: titleInfo.name)
+            ?.takeIf { it.isNotBlank() && it != titleInfo.title_id }
+        val localMeta = wiiuMetaIndex(saveDirOverrides, emudeckDir)[titleInfo.title_id.uppercase()]
+        val canonical = canonicalNames[titleInfo.title_id]
+        val displayName = canonical
+            ?: serverName
+            ?: localMeta?.name
+            ?: titleInfo.title_id
+
+        return SaveEntry(
+            titleId = titleInfo.title_id,
+            displayName = displayName,
+            systemName = "WIIU",
+            saveFile = null,
+            saveDir = saveDir,
+            isMultiFile = true,
+            isServerOnly = true,
+            gameCode = localMeta?.gameCode,
+            canonicalName = canonical?.takeIf { it != displayName }
+                ?: serverName?.takeIf { it != displayName }
+        )
+    }
+
+    /**
+     * meta.xml index for Wii U titles installed or dumped on this device,
+     * cached for the lifetime of the ViewModel — a scan can ask for it once
+     * per server-only row and the directory walk is not free.
+     */
+    private var wiiuMetaCache: Map<String, CemuEmulator.TitleMeta>? = null
+
+    private fun wiiuMetaIndex(
+        saveDirOverrides: Map<String, String>,
+        emudeckDir: String
+    ): Map<String, CemuEmulator.TitleMeta> {
+        wiiuMetaCache?.let { return it }
+        val index = try {
+            val override = saveDirOverrides[CemuEmulator.EMULATOR_KEY]?.takeIf { it.isNotBlank() }
+            val external = Environment.getExternalStorageDirectory()
+            val storageBase = EmudeckPaths.cemuRoot(emudeckDir)
+            CemuEmulator.buildMetaIndex(
+                mlcRoot = CemuEmulator.resolveMlcRoot(storageBase, override, external),
+                gameDirs = CemuEmulator.gameDirCandidates(
+                    storageBaseDir = storageBase,
+                    romScanDir = "",
+                    emudeckDir = emudeckDir,
+                    externalRoot = external
+                )
+            )
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        wiiuMetaCache = index
+        return index
     }
 
     private fun buildRomCatalogServerOnlyEntry(

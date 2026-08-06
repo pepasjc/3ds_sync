@@ -998,6 +998,7 @@ async def upload_save(
     source: str = Query("3ds"),
     console_id: str = Query(""),
     game_code: str = Query(""),
+    game_name: str = Query(""),
 ):
     title_id = _validate_title_id(title_id)
     cid = _resolve_console_id(_console_id_from_request(request, console_id), source)
@@ -1074,7 +1075,13 @@ async def upload_save(
                 },
             )
 
-    meta = storage.store_save(bundle, source=source, console_id=cid, game_code=game_code)
+    meta = storage.store_save(
+        bundle,
+        source=source,
+        console_id=cid,
+        game_code=game_code,
+        game_name_hint=game_name,
+    )
     return {
         "status": "ok",
         "timestamp": meta.last_sync,

@@ -136,6 +136,9 @@ void ui_init(void) {
 
     ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, ui_acquire_foreground, NULL, 100);
     ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, ui_release_foreground, NULL, 100);
+    /* EXIT too: MEM1 must go back before ProcUIShutdown() resets the heap,
+     * and the exiting transition does not necessarily fire RELEASE first. */
+    ProcUIRegisterCallback(PROCUI_CALLBACK_EXIT, ui_release_foreground, NULL, 100);
 
     /* WHBProcInit leaves us already in the foreground and does not replay the
      * ACQUIRE callback for that initial state — do it by hand. */

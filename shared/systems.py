@@ -736,6 +736,7 @@ SYSTEM_COLOR: dict[str, str] = {
     "3DS":    "#b71c1c",
     "GC":     "#4a148c",
     "WII":    "#880e4f",
+    "WIIU":   "#006064",
     "NSW":    "#e53935",
     "VITA":   "#283593",
     "3DO":    "#5d4037",
