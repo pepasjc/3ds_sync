@@ -387,6 +387,106 @@ static void parse_names_object(const char *body,
     }
 }
 
+/* Escape a meta.xml longname for a JSON string body.  Names carry quotes and
+ * the odd control character; an unescaped one would truncate the request into
+ * malformed JSON and lose every name after it. */
+static void json_escape(const char *in, char *out, size_t out_size) {
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        unsigned char c = *p;
+        const char *esc = NULL;
+        char buf[8];
+        switch (c) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\n': esc = "\\n";  break;
+            case '\r': esc = "\\r";  break;
+            case '\t': esc = "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    esc = buf;
+                }
+                break;
+        }
+        size_t need = esc ? strlen(esc) : 1;
+        if (j + need + 1 > out_size) break;
+        if (esc) {
+            memcpy(out + j, esc, need);
+            j += need;
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+}
+
+int network_push_name_hints(const SyncState *state, const SaveTitleList *list) {
+    if (!state || !list || list->title_count <= 0) return -1;
+    net_err_clear();
+
+    int   cap  = 64 * 1024;
+    char *json = (char *)malloc((size_t)cap);
+    if (!json) return -1;
+    int   off = 0;
+    int   sent = 0;
+
+    if (append(json, &off, cap, "{\"codes\":{") != 0) goto fail;
+    for (int i = 0; i < list->title_count; i++) {
+        const SaveTitle *t = &list->titles[i];
+        if (!t->game_code[0]) continue;
+        if (append(json, &off, cap, "%s\"%s\":\"%s\"", sent ? "," : "",
+                   t->title_id, t->game_code) != 0) goto fail;
+        sent++;
+    }
+
+    int named = 0;
+    if (append(json, &off, cap, "},\"names\":{") != 0) goto fail;
+    for (int i = 0; i < list->title_count; i++) {
+        const SaveTitle *t = &list->titles[i];
+        if (!t->name[0]) continue;
+        char esc[2 * SAVE_NAME_MAX];
+        json_escape(t->name, esc, sizeof(esc));
+        if (append(json, &off, cap, "%s\"%s\":\"%s\"", named ? "," : "",
+                   t->title_id, esc) != 0) goto fail;
+        named++;
+    }
+    if (append(json, &off, cap, "}}") != 0) goto fail;
+
+    /* Nothing worth telling the server (vWii-only list, or no meta.xml). */
+    if (sent == 0 && named == 0) { free(json); return 0; }
+
+    HttpRequest req = {0};
+    req.server_url        = state->server_url;
+    req.api_key           = state->api_key;
+    req.console_id        = state->console_id;
+    req.path              = "/api/v1/titles/update_names";
+    req.method            = "POST";
+    req.header_timeout_ms = HTTP_API_TIMEOUT_MS;
+    req.body              = (const uint8_t *)json;
+    req.body_len          = (uint32_t)off;
+    req.body_content_type = "application/json";
+
+    uint32_t resp_cap = 4096;
+    char *resp = (char *)malloc(resp_cap);
+    if (!resp) goto fail;
+
+    int status = 0;
+    int n = http_get_buf(&req, (uint8_t *)resp, resp_cap, &status);
+    free(resp);
+    free(json);
+
+    if (n < 0 || status != 200) {
+        net_err_set("name hints: HTTP %d", status);
+        return -1;
+    }
+    return 0;
+
+fail:
+    free(json);
+    return -1;
+}
+
 int network_fetch_names(const SyncState *state,
                         const char (*ids)[TITLE_ID_LEN],
                         int count,

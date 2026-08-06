@@ -121,4 +121,18 @@ int network_fetch_names(const SyncState *state,
                         int count,
                         char (*names)[SAVE_NAME_MAX]);
 
+/* Teach the server the names of this console's Wii U saves:
+ * POST /api/v1/titles/update_names with the product codes and longnames read
+ * from each title's meta.xml.
+ *
+ * A 16-hex Wii U title id resolves to no name anywhere on the server (its low
+ * word is not the product code), so without this a save shows as raw hex on
+ * the desktop / Steam Deck / Android clients, which have no console NAND to
+ * read.  Upload already sends a hint, but a save that is up to date is never
+ * re-uploaded, so the sync path has to carry it too.
+ *
+ * The server only fills in titles still named after their own id, so this is
+ * safe to send on every sync.  Returns 0 when the server accepted it. */
+int network_push_name_hints(const SyncState *state, const SaveTitleList *list);
+
 #endif /* WIIUSYNC_NETWORK_H */

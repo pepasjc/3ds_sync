@@ -27,6 +27,11 @@ _wii_names: dict[
     str, str
 ] = {}  # 4-char GC/Wii game code -> name e.g. "GALE" -> "Super Smash Bros. Melee"
 _wiiu_names: dict[str, str] = {}  # 4-char Wii U product code -> name e.g. "AMKE"
+# 16-hex Wii U title id -> name, from the ``title_id`` lines in the Wii U DAT.
+# A Wii U title id's low word is NOT its product code, so this direct index is
+# the only way to name a Wii U *save* (which is keyed by title id) — see
+# tools/enrich_wiiu_dat_titleids.py for where those lines come from.
+_wiiu_title_ids: dict[str, str] = {}
 _ps3_names: dict[str, str] = {}  # keyed by 9-char product code e.g. "BLJM61131"
 _xbox_names: dict[str, str] = {}  # keyed by 8-char hex Xbox Title ID e.g. "4D530004"
 
@@ -45,6 +50,7 @@ _3ds_title_id_priority: dict[str, tuple[int, int]] = {}
 _ds_priority: dict[str, tuple[int, int]] = {}
 _wii_priority: dict[str, tuple[int, int]] = {}
 _wiiu_priority: dict[str, tuple[int, int]] = {}
+_wiiu_title_id_priority: dict[str, tuple[int, int]] = {}
 _ps3_priority: dict[str, tuple[int, int]] = {}
 _xbox_priority: dict[str, tuple[int, int]] = {}
 
@@ -481,6 +487,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         _ds_names, \
         _wii_names, \
         _wiiu_names, \
+        _wiiu_title_ids, \
         _ps3_names
     global \
         _psx_priority, \
@@ -494,6 +501,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         _ds_priority, \
         _wii_priority, \
         _wiiu_priority, \
+        _wiiu_title_id_priority, \
         _ps3_priority
 
     if not dat_path.exists():
@@ -588,6 +596,9 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
     current_name: str | None = None
     current_serial: str | None = None
     current_title_id: str | None = None
+    # Wii U blocks can carry several title ids for one product code (regional
+    # revisions, demos), so unlike the 3DS/Xbox modes we keep them all.
+    current_title_ids: list[str] = []
 
     _NAME_RE = re.compile(r'^\s*name\s+"(.+?)"')
     _SERIAL_RE = re.compile(r'^\s*serial\s+"(.+?)"')
@@ -671,6 +682,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
                 current_name = m.group(1)
                 current_serial = None
                 current_title_id = None
+                current_title_ids = []
                 continue
 
             m = _SERIAL_RE.match(line)
@@ -679,15 +691,23 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
                 continue
 
             m = _TITLE_ID_RE.match(line)
-            if m and current_title_id is None:
-                current_title_id = m.group(1).upper()
+            if m:
+                tid = m.group(1).upper()
+                if current_title_id is None:
+                    current_title_id = tid
+                if tid not in current_title_ids:
+                    current_title_ids.append(tid)
                 continue
 
             # End of block — ")" alone on a line at top level
             has_3ds_title_only = mode == "3ds_code" and bool(current_title_id)
             has_xbox_title_only = mode == "xbox_titleid" and bool(current_title_id)
+            has_wiiu_title_only = mode == "wiiu_code" and bool(current_title_ids)
             if line.strip() == ")" and current_name and (
-                current_serial or has_3ds_title_only or has_xbox_title_only
+                current_serial
+                or has_3ds_title_only
+                or has_xbox_title_only
+                or has_wiiu_title_only
             ):
                 rank = (_source_tier, _region_rank(current_name))
                 entry_added = False
@@ -712,6 +732,22 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
                         _xbox_names[current_title_id] = current_name
                         _xbox_priority[current_title_id] = rank
                         entry_added = True
+
+                if mode == "wiiu_code" and current_title_ids:
+                    # Direct title-id index: a Wii U save is keyed by its
+                    # title id, and no amount of product-code lookup can get
+                    # there from the id alone.
+                    for tid in current_title_ids:
+                        if len(tid) != 16:
+                            continue
+                        existing_rank = _wiiu_title_id_priority.get(
+                            tid,
+                            (len(_REGION_PRIORITY) + 1, len(_REGION_PRIORITY) + 1),
+                        )
+                        if rank < existing_rank or tid not in _wiiu_title_ids:
+                            _wiiu_title_ids[tid] = current_name
+                            _wiiu_title_id_priority[tid] = rank
+                            entry_added = True
 
                 if mode == "3ds_code" and current_title_id:
                     serial_key = current_serial.upper().strip() if current_serial else ""
@@ -754,6 +790,7 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
                 current_name = None
                 current_serial = None
                 current_title_id = None
+                current_title_ids = []
 
     return added
 
@@ -859,6 +896,14 @@ def lookup_names_typed(product_codes: list[str]) -> dict[str, tuple[str, str]]:
         is_3ds_format = code_upper.startswith(("CTR-", "KTR-"))
 
         if len(code_upper) == 16 and all(c in "0123456789ABCDEF" for c in code_upper):
+            # 0. Wii U (00050000xxxxxxxx).  Its low word is not the product
+            #    code, so only the DAT's title_id index can name it.
+            if code_upper[:5] == _WIIU_HIGH_PREFIX:
+                name = _wiiu_title_ids.get(code_upper)
+                if name:
+                    result[code] = (name, "WIIU")
+                continue
+
             # 1. Direct TitleID lookup populated from 3DS DAT title_id lines.
             name = _3ds_title_ids.get(code_upper)
             if name:

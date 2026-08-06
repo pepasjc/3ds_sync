@@ -78,7 +78,18 @@ int sync_compute_plan(const SyncState *state,
         return -1;
     }
     int rc = network_sync_plan(state, list, platforms, platform_count, out_plan);
-    if (rc != 0) set_msg("%s", network_last_error());
+    if (rc != 0) {
+        set_msg("%s", network_last_error());
+        return rc;
+    }
+
+    /* Hand the server the names this console read from each title's meta.xml.
+     * Nothing else can name a Wii U save — its 16-hex title id resolves to no
+     * DAT entry — so without this the desktop / Steam Deck / Android clients
+     * list them as raw hex.  Upload carries the same hint, but a save that is
+     * already up to date never uploads, which is why it rides the plan too.
+     * Cosmetic, so a failure here must not fail the sync. */
+    (void)network_push_name_hints(state, list);
     return rc;
 }
 
