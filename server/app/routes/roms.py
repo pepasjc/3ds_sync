@@ -356,12 +356,14 @@ _XBOX_EXTRACT_SPECS = {
 }
 _XBOX_EXTRACT_FORMATS = list(_XBOX_EXTRACT_SPECS.keys())
 
-# Wii U.  A WUP/NUS dump installs on real hardware as-is, but Cemu cannot
-# read AES-encrypted ``.app`` contents — it needs a decrypted
-# ``code``/``content``/``meta`` tree or a ``.wua`` archive.  Both conversions
-# run through operator-configured external commands (CDecrypt / Cemu), same
-# as the 3DS and Xbox specs; the server ships neither the tool nor the Wii U
-# common key.
+# Wii U.  Unlike the 3DS and Xbox specs above, these are genuinely optional:
+# a WUP/NUS dump ships its own ticket, so real hardware AND Cemu 2.x both
+# decrypt it themselves and the raw bundle download works untouched.  These
+# formats exist only for users who want a decrypted code/content/meta tree or
+# a .wua on disk, and are advertised to clients ONLY when the matching command
+# is configured (see ``_wiiu_available_formats``) — otherwise a client would
+# request a format this server cannot produce and get a 503 instead of a
+# perfectly good download.
 _WIIU_SYSTEMS = frozenset({'WIIU'})
 _WIIU_LOADIINE_DIRS = ('code', 'content', 'meta')
 _WIIU_EXTRACT_SPECS = {
@@ -2117,6 +2119,29 @@ def _wiiu_bundle_kind(entry) -> str:
     return ''
 
 
+def _wiiu_available_formats(entry) -> list[str]:
+    """Wii U extract formats this server can actually deliver right now.
+
+    A WUP bundle only converts when the operator configured a decrypter, so
+    an unconfigured server advertises nothing and clients fall back to the
+    raw bundle — which is already what hardware and Cemu both accept.  An
+    already-decrypted bundle can always answer ``loadiine`` because that path
+    is a plain ZIP of the folder, no external tool involved.
+    """
+    kind = _wiiu_bundle_kind(entry)
+    if not kind:
+        return []
+
+    formats: list[str] = []
+    for fmt, spec in _WIIU_EXTRACT_SPECS.items():
+        if fmt == 'loadiine' and kind == 'loadiine':
+            formats.append(fmt)
+            continue
+        if getattr(settings, spec['setting'], ''):
+            formats.append(fmt)
+    return formats
+
+
 def _wiiu_cache_key(bundle_dir: Path, fmt: str) -> str:
     """Cache key over every file in the WUP/loadiine folder.
 
@@ -2164,10 +2189,12 @@ async def _extract_wiiu(entry, bundle_dir: Path, fmt: str) -> Response:
             content=(
                 f"Wii U → {spec['label']} conversion is not configured on the server.\n"
                 f"\n"
-                f"Wii U WUP/NUS dumps are AES-encrypted.  Real hardware installs\n"
-                f"them as-is, but Cemu needs a decrypted code/content/meta tree\n"
-                f"(or a .wua packed from one).  Set {spec['env']} to a command\n"
-                f"template that reads {{input}} and writes under {{output_dir}}.\n"
+                f"You probably do not need this.  A WUP/NUS dump ships its own\n"
+                f"ticket, so real hardware and Cemu 2.x both decrypt it themselves\n"
+                f"— downloading this ROM with no ?extract= gives a working title.\n"
+                f"\n"
+                f"Set {spec['env']} only if you specifically want a decrypted tree\n"
+                f"on disk.  It must read {{input}} and write under {{output_dir}}.\n"
                 f"\n"
                 f"Available placeholders:\n"
                 f"  {{input}}      — the WUP bundle DIRECTORY (not a file)\n"
@@ -2939,13 +2966,16 @@ def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
     if sys_up in _XBOX_SYSTEMS and getattr(entry, 'is_bundle', False):
         return 'xbox', list(_XBOX_EXTRACT_FORMATS)
     if sys_up in _WIIU_SYSTEMS and getattr(entry, 'is_bundle', False):
-        # No preferred format on purpose: the Wii U console client wants the
-        # raw encrypted WUP (that's what it installs), so the default
-        # download must stay the plain bundle ZIP.  Cemu clients pick
-        # 'loadiine' or 'wua' out of extract_formats explicitly.
-        if _wiiu_bundle_kind(entry):
-            return None, list(_WIIU_EXTRACT_FORMATS)
-        return None, []
+        # No preferred format on purpose.  The raw bundle ZIP is the WUP set,
+        # which is what BOTH real hardware and Cemu want: hardware installs it
+        # through MCP, and Cemu 2.x decrypts it itself from the bundled
+        # ticket.  Neither needs a server-side decrypter.
+        #
+        # Decrypted output is therefore strictly optional, and advertising a
+        # format the operator hasn't configured would make clients request a
+        # guaranteed 503 instead of downloading the perfectly usable original.
+        # So only offer what this server can actually produce.
+        return None, _wiiu_available_formats(entry)
     if sys_up in _PS1_EBOOT_SYSTEMS and getattr(entry, 'is_bundle', False):
         names = [
             str(f.get('name', ''))

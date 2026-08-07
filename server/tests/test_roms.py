@@ -1081,21 +1081,29 @@ class TestRomCatalog:
             "Game [DEADBEEFCAFEBABE]",
         )
 
-    def test_wiiu_wup_advertises_cemu_formats_but_no_default(
+    def test_wiiu_wup_advertises_nothing_without_a_decrypter(
         self, tmp_path, client, auth_headers
     ):
-        """A WUP bundle offers loadiine/wua to emulator clients, but has no
-        preferred ``extract_format`` — the plain download must stay the raw
-        encrypted ZIP that real Wii U hardware installs.
+        """With no decrypter configured a WUP bundle advertises no formats at
+        all, so clients download the raw set.
+
+        That raw set is what BOTH targets want — real hardware installs it via
+        MCP, and Cemu decrypts it itself from the bundled ticket.  Advertising
+        ``loadiine`` here would make every emulator client request a
+        guaranteed 503 instead of a working download.
         """
         from app.services import rom_db, rom_scanner
         from app.config import settings
 
         original = settings.rom_dir
+        original_cmd = settings.rom_wiiu_loadiine_command
+        original_wua = settings.rom_wiiu_wua_command
         try:
             rom_db.init_db(settings.save_dir)
             rom_dir = tmp_path / "roms"
             settings.rom_dir = rom_dir
+            settings.rom_wiiu_loadiine_command = ""
+            settings.rom_wiiu_wua_command = ""
 
             wup = rom_dir / "wiiu" / "Bayonetta 2 [0005000010172600]"
             wup.mkdir(parents=True)
@@ -1108,8 +1116,14 @@ class TestRomCatalog:
             resp = client.get("/api/v1/roms?system=WIIU", headers=auth_headers)
             assert resp.status_code == 200
             rom = resp.json()["roms"][0]
-            assert rom["extract_formats"] == ["loadiine", "wua"]
+            assert "extract_formats" not in rom
             assert "extract_format" not in rom
+
+            # ...and once a decrypter is configured, it shows up.
+            settings.rom_wiiu_loadiine_command = "cdecrypt {input} {output_dir}"
+            resp = client.get("/api/v1/roms?system=WIIU", headers=auth_headers)
+            assert resp.json()["roms"][0]["extract_formats"] == ["loadiine"]
+            settings.rom_wiiu_loadiine_command = ""
 
             # No ?extract → raw WUP ZIP, converter never consulted.
             raw = client.get(
@@ -1125,6 +1139,8 @@ class TestRomCatalog:
                 assert zf.read("00000000.app") == b"ENCRYPTED"
         finally:
             settings.rom_dir = original
+            settings.rom_wiiu_loadiine_command = original_cmd
+            settings.rom_wiiu_wua_command = original_wua
             rom_scanner._catalog = None
 
     def test_wiiu_loadiine_extract_runs_the_decrypter(

@@ -79,7 +79,20 @@ class RomEntryDownloadPolicyTest {
     }
 
     @Test
-    fun `Wii U WUP bundle requests the decrypted loadiine tree`() {
+    fun `Wii U takes the raw WUP bundle when no decrypter is advertised`() {
+        // Cemu decrypts a WUP set itself from the bundled ticket, so the raw
+        // bundle is usable as-is.  Requesting a format the server never
+        // advertised would only earn a 503.
+        val entry = rom(
+            system = "WIIU",
+            isBundle = true,
+            filename = "Super Mario 3D World (USA).zip",
+        )
+        assertNull(entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `Wii U uses loadiine only when the server advertises it`() {
         val entry = rom(
             system = "WIIU",
             extractFormats = listOf("loadiine", "wua"),

@@ -486,10 +486,17 @@ QLabel#detailLabel {{
         if is_bundle:
             file_count = len(rom.get("files") or [])
             if keep_extract_on_bundle:
+                # Only claim decryption when we actually asked for it — with
+                # no decrypter configured the raw WUP set is what ships, and
+                # Cemu decrypts it itself from the bundled ticket.
+                how = (
+                    "The server decrypts the WUP dump first"
+                    if extract_format
+                    else "Cemu decrypts it from the bundled ticket"
+                )
                 msg = (
                     f"Install '{entry.display_name}' for Cemu?\n"
-                    f"The server decrypts the WUP dump first"
-                    f"{size_txt.replace(' (', ' (source ')}\n"
+                    f"{how}{size_txt}\n"
                     f"Destination: {target_path}"
                 )
             else:

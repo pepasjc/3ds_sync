@@ -126,8 +126,11 @@ _XBOX_FILE_EXTS = frozenset({".iso", ".cci"})
 
 # Wii U titles arrive in three shapes:
 #   * WUP / NUS installable set — ``title.tmd`` + ``title.tik`` + ``title.cert``
-#     alongside numbered ``.app`` contents (and ``.h3`` hash trees).  This is
-#     what WUP Installer GX2 writes to a real console.
+#     alongside numbered ``.app`` contents (and ``.h3`` hash trees).  The
+#     contents are encrypted, but the bundled ticket carries the title key, so
+#     this shape is directly usable by BOTH a real console (installed through
+#     MCP, as WUP Installer GX2 does) and Cemu 2.x, which decrypts it itself.
+#     Nothing here needs a server-side decrypter.
 #   * Decrypted "loadiine" layout — ``code/`` + ``content/`` + ``meta/``.
 #   * A single emulator image — ``.wua`` (Cemu archive), ``.wud``/``.wux``
 #     disc dump, or a ``.zip`` wrapping either folder layout.

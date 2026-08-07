@@ -167,10 +167,13 @@ Clients pick whichever fits their platform; all land in the same storage.
 Wii U ROMs are folder-shaped: an encrypted WUP/NUS set (`title.tmd` + `.app`)
 or a decrypted loadiine tree (`code`/`content`/`meta`). Both scan as bundles, and
 a title id embedded in the folder name (`Game [0005000010145C00]`) becomes the
-catalog `title_id` so a ROM and its save share one key. Real hardware installs
-the encrypted set as-is; Cemu cannot, so `?extract=loadiine` / `?extract=wua`
-shell out to an operator-configured decrypter (`SYNC_ROM_WIIU_*_COMMAND`, e.g.
-CDecrypt). GameSync ships neither the tool nor the Wii U common key.
+catalog `title_id` so a ROM and its save share one key. The raw bundle is what
+both targets want — hardware installs it through MCP, and Cemu 2.x decrypts it
+itself from the bundled `title.tik` — so **no server-side decrypter is needed**.
+`?extract=loadiine` / `?extract=wua` are optional extras backed by an
+operator-configured tool (`SYNC_ROM_WIIU_*_COMMAND`, e.g. CDecrypt), and are
+advertised in `extract_formats` only when that command is set; otherwise clients
+see nothing and take the raw bundle.
 
 Bundle format (`server/app/services/bundle.py`): magic `3DSS`, version, title_id
 (u64 BE), timestamp (u32 LE), file count, total size, file table, file data.

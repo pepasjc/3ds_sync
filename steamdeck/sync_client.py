@@ -554,12 +554,12 @@ class SyncClient:
             return f"{stem}.iso", "iso"
 
         if system_up == "WIIU":
-            # Wii U catalog rows are WUP folders: AES-encrypted .app contents
-            # that real hardware installs but Cemu cannot read.  Ask the
-            # server for the decrypted code/content/meta tree, which it
-            # returns as a ZIP the bundle path extracts into a per-game
-            # folder.  An already-decrypted library answers the same request
-            # with a plain bundle ZIP, so one code path covers both.
+            # Wii U catalog rows are WUP folders.  The .app contents are
+            # encrypted, but the bundled ticket carries the title key so Cemu
+            # decrypts them itself — the raw bundle ZIP is directly usable.
+            # Only ask for a decrypted tree when this server advertised one;
+            # requesting an unconfigured format would earn a 503 instead of a
+            # working download.
             advertised = [
                 str(v).strip().lower()
                 for v in (rom.get("extract_formats") or [])

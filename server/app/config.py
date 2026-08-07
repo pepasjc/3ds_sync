@@ -92,11 +92,17 @@ class Settings(BaseSettings):
     # the server returns 503 with a hint pointing at SYNC_ROM_PS1_VCD_COMMAND.
     rom_ps1_vcd_command: str = ""
     rom_ps1_vcd_cwd: str = ""
-    # Optional command templates for decrypting a Wii U WUP/NUS title so
-    # emulators can use it.  A WUP dump (``title.tmd`` + ``title.tik`` +
-    # numbered ``.app`` contents) is AES-encrypted: real hardware installs it
-    # as-is, but Cemu needs either a decrypted ``code``/``content``/``meta``
-    # tree or a ``.wua`` archive.  Placeholders:
+    # OPTIONAL command templates for decrypting a Wii U WUP/NUS title.
+    #
+    # You probably do not need these.  A WUP dump's ``.app`` contents are
+    # encrypted, but the bundled ``title.tik`` carries the title key, so both
+    # a real console and Cemu 2.x decrypt it themselves — the raw download
+    # already works on both.  These exist only for people who want a
+    # decrypted ``code``/``content``/``meta`` tree or a ``.wua`` on disk.
+    #
+    # Leaving them empty is a supported configuration: the catalog then
+    # advertises no Wii U extract formats and clients take the raw bundle.
+    # Placeholders:
     #   {input}      — the WUP bundle *directory* (not a file)
     #   {output_dir} — fresh per-request scratch dir; the converter must
     #                  write its result somewhere underneath
@@ -117,11 +123,8 @@ class Settings(BaseSettings):
     #
     # ``rom_wiiu_wua_command`` has no widely-available CLI tool behind it:
     # Cemu converts to .wua from its GUI, not a documented headless flag.
-    # Leave it empty and use loadiine unless you have your own packer — the
-    # clients only request 'loadiine' anyway.
-    #
-    # Both stay empty until configured — until then the server returns 503
-    # with a hint pointing at SYNC_ROM_WIIU_*.
+    # Leave it empty unless you have your own packer — no shipped client
+    # requests 'wua'.
     rom_wiiu_loadiine_command: str = ""
     rom_wiiu_wua_command: str = ""
     # Working directory for the Wii U commands.  CDecrypt resolves its key

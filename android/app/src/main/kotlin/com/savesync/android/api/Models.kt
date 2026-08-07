@@ -210,13 +210,13 @@ fun RomEntry.preferredDownloadExtractFormat(): String? {
     }
 
     if (sysUp == "WIIU") {
-        // A Wii U catalog bundle is an AES-encrypted WUP set: real hardware
-        // installs it, Cemu cannot read it.  Ask for the decrypted
-        // code/content/meta tree, which arrives as a ZIP the download
-        // manager unpacks into a folder.  Already-decrypted libraries answer
-        // the same request with a plain bundle ZIP, so this is safe either
-        // way.  Single-file .wua/.wud/.wux entries need no conversion.
-        return if (isBundle) "loadiine" else null
+        // Unlike 3DS/Xbox above, a Wii U WUP bundle is directly usable as
+        // downloaded: Cemu decrypts it from the bundled ticket, exactly as
+        // the console does.  So take the raw bundle unless this server has
+        // actually advertised a decrypted format — requesting one it can't
+        // produce would turn a working download into a 503.
+        val advertised = extractFormats.map { it.trim().lowercase() }
+        return if (isBundle && "loadiine" in advertised) "loadiine" else null
     }
 
     return null

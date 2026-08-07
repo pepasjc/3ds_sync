@@ -34,13 +34,6 @@ import java.io.RandomAccessFile
 import java.util.UUID
 
 private const val TAG = "DownloadManager"
-
-/**
- * Server extract format whose response body is a ZIP that must land as a
- * directory rather than a file — the decrypted Wii U code/content/meta tree
- * Cemu loads.
- */
-private const val FORMAT_LOADIINE = "loadiine"
 private const val IO_BUFFER_SIZE = 256 * 1024  // 256 KB — fewer syscalls and better throughput on multi-GB
 private const val INITIAL_PERSIST_INTERVAL_MS = 250L
 private const val STEADY_PERSIST_INTERVAL_MS = 1500L
@@ -634,12 +627,18 @@ class DownloadManager(
     private suspend fun promotePartFile(entity: DownloadEntity) {
         val partFile = File(entity.partFilePath)
 
-        // Wii U: ``extract=loadiine`` answers with a ZIP of the decrypted
-        // code/content/meta tree, and Cemu wants that as a *folder*.  Unpack
-        // straight from the .part so a mid-extract crash leaves no orphaned
-        // .zip for the user to chase down.
-        if (entity.extractFormat?.lowercase() == FORMAT_LOADIINE) {
-            unpackLoadiineBundle(entity, partFile)
+        // Wii U catalog entries are folder-shaped and always arrive as a ZIP:
+        // the raw WUP set by default, or the decrypted code/content/meta tree
+        // with ``extract=loadiine``.  Cemu wants a folder either way, so
+        // unpack both.  Keying on system + .zip rather than on extractFormat
+        // covers the raw case, where there is no extract format at all.
+        //
+        // Unpack straight from the .part so a mid-extract crash leaves no
+        // orphaned .zip for the user to chase down.
+        if (entity.system.equals("WIIU", ignoreCase = true) &&
+            entity.finalFilePath.endsWith(".zip", ignoreCase = true)
+        ) {
+            unpackWiiuBundle(entity, partFile)
             return
         }
 
@@ -662,13 +661,13 @@ class DownloadManager(
     }
 
     /**
-     * Extract a decrypted Wii U title into ``<finalFilePath minus .zip>/``.
+     * Extract a Wii U title into ``<finalFilePath minus .zip>/``.
      *
-     * A previous partial extraction is wiped first: Cemu reads whatever
-     * ``code``/``content``/``meta`` it finds, so a half-written tree from an
-     * interrupted run would look installed but fail to boot.
+     * A previous partial extraction is wiped first: both Cemu and WUP
+     * installers read whatever files they find, so a half-written tree from
+     * an interrupted run would look installed but fail to load.
      */
-    private fun unpackLoadiineBundle(entity: DownloadEntity, partFile: File) {
+    private fun unpackWiiuBundle(entity: DownloadEntity, partFile: File) {
         val targetDir = File(entity.finalFilePath.removeSuffix(".zip"))
         if (targetDir.exists()) {
             runCatching { targetDir.deleteRecursively() }
