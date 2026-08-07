@@ -1057,6 +1057,140 @@ class TestRomCatalog:
         assert wux.title_id.startswith("WIIU_")
         assert wux.name == "Xenoblade Chronicles X"
 
+    def test_wiiu_update_and_dlc_are_named_and_grouped(
+        self, tmp_path, client, auth_headers
+    ):
+        """Updates and DLC are absent from every Wii U DAT, but share their
+        base game's low word — so they get named from it, labelled, and linked
+        back so a client can queue the whole set.
+        """
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+
+        original = settings.rom_dir
+        try:
+            rom_db.init_db(settings.save_dir)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+
+            for folder in (
+                "SUPER MARIO 3D WORLD [0005000010145C00]",
+                "SUPER MARIO 3D WORLD [0005000E10145C00]",
+                "SUPER MARIO 3D WORLD [0005000C10145C00]",
+                "BAYONETTA 2 [0005000010172600]",
+            ):
+                d = rom_dir / "wiiu" / folder
+                d.mkdir(parents=True)
+                (d / "title.tmd").write_bytes(b"TMD")
+                (d / "00000000.app").write_bytes(b"APP")
+
+            rom_scanner.init(rom_dir)
+
+            resp = client.get("/api/v1/roms?system=WIIU", headers=auth_headers)
+            assert resp.status_code == 200
+            rows = {r["rom_id"]: r for r in resp.json()["roms"]}
+
+            game = rows["0005000010145C00"]
+            update = rows["0005000E10145C00"]
+            dlc = rows["0005000C10145C00"]
+
+            assert game["content_type"] == "game"
+            assert update["content_type"] == "update"
+            assert dlc["content_type"] == "dlc"
+
+            # All three resolve to the same base id...
+            for row in (game, update, dlc):
+                assert row["base_title_id"] == "0005000010145C00"
+
+            # ...and the update/DLC borrow the base game's DAT name.
+            assert update["name"].endswith("(Update)")
+            assert dlc["name"].endswith("(DLC)")
+            assert update["name"].startswith(game["name"])
+            assert dlc["name"].startswith(game["name"])
+
+            # related_rom_ids is in install order: game -> update -> DLC.
+            # MCP rejects a DLC whose base game isn't installed yet, so the
+            # ordering is load-bearing.
+            assert game["related_rom_ids"] == [
+                "0005000E10145C00",
+                "0005000C10145C00",
+            ]
+            assert dlc["related_rom_ids"] == [
+                "0005000010145C00",
+                "0005000E10145C00",
+            ]
+
+            # A game with no extras still reports its type, with no siblings.
+            solo = rows["0005000010172600"]
+            assert solo["content_type"] == "game"
+            assert solo["related_rom_ids"] == []
+        finally:
+            settings.rom_dir = original
+            rom_scanner._catalog = None
+
+    def test_wiiu_sorted_folders_scan_like_a_flat_library(self, tmp_path):
+        """``wiiu/updates/<Game>/`` must scan the same as ``wiiu/<Game>/``.
+
+        Organiser folders are a natural way to keep a NAS tidy, and without
+        an explicit descent the scanner would collapse all of ``updates/``
+        into one giant bundle (a ``title.tmd`` exists *somewhere* beneath it).
+        """
+        from app.services import rom_db, rom_scanner
+
+        def build(root, layout):
+            for rel in layout:
+                d = root / "wiiu" / rel
+                d.mkdir(parents=True)
+                (d / "title.tmd").write_bytes(b"TMD")
+                (d / "00000000.app").write_bytes(b"A" * 100)
+
+        flat = tmp_path / "flat"
+        build(flat, [
+            "SUPER MARIO 3D WORLD [0005000010145C00]",
+            "SUPER MARIO 3D WORLD [0005000E10145C00]",
+            "SUPER MARIO 3D WORLD [0005000C10145C00]",
+        ])
+        sorted_ = tmp_path / "sorted"
+        build(sorted_, [
+            "games/SUPER MARIO 3D WORLD [0005000010145C00]",
+            "updates/SUPER MARIO 3D WORLD [0005000E10145C00]",
+            "dlc/SUPER MARIO 3D WORLD [0005000C10145C00]",
+        ])
+
+        def scan(root):
+            rom_db.init_db(root)
+            catalog = rom_scanner.RomCatalog()
+            catalog.scan(root)
+            return sorted(
+                (e.title_id, e.name, e.size, e.is_bundle)
+                for e in catalog.list_by_system("WIIU")
+            )
+
+        flat_rows = scan(flat)
+        assert len(flat_rows) == 3
+        assert scan(sorted_) == flat_rows
+
+    def test_wiiu_content_type_helpers(self):
+        """Title-id classification and base-id derivation."""
+        from shared import wiiu_meta
+
+        assert wiiu_meta.content_type("0005000010145C00") == "game"
+        assert wiiu_meta.content_type("0005000E10145C00") == "update"
+        assert wiiu_meta.content_type("0005000C10145C00") == "dlc"
+        assert wiiu_meta.content_type("00050002ABCDEF00") == "demo"
+        assert wiiu_meta.content_type("DEADBEEFCAFEBABE") == ""
+
+        assert (
+            wiiu_meta.base_title_id("0005000E10145C00") == "0005000010145C00"
+        )
+        # A base id maps to itself, so callers need no special case.
+        assert (
+            wiiu_meta.base_title_id("0005000010145C00") == "0005000010145C00"
+        )
+
+        assert wiiu_meta.decorate_name("Mario", "0005000E10145C00") == "Mario (Update)"
+        assert wiiu_meta.decorate_name("Mario", "0005000010145C00") == "Mario"
+
     def test_wiiu_title_id_split_helper(self):
         """The id parser tolerates brackets, parens, archive suffixes and
         rejects 16-hex runs outside the Wii U ``0005`` space.

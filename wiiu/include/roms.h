@@ -30,6 +30,11 @@
 #define ROM_CATALOG_MAX 2048
 #define ROM_ID_LEN      96
 
+/* A Wii U game has at most one update and one DLC title in practice; 4 leaves
+ * room for a demo and a second DLC without growing RomEntry much (the catalog
+ * array is 2048 entries, so every byte here costs 2 KB). */
+#define WIIU_RELATED_MAX 4
+
 typedef struct {
     char     rom_id[ROM_ID_LEN];
     char     filename[160];
@@ -42,6 +47,13 @@ typedef struct {
     /* Bundle entries (Wii U WUP folders) are downloaded file-by-file rather
      * than as one blob — see network_fetch_bundle_manifest. */
     bool     is_bundle;
+    /* Wii U grouping.  A game's update (0005000E...) and DLC (0005000C...)
+     * are separate titles sharing the base game's low word; the server tags
+     * each row and lists the others so one action covers the whole set.
+     * ``content_type`` is "game"/"update"/"dlc"/"demo", empty otherwise. */
+    char     content_type[8];
+    char     related[WIIU_RELATED_MAX][ROM_ID_LEN];
+    int      related_count;
 } RomEntry;
 
 typedef struct {

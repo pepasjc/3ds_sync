@@ -29,7 +29,12 @@ from typing import Iterable, Optional
 __all__ = [
     "TITLE_HIGH",
     "META_HIGH_IDS",
+    "CONTENT_TYPE_BY_HIGH",
+    "CONTENT_TYPE_SUFFIX",
+    "base_title_id",
     "build_meta_index",
+    "content_type",
+    "decorate_name",
     "game_paths_from_settings",
     "host_dir",
     "is_wiiu_title_id",
@@ -45,6 +50,24 @@ __all__ = [
 # disc game has, since a disc title installs no 00050000 content.
 TITLE_HIGH = "00050000"
 META_HIGH_IDS = ("00050000", "0005000E", "0005000C")
+
+# Title-id high word -> what kind of content it is.  The low word is shared
+# across all of a game's pieces, which is what makes grouping possible without
+# any external database: 0005000E10145C00 is the update for 0005000010145C00.
+CONTENT_TYPE_BY_HIGH: dict[str, str] = {
+    "00050000": "game",
+    "0005000E": "update",
+    "0005000C": "dlc",
+    "00050002": "demo",
+}
+
+# Display suffix appended to the base game's name.  "game" gets none — a base
+# title is just the game.
+CONTENT_TYPE_SUFFIX: dict[str, str] = {
+    "update": "(Update)",
+    "dlc": "(DLC)",
+    "demo": "(Demo)",
+}
 
 _TITLE_ID_RE = re.compile(r"^0005[0-9A-Fa-f]{12}$")
 _HEX8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
@@ -74,6 +97,42 @@ _META_XML_MAX = 128 * 1024
 
 def is_wiiu_title_id(title_id: str) -> bool:
     return bool(title_id) and bool(_TITLE_ID_RE.match(title_id.strip()))
+
+
+def content_type(title_id: str) -> str:
+    """Classify a Wii U title id: ``game``/``update``/``dlc``/``demo``.
+
+    Returns ``""`` for anything that isn't a recognised Wii U title id, so
+    callers can use a falsy result as "not Wii U content".
+    """
+    if not is_wiiu_title_id(title_id):
+        return ""
+    return CONTENT_TYPE_BY_HIGH.get(title_id.strip().upper()[:8], "")
+
+
+def base_title_id(title_id: str) -> str:
+    """The base-game id an update/DLC/demo belongs to.
+
+    Swaps the high word for ``00050000`` and keeps the shared low word, so
+    ``0005000E10145C00`` -> ``0005000010145C00``.  A base id maps to itself.
+    Returns ``""`` when the input isn't a Wii U title id.
+    """
+    if not is_wiiu_title_id(title_id):
+        return ""
+    return TITLE_HIGH + title_id.strip().upper()[8:]
+
+
+def decorate_name(base_name: str, title_id: str) -> str:
+    """Label a base-game name for the piece ``title_id`` actually refers to.
+
+    ``("Super Mario 3D World (USA)", "0005000E…")`` ->
+    ``"Super Mario 3D World (USA) (Update)"``.  A base title is returned
+    unchanged.
+    """
+    suffix = CONTENT_TYPE_SUFFIX.get(content_type(title_id), "")
+    if not suffix or not base_name:
+        return base_name
+    return f"{base_name} {suffix}"
 
 
 def _clean(raw: str) -> str:

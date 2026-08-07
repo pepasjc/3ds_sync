@@ -1,5 +1,6 @@
 package com.savesync.android.api
 
+import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -111,5 +112,41 @@ class RomEntryDownloadPolicyTest {
         val entry = rom(system = "WIIU", filename = "Bayonetta 2.wua")
         assertNull(entry.preferredDownloadExtractFormat())
         assertEquals("Bayonetta 2.wua", entry.preferredDownloadFilename(null))
+    }
+
+    /**
+     * Regression: Gson instantiates via Unsafe and skips the Kotlin
+     * constructor, so a `= emptyList()` default is NOT applied when the key is
+     * missing from the JSON.  A non-null-typed access then NPEs on the very
+     * first call.  The server omits `extract_formats` whenever it has nothing
+     * to advertise — e.g. a Wii U bundle on a host with no decrypter — which
+     * crashed the catalog screen the moment Download was tapped.
+     */
+    @Test
+    fun `absent extract_formats deserializes without crashing`() {
+        val json = """
+            {"rom_id":"0005000010145C00","title_id":"0005000010145C00",
+             "system":"WIIU","name":"Super Mario 3D World (USA)",
+             "filename":"Super Mario 3D World (USA).zip",
+             "path":"wiiu/Super Mario 3D World (USA)","size":1752408756,
+             "is_bundle":true}
+        """.trimIndent()
+        val entry = Gson().fromJson(json, RomEntry::class.java)
+
+        assertEquals(emptyList<String>(), entry.extractFormatList)
+        assertNull(entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `present extract_formats survives deserialization`() {
+        val json = """
+            {"rom_id":"r","title_id":"t","system":"WIIU","name":"n",
+             "filename":"n.zip","path":"p","size":1,"is_bundle":true,
+             "extract_formats":["loadiine","wua"]}
+        """.trimIndent()
+        val entry = Gson().fromJson(json, RomEntry::class.java)
+
+        assertEquals(listOf("loadiine", "wua"), entry.extractFormatList)
+        assertEquals("loadiine", entry.preferredDownloadExtractFormat())
     }
 }

@@ -647,3 +647,80 @@ def test_rom_target_wiiu_folder(tmp_path):
     assert resolve_rom_target_dir(tmp_path, "WIIU") == tmp_path / "wiiu"
     (tmp_path / "Wii U").mkdir()
     assert resolve_rom_target_dir(tmp_path, "WIIU") == tmp_path / "Wii U"
+
+
+# ---------------------------------------------------------------------------
+# related_roms — Wii U update / DLC grouping
+# ---------------------------------------------------------------------------
+
+
+class _StubCatalogClient(SyncClient):
+    """SyncClient with ``list_roms`` stubbed so no server is needed."""
+
+    def __init__(self, catalog):
+        super().__init__("localhost", 8000, "key")
+        self._catalog = catalog
+
+    def list_roms(self, system=None):  # type: ignore[override]
+        return self._catalog
+
+
+_WIIU_BASE = {
+    "rom_id": "0005000010145C00",
+    "system": "WIIU",
+    "name": "Super Mario 3D World (USA)",
+    "size": 1_000,
+    "content_type": "game",
+    "is_bundle": True,
+    "related_rom_ids": ["0005000E10145C00", "0005000C10145C00"],
+}
+_WIIU_UPDATE = {
+    "rom_id": "0005000E10145C00",
+    "system": "WIIU",
+    "name": "Super Mario 3D World (USA) (Update)",
+    "size": 200,
+    "content_type": "update",
+    "is_bundle": True,
+    "related_rom_ids": ["0005000010145C00", "0005000C10145C00"],
+}
+_WIIU_DLC = {
+    "rom_id": "0005000C10145C00",
+    "system": "WIIU",
+    "name": "Super Mario 3D World (USA) (DLC)",
+    "size": 50,
+    "content_type": "dlc",
+    "is_bundle": True,
+    "related_rom_ids": ["0005000010145C00", "0005000E10145C00"],
+}
+
+
+def test_related_roms_returns_update_then_dlc():
+    """Install order matters — MCP rejects a DLC whose base game is absent."""
+    client = _StubCatalogClient([_WIIU_BASE, _WIIU_UPDATE, _WIIU_DLC])
+    related = client.related_roms(_WIIU_BASE, "WIIU")
+    assert [r["rom_id"] for r in related] == [
+        "0005000E10145C00",
+        "0005000C10145C00",
+    ]
+
+
+def test_related_roms_excludes_self():
+    """Opening the update must not queue the update twice."""
+    client = _StubCatalogClient([_WIIU_BASE, _WIIU_UPDATE, _WIIU_DLC])
+    related = client.related_roms(_WIIU_UPDATE, "WIIU")
+    assert [r["rom_id"] for r in related] == [
+        "0005000010145C00",
+        "0005000C10145C00",
+    ]
+
+
+def test_related_roms_empty_for_ungrouped_systems():
+    client = _StubCatalogClient([])
+    assert client.related_roms({"rom_id": "x", "system": "GBA"}, "GBA") == []
+
+
+def test_related_roms_skips_ids_missing_from_the_catalog():
+    """A dangling id (DLC folder deleted between scans) is dropped, not fatal."""
+    client = _StubCatalogClient([_WIIU_BASE, _WIIU_UPDATE])
+    related = client.related_roms(_WIIU_BASE, "WIIU")
+    assert [r["rom_id"] for r in related] == ["0005000E10145C00"]

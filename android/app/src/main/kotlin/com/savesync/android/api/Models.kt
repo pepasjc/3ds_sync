@@ -147,12 +147,64 @@ data class RomEntry(
     val source: String? = null,
     @SerializedName("extract_format")
     val extractFormat: String? = null,
+    /**
+     * Nullable on purpose.  Gson instantiates via Unsafe and does not run the
+     * Kotlin constructor, so a declared `= emptyList()` default is NOT applied
+     * when the key is absent from the JSON — the field is left null and any
+     * non-null-typed access NPEs at the first call.  The server omits this key
+     * for systems with nothing to advertise, so read it through [extractFormatList].
+     */
     @SerializedName("extract_formats")
-    val extractFormats: List<String> = emptyList(),
+    val extractFormats: List<String>? = null,
     /** True for folder-shaped catalog entries (PS3 packages, Wii U WUP sets). */
     @SerializedName("is_bundle")
-    val isBundle: Boolean = false
+    val isBundle: Boolean = false,
+    /** Wii U only: `game` / `update` / `dlc` / `demo`. */
+    @SerializedName("content_type")
+    val contentType: String? = null,
+    /** Wii U only: the base-game title id this entry belongs to. */
+    @SerializedName("base_title_id")
+    val baseTitleId: String? = null,
+    /**
+     * Wii U only: the *other* pieces of this game (its update, DLC, or the
+     * base game if this is one of those), server-ordered game → update → DLC.
+     * Nullable for the same Gson reason as [extractFormats].
+     */
+    @SerializedName("related_rom_ids")
+    val relatedRomIds: List<String>? = null
 )
+
+/**
+ * Install order for a Wii U title's pieces.  MCP rejects an update or DLC
+ * whose base game is not on the console yet, so downloading — and therefore
+ * installing — has to follow this sequence.
+ */
+private val WIIU_CONTENT_ORDER = listOf("game", "update", "dlc", "demo")
+
+/**
+ * This entry together with its updates / DLC, in install order.
+ *
+ * Returns just `this` for systems with no grouping, or for a Wii U title the
+ * server found no siblings for.  Tapping *any* piece yields the whole set:
+ * an update on its own is unusable, so queuing the group is what the user
+ * actually wants either way.
+ */
+fun RomEntry.withRelated(catalog: List<RomEntry>): List<RomEntry> {
+    val ids = relatedRomIds.orEmpty()
+    if (ids.isEmpty()) return listOf(this)
+
+    val byId = catalog.associateBy { it.rom_id ?: it.title_id }
+    return (listOf(this) + ids.mapNotNull { byId[it] })
+        .distinctBy { it.rom_id ?: it.title_id }
+        .sortedBy {
+            val idx = WIIU_CONTENT_ORDER.indexOf(it.contentType?.trim()?.lowercase())
+            if (idx < 0) WIIU_CONTENT_ORDER.size else idx
+        }
+}
+
+/** Server-advertised extract formats, lowercased; empty when none. */
+val RomEntry.extractFormatList: List<String>
+    get() = extractFormats.orEmpty().mapNotNull { it.trim().lowercase().ifEmpty { null } }
 
 data class RomsResponse(
     val roms: List<RomEntry>,
@@ -215,8 +267,7 @@ fun RomEntry.preferredDownloadExtractFormat(): String? {
         // the console does.  So take the raw bundle unless this server has
         // actually advertised a decrypted format — requesting one it can't
         // produce would turn a working download into a 503.
-        val advertised = extractFormats.map { it.trim().lowercase() }
-        return if (isBundle && "loadiine" in advertised) "loadiine" else null
+        return if (isBundle && "loadiine" in extractFormatList) "loadiine" else null
     }
 
     return null

@@ -15,6 +15,8 @@
  *   CONFIG
  */
 
+#include <ctype.h>
+
 #include "common.h"
 #include "config.h"
 #include "downloads.h"
@@ -564,6 +566,14 @@ static int queue_wii_rom(const RomEntry *rom, bool run_now) {
     return 0;
 }
 
+static const RomEntry *catalog_find(const char *rom_id) {
+    if (!rom_id || !rom_id[0]) return NULL;
+    for (int i = 0; i < g_catalog.count; i++)
+        if (strcmp(g_catalog.items[i].rom_id, rom_id) == 0)
+            return &g_catalog.items[i];
+    return NULL;
+}
+
 /* Expand a Wii U bundle entry into one download per WUP file.  The folder is
  * only installable once every file has landed (title.tmd is what MCP reads
  * first), so nothing auto-installs — the Local view does that on request. */
@@ -620,7 +630,21 @@ static void queue_selected_rom(bool run_now) {
         return;
     }
     if (strcmp(g_cat_system, "WIIU") == 0) {
-        queue_wiiu_rom(rom, run_now);
+        /* A game's update and DLC are separate titles that are useless apart,
+         * so one action queues the whole set.  The server already ordered
+         * related[] game -> update -> DLC, which is the order MCP needs. */
+        int queued = queue_wiiu_rom(rom, false) == 0 ? 1 : 0;
+        for (int i = 0; i < rom->related_count; i++) {
+            const RomEntry *part = catalog_find(rom->related[i]);
+            if (!part) continue;                 /* not in this page/system */
+            if (queue_wiiu_rom(part, false) == 0) queued++;
+        }
+        if (queued > 1)
+            ui_status("Queued %d titles (game + update/DLC)", queued);
+        if (run_now && queued > 0) {
+            g_view = APP_VIEW_DOWNLOADS;
+            run_download_queue();
+        }
         return;
     }
 
@@ -692,6 +716,68 @@ static void install_progress_cb(const InstallProgress *p) {
     redraw();
 }
 
+/* Wii U install order: base game, then update, then DLC.  MCP rejects an
+ * update or DLC whose base game is not on the console yet, so a set has to
+ * go in sequence. */
+static int install_rank(const char *title_id) {
+    if (!title_id || strlen(title_id) < 8) return 9;
+    if (!strncasecmp(title_id, "00050000", 8)) return 0;   /* game   */
+    if (!strncasecmp(title_id, "0005000E", 8)) return 1;   /* update */
+    if (!strncasecmp(title_id, "0005000C", 8)) return 2;   /* DLC    */
+    if (!strncasecmp(title_id, "00050002", 8)) return 3;   /* demo   */
+    return 9;
+}
+
+/* The 16-hex title id embedded in a staged folder name, or "" if absent. */
+static void wup_title_id_from_name(const char *name, char *out, size_t out_size) {
+    out[0] = '\0';
+    if (!name) return;
+    for (const char *p = name; *p; p++) {
+        if (strncasecmp(p, "0005", 4) != 0) continue;
+        int n = 0;
+        while (n < 16 && isxdigit((unsigned char)p[n])) n++;
+        if (n != 16) continue;
+        if (isxdigit((unsigned char)p[16])) continue;   /* longer run */
+        if (out_size < 17) return;
+        for (int i = 0; i < 16; i++) out[i] = (char)toupper((unsigned char)p[i]);
+        out[16] = '\0';
+        return;
+    }
+}
+
+/* Every staged WUP folder belonging to the same game as ``title_id`` — i.e.
+ * sharing its low word — sorted into install order. */
+static int collect_install_set(const char *title_id, int *idx_out, int max) {
+    int n = 0;
+    if (!title_id || !title_id[0]) return 0;
+    const char *low = title_id + 8;
+
+    for (int i = 0; i < g_local.count && n < max; i++) {
+        if (strcmp(g_local.items[i].system, "WIIU") != 0) continue;
+        char tid[24];
+        wup_title_id_from_name(g_local.items[i].name, tid, sizeof(tid));
+        if (!tid[0] || strcasecmp(tid + 8, low) != 0) continue;
+        idx_out[n++] = i;
+    }
+
+    /* Insertion sort by install rank — n is <= 4 in practice. */
+    for (int a = 1; a < n; a++) {
+        int key = idx_out[a];
+        char ka[24];
+        wup_title_id_from_name(g_local.items[key].name, ka, sizeof(ka));
+        int rk = install_rank(ka), b = a - 1;
+        while (b >= 0) {
+            char kb[24];
+            wup_title_id_from_name(g_local.items[idx_out[b]].name, kb, sizeof(kb));
+            if (install_rank(kb) <= rk) break;
+            idx_out[b + 1] = idx_out[b];
+            b--;
+        }
+        idx_out[b + 1] = key;
+    }
+    return n;
+}
+
 static void install_selected_local(void) {
     if (g_local.count == 0 || g_loc_sel >= g_local.count) return;
     LocalRom *r = &g_local.items[g_loc_sel];
@@ -706,19 +792,45 @@ static void install_selected_local(void) {
         return;
     }
 
+    /* Pull in the update / DLC staged alongside this game so they install in
+     * the right order without the user having to know there is one. */
+    char tid[24];
+    wup_title_id_from_name(r->name, tid, sizeof(tid));
+    int set[WIIU_RELATED_MAX + 1];
+    int count = collect_install_set(tid, set, (int)(sizeof(set) / sizeof(set[0])));
+    if (count == 0) { set[0] = g_loc_sel; count = 1; }
+
     bool to_usb = !strcasecmp(g_state.install_target, "usb");
-    if (!confirm("Install %s\nto %s?\n\nThis writes to the console's storage.",
-                 r->name, to_usb ? "USB (Wii U drive)" : "NAND (MLC)"))
+    if (count > 1) {
+        if (!confirm("Install %s\nand %d related title(s) to %s?\n\n"
+                     "Base game first, then update, then DLC.",
+                     r->name, count - 1,
+                     to_usb ? "USB (Wii U drive)" : "NAND (MLC)"))
+            return;
+    } else if (!confirm("Install %s\nto %s?\n\nThis writes to the console's storage.",
+                        r->name, to_usb ? "USB (Wii U drive)" : "NAND (MLC)")) {
         return;
+    }
 
-    ui_status("Starting install...");
-    redraw();
+    int done = 0;
+    for (int i = 0; i < count; i++) {
+        LocalRom *part = &g_local.items[set[i]];
+        ui_status("Installing %d/%d: %s", i + 1, count, part->name);
+        redraw();
 
-    InstallProgress prog;
-    int rc = install_wup_folder(r->path, g_state.install_target,
-                                &prog, install_progress_cb);
-    if (rc == 0) ui_status("%s: %s", r->name, prog.message);
-    else         ui_error("%s", prog.message);
+        InstallProgress prog;
+        int rc = install_wup_folder(part->path, g_state.install_target,
+                                    &prog, install_progress_cb);
+        if (rc != 0) {
+            /* Stop the chain: an update on top of a base game that failed to
+             * install is worse than nothing. */
+            ui_error("%s: %s", part->name, prog.message);
+            redraw();
+            return;
+        }
+        done++;
+    }
+    ui_status("Installed %d title(s) to %s", done, to_usb ? "USB" : "NAND");
     redraw();
 }
 

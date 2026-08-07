@@ -77,6 +77,8 @@ from app.services.rom_id import (
     SYSTEM_CODES,
     normalize_rom_name,
 )
+# rom_id imports `shared` onto sys.path for us, so this stays a plain import.
+from shared import wiiu_meta
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,11 @@ _WIIU_FILE_EXTS = frozenset({".wua", ".wud", ".wux", ".iso", ".zip", ".7z", ".ra
 _WIIU_TITLE_ID_RE = re.compile(
     r"(?<![0-9A-Fa-f])(0005[0-9A-Fa-f]{12})(?![0-9A-Fa-f])"
 )
+
+# How far below ``wiiu/`` to look for bundles.  Covers wiiu/updates/<Game>/
+# and one further level of nesting; deep enough for any real layout, shallow
+# enough that a stray deep tree can't turn the scan into a full-disk walk.
+_WIIU_MAX_SCAN_DEPTH = 3
 
 
 class RomEntry:
@@ -364,13 +371,30 @@ def _identify_wiiu(raw_name: str, norm: Optional[object]) -> tuple[str, str, str
     keyed by (``SYNC_ID_RULES`` uses the ``title_id`` strategy for WIIU), so
     a catalog entry and its save land on the same key.  Without one we fall
     back to the usual DAT-normalized slug.
+
+    Updates (``0005000E…``) and DLC (``0005000C…``) are absent from every DAT,
+    but they share their base game's low word — so we name them from the base
+    id and label which piece they are.
     """
     title_id, display = _wiiu_split_title_id(raw_name)
     if title_id:
         dat_name = game_names.get_name(title_id)
         if dat_name:
             return title_id, dat_name, "title_id"
-        return title_id, display or title_id, "filename"
+
+        base_id = wiiu_meta.base_title_id(title_id)
+        if base_id and base_id != title_id:
+            base_name = game_names.get_name(base_id)
+            if base_name:
+                return (
+                    title_id,
+                    wiiu_meta.decorate_name(base_name, title_id),
+                    "title_id",
+                )
+
+        # No DAT entry anywhere — fall back to the folder name, still
+        # labelled so the list doesn't show three identical rows.
+        return title_id, wiiu_meta.decorate_name(display or title_id, title_id), "filename"
 
     if norm is not None:
         info = norm.normalize("WIIU", raw_name)
@@ -381,12 +405,50 @@ def _identify_wiiu(raw_name: str, norm: Optional[object]) -> tuple[str, str, str
 
 
 def _is_wiiu_bundle_dir(sub: Path) -> bool:
-    """True when ``sub`` holds a WUP set or a decrypted loadiine layout."""
-    for f in sub.rglob("*"):
-        if f.is_file() and f.name.lower() == _WIIU_WUP_MARKER:
-            return True
-    child_dirs = {c.name.lower() for c in sub.iterdir() if c.is_dir()}
+    """True when ``sub`` *itself* is a WUP set or a decrypted loadiine layout.
+
+    Deliberately checks only direct children.  A recursive search would make
+    an organiser folder like ``wiiu/updates/`` look like one giant bundle
+    because a ``title.tmd`` exists somewhere beneath it — see
+    :func:`_wiiu_bundle_dirs`, which descends instead.
+    """
+    try:
+        children = list(sub.iterdir())
+    except OSError:
+        return False
+
+    if any(
+        c.is_file() and c.name.lower() == _WIIU_WUP_MARKER for c in children
+    ):
+        return True
+    child_dirs = {c.name.lower() for c in children if c.is_dir()}
     return all(name in child_dirs for name in _WIIU_LOADIINE_DIRS)
+
+
+def _wiiu_bundle_dirs(folder: Path, depth: int = 0) -> list[Path]:
+    """Every Wii U bundle under ``folder``, descending through organiser dirs.
+
+    Libraries come both ways and both are supported: flat
+    (``wiiu/<Game [id]>/``) or sorted (``wiiu/updates/<Game [id]>/``,
+    ``wiiu/dlc/...``).  A directory that is itself a bundle ends the walk;
+    anything else is assumed to be an organiser folder and descended into.
+    That also covers dumps that nest one extra level inside their own folder.
+    """
+    if depth > _WIIU_MAX_SCAN_DEPTH:
+        return []
+    found: list[Path] = []
+    try:
+        children = sorted(folder.iterdir())
+    except OSError:
+        return found
+    for sub in children:
+        if not sub.is_dir() or sub.name in SKIP_DIR_NAMES:
+            continue
+        if _is_wiiu_bundle_dir(sub):
+            found.append(sub)
+        else:
+            found.extend(_wiiu_bundle_dirs(sub, depth + 1))
+    return found
 
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -770,18 +832,10 @@ class RomCatalog:
         """
         system = "WIIU"
 
-        bundle_dirs: list[Path] = []
+        bundle_dirs = _wiiu_bundle_dirs(folder)
         bundled_paths: set[Path] = set()
-
-        for sub in sorted(folder.iterdir()):
-            if not sub.is_dir():
-                continue
-            if sub.name in SKIP_DIR_NAMES:
-                continue
-            if not _is_wiiu_bundle_dir(sub):
-                continue
-            bundle_dirs.append(sub)
-            for f in sub.rglob("*"):
+        for bundle_dir in bundle_dirs:
+            for f in bundle_dir.rglob("*"):
                 if f.is_file():
                     bundled_paths.add(f.resolve())
 

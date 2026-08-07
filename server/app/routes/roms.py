@@ -253,6 +253,7 @@ def _save_dir_to_cache(temp_dir: Path, source_path: Path, fmt: str) -> Path:
 # WAN links cost ~1MB of process memory regardless of file size.
 _STREAM_CHUNK = 1 << 20
 from app.services import ctr_rom, rom_scanner
+from shared import wiiu_meta
 
 router = APIRouter()
 
@@ -460,6 +461,7 @@ async def list_roms(
     # (disc_index, disc_total, primary_rom_id).  Single-disc games get
     # the trivial (1, 1, rom_id) tuple.
     ps1_disc_meta = _ps1_compute_disc_groups(entries)
+    wiiu_group_meta = _wiiu_compute_content_groups(entries)
 
     if limit is not None:
         page = entries[offset : offset + limit]
@@ -479,6 +481,9 @@ async def list_roms(
         meta = ps1_disc_meta.get(e.rom_id)
         if meta is not None:
             d['disc_index'], d['disc_total'], d['primary_rom_id'] = meta
+        wiiu = wiiu_group_meta.get(e.rom_id)
+        if wiiu is not None:
+            d['content_type'], d['base_title_id'], d['related_rom_ids'] = wiiu
         result.append(d)
 
     return {
@@ -488,6 +493,50 @@ async def list_roms(
         "limit": limit,
         "has_more": has_more,
     }
+
+
+def _wiiu_compute_content_groups(entries) -> dict[str, tuple[str, str, list[str]]]:
+    """Link Wii U base games to their updates and DLC.
+
+    A Wii U title id encodes the content kind in its high word and shares the
+    low word across every piece of a game, so ``0005000E10145C00`` is the
+    update for ``0005000010145C00`` with no database needed.
+
+    Returns a map keyed on ``rom_id`` giving
+    ``(content_type, base_title_id, related_rom_ids)``.  ``related_rom_ids``
+    is the *other* pieces of the same game, ordered game → update → DLC →
+    demo, which is both the install order hardware needs and the order a
+    client should queue downloads in.  Entries with no siblings still get a
+    row (with an empty list) so a client can read ``content_type`` without an
+    extra lookup.
+    """
+    # Install/queue order.  A DLC installed before its base game is rejected
+    # by MCP, so this ordering is load-bearing, not cosmetic.
+    order = {'game': 0, 'update': 1, 'dlc': 2, 'demo': 3}
+
+    wiiu = [
+        e for e in entries
+        if (e.system or '').upper() in _WIIU_SYSTEMS
+        and wiiu_meta.content_type(e.title_id or '')
+    ]
+    if not wiiu:
+        return {}
+
+    by_base: dict[str, list] = {}
+    for e in wiiu:
+        by_base.setdefault(wiiu_meta.base_title_id(e.title_id), []).append(e)
+
+    result: dict[str, tuple[str, str, list[str]]] = {}
+    for base_id, group in by_base.items():
+        group.sort(key=lambda e: (
+            order.get(wiiu_meta.content_type(e.title_id), 9), e.rom_id
+        ))
+        for e in group:
+            related = [o.rom_id for o in group if o.rom_id != e.rom_id]
+            result[e.rom_id] = (
+                wiiu_meta.content_type(e.title_id), base_id, related,
+            )
+    return result
 
 
 def _ps1_compute_disc_groups(entries) -> dict[str, tuple[int, int, str]]:

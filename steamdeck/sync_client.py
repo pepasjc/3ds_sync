@@ -573,6 +573,32 @@ class SyncClient:
         extract = str(rom.get("extract_format") or "").strip().lower() or None
         return filename, extract
 
+    def related_roms(self, rom: dict, system: str) -> list[dict]:
+        """The updates / DLC belonging to ``rom``, in install order.
+
+        A Wii U game's update (``0005000E…``) and DLC (``0005000C…``) are
+        separate titles that are useless on their own, and MCP rejects a DLC
+        whose base game isn't installed — so the server hands back
+        ``related_rom_ids`` already ordered game → update → DLC and we queue
+        the whole set together.
+
+        Returns ``[]`` for systems with no grouping, so callers can append
+        unconditionally.
+        """
+        related = [str(r) for r in (rom.get("related_rom_ids") or []) if r]
+        if not related:
+            return []
+
+        this_id = str(rom.get("rom_id") or "")
+        by_id = {
+            str(r.get("rom_id")): r
+            for r in self.list_roms(system)
+            if r.get("rom_id")
+        }
+        return [
+            by_id[rid] for rid in related if rid in by_id and rid != this_id
+        ]
+
     def find_roms_for_title(self, title_id: str, system: str) -> list[dict]:
         """
         Return ROM catalog entries whose ``title_id`` matches ``title_id``.

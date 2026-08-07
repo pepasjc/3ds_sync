@@ -135,6 +135,32 @@ static bool extract_str(const char *p, const char *end, char *out, size_t out_si
     return true;
 }
 
+/* Read a JSON array of strings into a fixed 2-D char buffer.
+ * ``out`` is ``count_max`` slots of ``slot_len`` bytes each; extra elements
+ * are dropped rather than overflowing. */
+static bool extract_str_array(const char *p, const char *end,
+                              char (*out)[ROM_ID_LEN],
+                              int count_max, size_t slot_len, int *count_out) {
+    if (count_out) *count_out = 0;
+    if (!p || p >= end || *p != '[') return false;
+    p++;
+    int n = 0;
+    while (p < end && n < count_max) {
+        p = skip_ws(p);
+        if (p >= end || *p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '"') break;
+        if (!extract_str(p, end, out[n], slot_len)) break;
+        n++;
+        /* Step past the string we just consumed. */
+        p++;
+        while (p < end && *p != '"') { if (*p == '\\' && p + 1 < end) p++; p++; }
+        if (p < end) p++;
+    }
+    if (count_out) *count_out = n;
+    return true;
+}
+
 static bool extract_u64(const char *p, const char *end, uint64_t *out) {
     if (!p || p >= end) return false;
     p = skip_ws(p);
@@ -213,6 +239,11 @@ static bool parse_catalog_page(const char *scratch_buf, int n,
         if (v) extract_str(v, obj_end, e->extract_format, sizeof(e->extract_format));
         v = find_key(p + 1, obj_end, "is_bundle");
         if (v) e->is_bundle = (*skip_ws(v) == 't');
+        v = find_key(p + 1, obj_end, "content_type");
+        if (v) extract_str(v, obj_end, e->content_type, sizeof(e->content_type));
+        v = find_key(p + 1, obj_end, "related_rom_ids");
+        if (v) extract_str_array(v, obj_end, e->related, WIIU_RELATED_MAX,
+                                 ROM_ID_LEN, &e->related_count);
 
         if (!e->name[0] && e->filename[0])
             strncpy(e->name, e->filename, sizeof(e->name) - 1);
