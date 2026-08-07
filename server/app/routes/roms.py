@@ -356,6 +356,32 @@ _XBOX_EXTRACT_SPECS = {
 }
 _XBOX_EXTRACT_FORMATS = list(_XBOX_EXTRACT_SPECS.keys())
 
+# Wii U.  A WUP/NUS dump installs on real hardware as-is, but Cemu cannot
+# read AES-encrypted ``.app`` contents — it needs a decrypted
+# ``code``/``content``/``meta`` tree or a ``.wua`` archive.  Both conversions
+# run through operator-configured external commands (CDecrypt / Cemu), same
+# as the 3DS and Xbox specs; the server ships neither the tool nor the Wii U
+# common key.
+_WIIU_SYSTEMS = frozenset({'WIIU'})
+_WIIU_LOADIINE_DIRS = ('code', 'content', 'meta')
+_WIIU_EXTRACT_SPECS = {
+    'loadiine': {
+        'setting': 'rom_wiiu_loadiine_command',
+        'env': 'SYNC_ROM_WIIU_LOADIINE_COMMAND',
+        'label': 'decrypted folder ZIP',
+        'output_ext': '.zip',
+        'mime': 'application/zip',
+    },
+    'wua': {
+        'setting': 'rom_wiiu_wua_command',
+        'env': 'SYNC_ROM_WIIU_WUA_COMMAND',
+        'label': 'Cemu .wua archive',
+        'output_ext': '.wua',
+        'mime': 'application/octet-stream',
+    },
+}
+_WIIU_EXTRACT_FORMATS = list(_WIIU_EXTRACT_SPECS.keys())
+
 # PS1 → PSP EBOOT.PBP conversion (popstation-style).  Used by the PSP
 # client's ROM Catalog so PS1 games convert into a PBP installable
 # under ms0:/PSP/GAME/<id>/.  Spec mirrors the 3DS/Xbox layout so the
@@ -1052,6 +1078,11 @@ async def download_rom(
                 )
             if sys_up in _PS1_EBOOT_SYSTEMS and fmt == 'psio':
                 return await _extract_ps1_psio(sys_up, entry)
+            if sys_up in _WIIU_SYSTEMS and fmt in _WIIU_EXTRACT_SPECS:
+                # Emulator clients ask for a decrypted shape; the default
+                # (no ?extract) stays the raw WUP ZIP that real hardware
+                # installs.
+                return await _extract_wiiu(entry, bundle_dir, fmt)
         return await _serve_bundle_zip(entry, bundle_dir)
 
     file_path = rom_dir / entry.path
@@ -2062,6 +2093,193 @@ async def _extract_ps1_vcd(source_path: Path, system: str, entry) -> Response:
     return _stream_file_response(cached_path, spec['mime'], cleanup_dir=tmpdir)
 
 
+# ── Wii U WUP → decrypted loadiine folder / Cemu .wua ───────────────────────
+
+
+def _wiiu_bundle_kind(entry) -> str:
+    """Classify a Wii U bundle from its file list: ``wup``/``loadiine``/``""``.
+
+    ``wup`` is an encrypted NUS dump (``title.tmd`` present) — installable on
+    real hardware, unusable by Cemu until decrypted.  ``loadiine`` is an
+    already-decrypted ``code``/``content``/``meta`` tree, which Cemu reads
+    directly.
+    """
+    names = [
+        str(f.get('name', '')).lower()
+        for f in (getattr(entry, 'bundle_files', None) or [])
+        if isinstance(f, dict)
+    ]
+    if any(name.rsplit('/', 1)[-1] == 'title.tmd' for name in names):
+        return 'wup'
+    tops = {name.split('/', 1)[0] for name in names if '/' in name}
+    if all(d in tops for d in _WIIU_LOADIINE_DIRS):
+        return 'loadiine'
+    return ''
+
+
+def _wiiu_cache_key(bundle_dir: Path, fmt: str) -> str:
+    """Cache key over every file in the WUP/loadiine folder.
+
+    Bundles are directories, so the single-file ``_conversion_cache_key``
+    (which stats one path) can't be used — replacing one ``.app`` inside the
+    folder must invalidate the decrypted output.
+    """
+    parts: list[str] = []
+    for p in sorted(bundle_dir.rglob('*')):
+        if not p.is_file():
+            continue
+        st = p.stat()
+        parts.append(f"{p.relative_to(bundle_dir).as_posix()}|{st.st_mtime_ns}|{st.st_size}")
+    payload = f"{bundle_dir.absolute()}\n" + '\n'.join(parts) + f"|{fmt}"
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+async def _extract_wiiu(entry, bundle_dir: Path, fmt: str) -> Response:
+    """Decrypt a Wii U WUP bundle into a Cemu-usable shape.
+
+    ``loadiine`` yields a ZIP of the decrypted ``code``/``content``/``meta``
+    tree; ``wua`` yields a single Cemu archive.  A bundle that is *already*
+    decrypted short-circuits the ``loadiine`` request to a plain bundle ZIP —
+    no converter needed, and no reason to require one to be configured.
+    """
+    spec = _WIIU_EXTRACT_SPECS[fmt]
+    kind = _wiiu_bundle_kind(entry)
+
+    if fmt == 'loadiine' and kind == 'loadiine':
+        return await _serve_bundle_zip(entry, bundle_dir)
+
+    download_name = f"{_safe_archive_stem(entry.name)}{spec['output_ext']}"
+
+    cache_key = _wiiu_cache_key(bundle_dir, fmt)
+    cached = _lookup_cached_by_key('wiiu', cache_key, spec['output_ext'])
+    if cached is not None:
+        return _stream_file_response(
+            cached, spec['mime'], download_name=download_name
+        )
+
+    command_template = getattr(settings, spec['setting'])
+    if not command_template:
+        return Response(
+            status_code=503,
+            content=(
+                f"Wii U → {spec['label']} conversion is not configured on the server.\n"
+                f"\n"
+                f"Wii U WUP/NUS dumps are AES-encrypted.  Real hardware installs\n"
+                f"them as-is, but Cemu needs a decrypted code/content/meta tree\n"
+                f"(or a .wua packed from one).  Set {spec['env']} to a command\n"
+                f"template that reads {{input}} and writes under {{output_dir}}.\n"
+                f"\n"
+                f"Available placeholders:\n"
+                f"  {{input}}      — the WUP bundle DIRECTORY (not a file)\n"
+                f"  {{output_dir}} — fresh scratch dir; put the result under it\n"
+                f"  {{output}}     — suggested output path (.wua only)\n"
+                f"  {{stem}}       — bundle folder name\n"
+                f"  {{title}}      — game name\n"
+                f"  {{title_id}}   — 16-hex Wii U title id\n"
+                f"\n"
+                f"CDecrypt is the intended tool (check your build's usage line\n"
+                f"for argument order):\n"
+                f"  SYNC_ROM_WIIU_LOADIINE_COMMAND="
+                f"[\"cdecrypt\",\"{{input}}\",\"{{output_dir}}\"]\n"
+                f"\n"
+                f"Forks that read the Wii U common key from a keys.txt need\n"
+                f"SYNC_ROM_WIIU_CWD pointed at the folder holding it.  GameSync\n"
+                f"does not ship that key and cannot redistribute it.\n"
+            ),
+        )
+
+    cwd = settings.rom_wiiu_cwd or None
+    tmpdir = tempfile.mkdtemp(prefix='wiiu_', dir=_conversion_tmp_dir())
+
+    def _run() -> Path:
+        tmp = Path(tmpdir)
+        stage = tmp / 'stage'
+        stage.mkdir()
+
+        cmd = _expand_command_template(
+            command_template,
+            input=str(bundle_dir),
+            output=str(stage / f"{bundle_dir.name}{spec['output_ext']}"),
+            output_dir=str(stage),
+            stem=bundle_dir.name,
+            title=entry.name or bundle_dir.name,
+            title_id=entry.title_id or '',
+        )
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            cwd=cwd or str(tmp),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or 'Wii U decryption failed'
+            )
+
+        if fmt == 'wua':
+            candidates = _find_outputs(stage, {'.wua'})
+            if not candidates:
+                raise RuntimeError(
+                    "converter completed but did not produce a .wua file"
+                    + (('\n' + result.stdout[-2000:]) if result.stdout else '')
+                )
+            candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+            return candidates[0]
+
+        # loadiine — the converter drops code/content/meta somewhere under
+        # the scratch dir.  Zip from whichever directory actually holds
+        # them, so a tool that nests its output one level deep still works.
+        root = _wiiu_find_loadiine_root(stage)
+        if root is None:
+            raise RuntimeError(
+                "converter completed but produced no code/content/meta tree"
+                + (('\n' + result.stdout[-2000:]) if result.stdout else '')
+            )
+        zip_path = tmp / f'{bundle_dir.name}.zip'
+        # Decrypted Wii U content is mostly already-compressed asset
+        # archives, so ZIP_STORED keeps CPU off the (often Pi-class) server.
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for p in sorted(root.rglob('*')):
+                if p.is_file():
+                    zf.write(p, arcname=p.relative_to(root).as_posix())
+        return zip_path
+
+    try:
+        final_path = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except RuntimeError as exc:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=500, content=f"Conversion failed: {exc}")
+    except subprocess.TimeoutExpired:
+        _cleanup_dir(tmpdir)
+        return Response(status_code=504, content="Conversion timed out (>2 hours)")
+
+    cached_path = _save_to_cache_by_key(
+        final_path, 'wiiu', cache_key, spec['output_ext']
+    )
+    return _stream_file_response(
+        cached_path, spec['mime'],
+        cleanup_dir=tmpdir, download_name=download_name,
+    )
+
+
+def _wiiu_find_loadiine_root(stage: Path) -> Path | None:
+    """Find the directory holding ``code``/``content``/``meta`` under ``stage``.
+
+    CDecrypt writes them straight into the output dir, but wrappers often add
+    a per-title subfolder — search a couple of levels rather than insisting on
+    one layout.
+    """
+    candidates = [stage] + [p for p in stage.rglob('*') if p.is_dir()]
+    for candidate in candidates:
+        children = {c.name.lower() for c in candidate.iterdir() if c.is_dir()}
+        if all(d in children for d in _WIIU_LOADIINE_DIRS):
+            return candidate
+    return None
+
+
 # ── PS1 CHD / CUE → PSIO BIN/CU2 ZIP ────────────────────────────────────────
 
 _CUE_SECTOR_SIZE_BY_MODE = {
@@ -2720,6 +2938,14 @@ def _extract_formats_for_entry(entry) -> tuple[str | None, list[str]]:
 
     if sys_up in _XBOX_SYSTEMS and getattr(entry, 'is_bundle', False):
         return 'xbox', list(_XBOX_EXTRACT_FORMATS)
+    if sys_up in _WIIU_SYSTEMS and getattr(entry, 'is_bundle', False):
+        # No preferred format on purpose: the Wii U console client wants the
+        # raw encrypted WUP (that's what it installs), so the default
+        # download must stay the plain bundle ZIP.  Cemu clients pick
+        # 'loadiine' or 'wua' out of extract_formats explicitly.
+        if _wiiu_bundle_kind(entry):
+            return None, list(_WIIU_EXTRACT_FORMATS)
+        return None, []
     if sys_up in _PS1_EBOOT_SYSTEMS and getattr(entry, 'is_bundle', False):
         names = [
             str(f.get('name', ''))

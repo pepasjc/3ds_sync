@@ -9,7 +9,7 @@ Sync save files between consoles, handhelds, and emulators through a self-hosted
 | `server/` | FastAPI server — stores saves and history |
 | `3ds/` | Nintendo 3DS homebrew client |
 | `ds/` | Nintendo DS / DSi homebrew client |
-| `wiiu/` | Wii U homebrew client (Aroma) — GameCube/Nintendont, vWii and Wii U saves |
+| `wiiu/` | Wii U homebrew client (Aroma) — GameCube/Nintendont, vWii and Wii U saves; GC/Wii/Wii U game catalog to SD or FAT32 USB |
 | `psp/` | PSP homebrew client |
 | `vita/` | PS Vita homebrew client |
 | `ps2/` | PlayStation 2 homebrew client — ⚠️ work in progress, not functional yet |
@@ -114,6 +114,9 @@ reads and writes.
 - **gen1 MemCard Pro `0x21` GameID command** (`ps2/`) — [jdfr228/PS1-Disc-Based-Game-ID](https://github.com/jdfr228).
 - **Saroo `SS_SAVE.BIN` Saturn saves** (`desktop/saroo_format.py`) — [SAROO](https://github.com/tpunix/SAROO) by **tpunix** and [save-file-converter](https://github.com/euan-forrester/save-file-converter) by **Euan Forrester**.
 - **3DS NCSD/NCCH header layout** (`server/app/services/ctr_rom.py`) — [ninfs / pyctr](https://github.com/ihaveamac/ninfs) and `3dsconv` by **ihaveamac**.
+- **Wii U WUP/NUS installable layout** (`server/app/services/rom_scanner.py`) — `title.tmd`/`title.tik`/`.app`/`.h3` structure as documented by [wiiubrew](https://wiiubrew.org/wiki/Title_metadata).
+- **Wii U MCP title installation** (`wiiu/source/install.c`) — the `MCP_InstallSetTargetDevice` → `MCP_InstallTitleAsync` → `MCP_InstallGetProgress` sequence, and the 0x40-byte heap alignment IOS requires for those structs, based on analysis of [WUP Installer GX2](https://github.com/Willyanto/wup-installer-gx2) by **Dimok**, **Maschell** and contributors (GPL-2.0-or-later). No code copied.
+- **FAT32 USB mounting on Wii U** (`wiiu/source/natives.c`) — the `/dev/usb01` → `/vol/usb` FSA mount that Tiramisu/Aroma homebrew uses to reach a non-WFS drive, via [libmocha](https://github.com/wiiu-env/libmocha) by **Maschell**.
 
 ### Game databases
 

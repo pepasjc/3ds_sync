@@ -21,6 +21,7 @@
 #include "appstate.h"
 #include "gcsaves.h"
 #include "http.h"
+#include "install.h"
 #include "natives.h"
 #include "roms.h"
 #include "sync.h"
@@ -257,29 +258,63 @@ static bool edit_text(char *out, size_t cap, const char *label) {
 /* ---- Config view ---- */
 
 typedef enum {
-    CF_SERVER = 0, CF_APIKEY, CF_NINSAVES, CF_GAMES, CF_WBFS,
+    CF_SERVER = 0, CF_APIKEY, CF_STORAGE, CF_INSTTARGET,
+    CF_NINSAVES, CF_GAMES, CF_WBFS, CF_INSTALL,
     CF_SYNCVWII, CF_SYNCWIIU, CF_SAVE, CF_COUNT
 } CfgField;
 
+/* Where downloads land.  "usb" only takes effect once a FAT32 drive mounts,
+ * so show what is actually in use next to what was asked for. */
+static const char *storage_label(void) {
+    bool want_usb = !strcasecmp(g_state.rom_storage, "usb");
+    if (!want_usb) return "SD card";
+    return g_state.usb_fat_ready ? "USB (FAT32)" : "USB (not found -> SD)";
+}
+
 static void draw_config(void) {
     int top = ui_list_top();
-    ui_text_hl(top + CF_SERVER,   g_cfg_sel == CF_SERVER,   UI_WHITE, " Server URL : %s", g_state.server_url);
-    ui_text_hl(top + CF_APIKEY,   g_cfg_sel == CF_APIKEY,   UI_WHITE, " API Key    : %s", g_state.api_key);
-    ui_text_hl(top + CF_NINSAVES, g_cfg_sel == CF_NINSAVES, UI_WHITE, " GC memcards: %s", g_state.nin_saves_dir);
-    ui_text_hl(top + CF_GAMES,    g_cfg_sel == CF_GAMES,    UI_WHITE, " GC games   : %s", g_state.games_dir);
-    ui_text_hl(top + CF_WBFS,     g_cfg_sel == CF_WBFS,     UI_WHITE, " Wii wbfs   : %s", g_state.wbfs_dir);
-    ui_text_hl(top + CF_SYNCVWII, g_cfg_sel == CF_SYNCVWII, UI_WHITE, " Sync vWii  : %s", g_state.sync_vwii ? "on" : "off");
-    ui_text_hl(top + CF_SYNCWIIU, g_cfg_sel == CF_SYNCWIIU, UI_WHITE, " Sync Wii U : %s", g_state.sync_wiiu ? "on" : "off");
-    ui_text_hl(top + CF_SAVE,     g_cfg_sel == CF_SAVE,     UI_GREEN, " [ Save config to SD ]");
+    ui_text_hl(top + CF_SERVER,     g_cfg_sel == CF_SERVER,     UI_WHITE, " Server URL : %s", g_state.server_url);
+    ui_text_hl(top + CF_APIKEY,     g_cfg_sel == CF_APIKEY,     UI_WHITE, " API Key    : %s", g_state.api_key);
+    ui_text_hl(top + CF_STORAGE,    g_cfg_sel == CF_STORAGE,    UI_CYAN,  " Download to: %s", storage_label());
+    ui_text_hl(top + CF_INSTTARGET, g_cfg_sel == CF_INSTTARGET, UI_CYAN,  " Install to : %s",
+               !strcasecmp(g_state.install_target, "usb") ? "USB (Wii U drive)" : "NAND (MLC)");
+    ui_text_hl(top + CF_NINSAVES,   g_cfg_sel == CF_NINSAVES,   UI_WHITE, " GC memcards: %s", g_state.nin_saves_dir);
+    ui_text_hl(top + CF_GAMES,      g_cfg_sel == CF_GAMES,      UI_WHITE, " GC games   : %s", g_state.games_dir);
+    ui_text_hl(top + CF_WBFS,       g_cfg_sel == CF_WBFS,       UI_WHITE, " Wii wbfs   : %s", g_state.wbfs_dir);
+    ui_text_hl(top + CF_INSTALL,    g_cfg_sel == CF_INSTALL,    UI_WHITE, " Wii U WUP  : %s", g_state.install_dir);
+    ui_text_hl(top + CF_SYNCVWII,   g_cfg_sel == CF_SYNCVWII,   UI_WHITE, " Sync vWii  : %s", g_state.sync_vwii ? "on" : "off");
+    ui_text_hl(top + CF_SYNCWIIU,   g_cfg_sel == CF_SYNCWIIU,   UI_WHITE, " Sync Wii U : %s", g_state.sync_wiiu ? "on" : "off");
+    ui_text_hl(top + CF_SAVE,       g_cfg_sel == CF_SAVE,       UI_GREEN, " [ Save config to SD ]");
 
+    int row = top + CF_COUNT + 1;
+    char root[SAVE_DIR_LEN];
+    roms_install_dir(root, sizeof(root));
+    ui_text(row++, 0, UI_GREY, "games -> %s", root);
+    if (!strcasecmp(g_state.rom_storage, "usb") && !g_state.usb_fat_ready)
+        ui_text(row++, 0, UI_YELLOW, "usb: %s (A on 'Download to' retries)",
+                g_state.usb_fat_error);
     if (g_state.mocha_error[0])
-        ui_text(top + CF_COUNT + 1, 0, UI_YELLOW, "mocha: %s", g_state.mocha_error);
+        ui_text(row++, 0, UI_YELLOW, "mocha: %s", g_state.mocha_error);
 }
 
 static void config_change(void) {
     switch (g_cfg_sel) {
         case CF_SYNCVWII: g_state.sync_vwii = !g_state.sync_vwii; break;
         case CF_SYNCWIIU: g_state.sync_wiiu = !g_state.sync_wiiu; break;
+        case CF_STORAGE:
+            snprintf(g_state.rom_storage, sizeof(g_state.rom_storage), "%s",
+                     !strcasecmp(g_state.rom_storage, "usb") ? "sd" : "usb");
+            /* Mount on demand so the user can plug a drive in without
+             * relaunching; roms_set_target then repoints every download dir. */
+            if (!strcasecmp(g_state.rom_storage, "usb") && !g_state.usb_fat_ready)
+                natives_mount_usb_fat(&g_state);
+            roms_set_target(&g_state);
+            roms_ensure_target_dirs();
+            break;
+        case CF_INSTTARGET:
+            snprintf(g_state.install_target, sizeof(g_state.install_target), "%s",
+                     !strcasecmp(g_state.install_target, "usb") ? "mlc" : "usb");
+            break;
         default: break;
     }
 }
@@ -293,6 +328,24 @@ static void config_activate(void) {
                           roms_set_target(&g_state); break;
         case CF_WBFS:     edit_text(g_state.wbfs_dir, sizeof(g_state.wbfs_dir), "Wii wbfs dir");
                           roms_set_target(&g_state); break;
+        case CF_INSTALL:  edit_text(g_state.install_dir, sizeof(g_state.install_dir), "Wii U WUP dir");
+                          roms_set_target(&g_state); break;
+        case CF_STORAGE:
+            /* Retry the mount without flipping the setting — the common case
+             * is "I picked USB, then plugged the drive in". */
+            if (!strcasecmp(g_state.rom_storage, "usb") && !g_state.usb_fat_ready) {
+                if (natives_mount_usb_fat(&g_state)) {
+                    roms_set_target(&g_state);
+                    roms_ensure_target_dirs();
+                    ui_status("FAT32 USB mounted");
+                } else {
+                    ui_error("%s", g_state.usb_fat_error);
+                }
+            } else {
+                config_change();
+            }
+            break;
+        case CF_INSTTARGET:
         case CF_SYNCVWII:
         case CF_SYNCWIIU: config_change(); break;
         case CF_SAVE:
@@ -327,8 +380,11 @@ static void fetch_catalog(void) {
 }
 
 static void toggle_catalog_system(void) {
-    snprintf(g_cat_system, sizeof(g_cat_system), "%s",
-             strcmp(g_cat_system, "GC") == 0 ? "WII" : "GC");
+    /* GC -> WII -> WIIU -> GC */
+    const char *next = "GC";
+    if (strcmp(g_cat_system, "GC") == 0)       next = "WII";
+    else if (strcmp(g_cat_system, "WII") == 0) next = "WIIU";
+    snprintf(g_cat_system, sizeof(g_cat_system), "%s", next);
     g_catalog.count = 0;
     g_catalog_loaded = false;
     g_rom_sel = 0; g_rom_scroll = 0;
@@ -508,6 +564,52 @@ static int queue_wii_rom(const RomEntry *rom, bool run_now) {
     return 0;
 }
 
+/* Expand a Wii U bundle entry into one download per WUP file.  The folder is
+ * only installable once every file has landed (title.tmd is what MCP reads
+ * first), so nothing auto-installs — the Local view does that on request. */
+static int queue_wiiu_rom(const RomEntry *rom, bool run_now) {
+    if (!rom->is_bundle) {
+        ui_error("%s is not a WUP folder on the server (unzip it there)",
+                 rom->name);
+        return -1;
+    }
+
+    ui_status("Asking server for the WUP file list...");
+    redraw();
+
+    http_set_wait_cb(wait_cb);
+    BundleManifest man;
+    int rc = network_fetch_bundle_manifest(&g_state, rom->rom_id,
+                                           g_scratch, sizeof(g_scratch), &man);
+    http_set_wait_cb(wait_cb);
+    if (rc != 0) { ui_error("%s", man.last_error); return -1; }
+
+    char game_dir[SAVE_DIR_LEN];
+    roms_wup_game_dir(man.name[0] ? man.name : rom->name,
+                      game_dir, sizeof(game_dir));
+    roms_mkdir_p(game_dir);
+
+    DownloadEntry *first = NULL;
+    for (int i = 0; i < man.file_count; i++) {
+        DownloadEntry *e = downloads_upsert_wup_file(&g_downloads, rom,
+                                                     man.files[i].name,
+                                                     man.files[i].size,
+                                                     game_dir);
+        if (!e) { ui_error("Download list full (%d files needed)", man.file_count); break; }
+        if (!first) first = e;
+    }
+    downloads_save(&g_downloads);
+    ui_status("Queued %s: %d file(s), %llu MB", man.name, man.file_count,
+              (unsigned long long)(man.total_size >> 20));
+
+    if (run_now && first) {
+        g_dl_sel = (int)(first - g_downloads.items);
+        g_view = APP_VIEW_DOWNLOADS;
+        run_download_queue();
+    }
+    return 0;
+}
+
 static void queue_selected_rom(bool run_now) {
     if (!g_state.sd_ready) { ui_error("No SD - cannot install"); return; }
     if (g_catalog.count == 0 || g_rom_sel >= g_catalog.count) return;
@@ -515,6 +617,10 @@ static void queue_selected_rom(bool run_now) {
 
     if (strcmp(g_cat_system, "WII") == 0) {
         queue_wii_rom(rom, run_now);
+        return;
+    }
+    if (strcmp(g_cat_system, "WIIU") == 0) {
+        queue_wiiu_rom(rom, run_now);
         return;
     }
 
@@ -535,7 +641,7 @@ static void queue_selected_rom(bool run_now) {
 static void draw_roms(void) {
     int top = ui_list_top(), vis = ui_list_visible();
     if (g_catalog.count == 0) {
-        ui_text(top, 0, UI_CYAN, "System: %s  (MINUS toggles GC/WII)", g_cat_system);
+        ui_text(top, 0, UI_CYAN, "System: %s  (MINUS cycles GC/WII/WIIU)", g_cat_system);
         ui_text(top + 2, 0, UI_GREY, "%s",
                 g_catalog.last_error[0] ? g_catalog.last_error : "Press A to fetch.");
         return;
@@ -570,6 +676,50 @@ static void draw_local(void) {
         ui_text_hl(top + i, idx == g_loc_sel, UI_WHITE,
                    " %-3s %-*.*s %7s", r->system, namew, namew, r->name, sz);
     }
+}
+
+/* ---- Wii U title install (MCP) ---- */
+
+static void install_progress_cb(const InstallProgress *p) {
+    if (!p) return;
+    if (p->size_total)
+        ui_status("Installing... %llu / %llu MB (%u/%u contents)",
+                  (unsigned long long)(p->size_done >> 20),
+                  (unsigned long long)(p->size_total >> 20),
+                  (unsigned)p->contents_done, (unsigned)p->contents_total);
+    else
+        ui_status("Installing...");
+    redraw();
+}
+
+static void install_selected_local(void) {
+    if (g_local.count == 0 || g_loc_sel >= g_local.count) return;
+    LocalRom *r = &g_local.items[g_loc_sel];
+
+    if (strcmp(r->system, "WIIU") != 0) {
+        ui_error("%s games are loaded by Nintendont / a USB loader, not installed",
+                 r->system);
+        return;
+    }
+    if (!roms_is_wup_dir(r->path)) {
+        ui_error("%s has no title.tmd — download incomplete?", r->name);
+        return;
+    }
+
+    bool to_usb = !strcasecmp(g_state.install_target, "usb");
+    if (!confirm("Install %s\nto %s?\n\nThis writes to the console's storage.",
+                 r->name, to_usb ? "USB (Wii U drive)" : "NAND (MLC)"))
+        return;
+
+    ui_status("Starting install...");
+    redraw();
+
+    InstallProgress prog;
+    int rc = install_wup_folder(r->path, g_state.install_target,
+                                &prog, install_progress_cb);
+    if (rc == 0) ui_status("%s: %s", r->name, prog.message);
+    else         ui_error("%s", prog.message);
+    redraw();
 }
 
 static void draw_downloads(void) {
@@ -1028,8 +1178,8 @@ static void draw_natives(AppView view) {
 
 static const char *hint_for(AppView v) {
     switch (v) {
-        case APP_VIEW_ROMS:      return "A=fetch X=queue Y=get now MINUS=GC/WII  +=quit";
-        case APP_VIEW_LOCAL:     return "A=rescan X=delete  ZL/ZR=view  +=quit";
+        case APP_VIEW_ROMS:      return "A=fetch X=queue Y=get now MINUS=GC/WII/WIIU  +=quit";
+        case APP_VIEW_LOCAL:     return "A=rescan X=delete Y=install(Wii U)  ZL/ZR=view  +=quit";
         case APP_VIEW_DOWNLOADS: return "A=start one Y=run all X=remove B=pause  +=quit";
         case APP_VIEW_GCCARDS:   return "A=upload Y=restore R=next card X=rescan L=import all";
         case APP_VIEW_SERVER:    return "A=restore into card X=refresh Y=pull all GCI  +=quit";
@@ -1327,6 +1477,7 @@ int main(int argc, char **argv) {
             else if (down & VPAD_BUTTON_LEFT)  g_loc_sel -= ui_list_visible();
             else if (down & VPAD_BUTTON_RIGHT) g_loc_sel += ui_list_visible();
             else if (down & VPAD_BUTTON_A)     scan_local();
+            else if (down & VPAD_BUTTON_Y)     install_selected_local();
             else if (down & VPAD_BUTTON_X) {
                 if (c > 0 && g_loc_sel < c &&
                     confirm("Delete %s\n(%s) from the SD card?",

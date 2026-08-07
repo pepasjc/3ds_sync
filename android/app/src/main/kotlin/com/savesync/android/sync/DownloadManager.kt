@@ -34,6 +34,13 @@ import java.io.RandomAccessFile
 import java.util.UUID
 
 private const val TAG = "DownloadManager"
+
+/**
+ * Server extract format whose response body is a ZIP that must land as a
+ * directory rather than a file — the decrypted Wii U code/content/meta tree
+ * Cemu loads.
+ */
+private const val FORMAT_LOADIINE = "loadiine"
 private const val IO_BUFFER_SIZE = 256 * 1024  // 256 KB — fewer syscalls and better throughput on multi-GB
 private const val INITIAL_PERSIST_INTERVAL_MS = 250L
 private const val STEADY_PERSIST_INTERVAL_MS = 1500L
@@ -626,6 +633,16 @@ class DownloadManager(
 
     private suspend fun promotePartFile(entity: DownloadEntity) {
         val partFile = File(entity.partFilePath)
+
+        // Wii U: ``extract=loadiine`` answers with a ZIP of the decrypted
+        // code/content/meta tree, and Cemu wants that as a *folder*.  Unpack
+        // straight from the .part so a mid-extract crash leaves no orphaned
+        // .zip for the user to chase down.
+        if (entity.extractFormat?.lowercase() == FORMAT_LOADIINE) {
+            unpackLoadiineBundle(entity, partFile)
+            return
+        }
+
         val finalFile = File(entity.finalFilePath)
         finalFile.parentFile?.mkdirs()
         if (finalFile.exists()) {
@@ -642,6 +659,42 @@ class DownloadManager(
             }
             partFile.delete()
         }
+    }
+
+    /**
+     * Extract a decrypted Wii U title into ``<finalFilePath minus .zip>/``.
+     *
+     * A previous partial extraction is wiped first: Cemu reads whatever
+     * ``code``/``content``/``meta`` it finds, so a half-written tree from an
+     * interrupted run would look installed but fail to boot.
+     */
+    private fun unpackLoadiineBundle(entity: DownloadEntity, partFile: File) {
+        val targetDir = File(entity.finalFilePath.removeSuffix(".zip"))
+        if (targetDir.exists()) {
+            runCatching { targetDir.deleteRecursively() }
+        }
+        targetDir.mkdirs()
+
+        val canonicalRoot = targetDir.canonicalPath
+        java.util.zip.ZipInputStream(partFile.inputStream().buffered()).use { zis ->
+            while (true) {
+                val zipEntry = zis.nextEntry ?: break
+                val out = File(targetDir, zipEntry.name)
+                // Zip-slip guard — a crafted archive could otherwise write
+                // outside the ROM folder entirely.
+                if (!out.canonicalPath.startsWith(canonicalRoot + File.separator)) {
+                    throw IOException("Refusing unsafe ZIP member: ${zipEntry.name}")
+                }
+                if (zipEntry.isDirectory) {
+                    out.mkdirs()
+                } else {
+                    out.parentFile?.mkdirs()
+                    out.outputStream().use { output -> zis.copyTo(output) }
+                }
+                zis.closeEntry()
+            }
+        }
+        partFile.delete()
     }
 
     private suspend fun markCompleted(id: String) {

@@ -469,6 +469,13 @@ QLabel#detailLabel {{
         # file the emulator can open.
         if is_bundle and extract_format == "iso" and (entry.system or "").upper() in ("XBOX", "X360", "XBOX360"):
             is_bundle = False
+        # Wii U is the one system that needs BOTH: the response is a ZIP (so
+        # the bundle path extracts it into a per-game folder) *and* it must be
+        # requested with ?extract=loadiine, because the raw bundle is the
+        # encrypted WUP set Cemu can't open.
+        keep_extract_on_bundle = (
+            is_bundle and (entry.system or "").upper() == "WIIU"
+        )
         if is_bundle:
             bundle_dir_name = (rom.get("name") or
                                Path(target_filename).stem) or rom_id
@@ -478,11 +485,19 @@ QLabel#detailLabel {{
 
         if is_bundle:
             file_count = len(rom.get("files") or [])
-            msg = (
-                f"Download PS3 bundle '{entry.display_name}'?\n"
-                f"Files: {file_count}{size_txt}\n"
-                f"Destination: {target_path}"
-            )
+            if keep_extract_on_bundle:
+                msg = (
+                    f"Install '{entry.display_name}' for Cemu?\n"
+                    f"The server decrypts the WUP dump first"
+                    f"{size_txt.replace(' (', ' (source ')}\n"
+                    f"Destination: {target_path}"
+                )
+            else:
+                msg = (
+                    f"Download PS3 bundle '{entry.display_name}'?\n"
+                    f"Files: {file_count}{size_txt}\n"
+                    f"Destination: {target_path}"
+                )
         else:
             msg = (
                 f"Download ROM for '{entry.display_name}'?\n"
@@ -514,7 +529,11 @@ QLabel#detailLabel {{
                 system=entry.system or "?",
                 display_name=entry.display_name,
                 target_path=target_path,
-                extract_format=None if is_bundle else extract_format,
+                extract_format=(
+                    extract_format
+                    if (keep_extract_on_bundle or not is_bundle)
+                    else None
+                ),
                 expected_size=size,
                 is_bundle=is_bundle,
             )

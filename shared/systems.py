@@ -368,6 +368,10 @@ ROM_EXTENSIONS: frozenset[str] = frozenset(
         ".gcm",    # GameCube disc image
         ".gci",    # GameCube save container (used as ROM in some loaders)
         ".rvz",    # Dolphin compressed disc image (GameCube / Wii)
+        # Wii U
+        ".wud",    # Wii U disc image (raw)
+        ".wux",    # Wii U disc image (compressed)
+        ".wua",    # Wii U archive (Cemu 2.0+)
         # Sega 8-bit
         ".sms",    # Master System
         ".gg",     # Game Gear
@@ -566,6 +570,7 @@ SYSTEM_DAT_KEYWORDS: dict[str, list[str]] = {
     "ATARIST": ["Atari - ST", "Atari ST"],
     "3DO":    ["The 3DO Company - 3DO", "3DO"],
     "WII":    ["Nintendo - Wii", "Wii"],
+    "WIIU":   ["Nintendo - Wii U", "Wii U"],
     "BS":     ["Nintendo - Satellaview", "Satellaview", "BS-X"],
     "POKEMINI": ["Nintendo - Pokemon Mini", "Pokemon Mini", "Pokemon-Mini"],
     "NAOMI":  ["Sega - Naomi", "Naomi"],
@@ -685,6 +690,9 @@ FOLDER_TO_SYSTEM: dict[str, str] = {
     "tg-cd":           "PCECD",
     "virtualboy":      "VB",
     "wii":             "WII",
+    "wiiu":            "WIIU",
+    "wii-u":           "WIIU",
+    "nintendowiiu":    "WIIU",
     "wonderswan":      "WSWAN",
     "wonderswancolor": "WSWANC",
     "xbox":            "XBOX",

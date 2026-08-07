@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 import zipfile
@@ -955,6 +956,308 @@ class TestRomCatalog:
         assert b.size == 4096 + 2048 + 256 + len(b"FILE \"FF7-D1 (Track 01).bin\"\n")
 
         assert loose[0].filename == "Crash Bandicoot (USA).chd"
+
+    def test_wiiu_wup_folder_is_a_bundle(self, tmp_path):
+        """A WUP installable set collapses into one entry keyed by the title
+        id embedded in the folder name, keeping every ``.app``/``.h3``/ticket
+        file so the console client can install it.
+        """
+        from app.services import rom_db, rom_scanner
+
+        rom_db.init_db(tmp_path)
+        rom_dir = tmp_path / "roms"
+
+        wup = rom_dir / "wiiu" / "SUPER MARIO 3D WORLD [0005000010145C00]"
+        wup.mkdir(parents=True)
+        (wup / "00000000.app").write_bytes(b"a" * 4096)
+        (wup / "00000000.h3").write_bytes(b"h" * 64)
+        (wup / "title.tmd").write_bytes(b"t" * 128)
+        (wup / "title.tik").write_bytes(b"k" * 32)
+        (wup / "title.cert").write_bytes(b"c" * 16)
+
+        catalog = rom_scanner.RomCatalog()
+        catalog.scan(rom_dir, use_crc32=False)
+
+        entries = catalog.list_by_system("WIIU")
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.is_bundle is True
+        assert e.title_id == "0005000010145C00"
+        assert e.size == 4096 + 64 + 128 + 32 + 16
+        assert sorted(f["name"] for f in e.bundle_files) == [
+            "00000000.app",
+            "00000000.h3",
+            "title.cert",
+            "title.tik",
+            "title.tmd",
+        ]
+
+    def test_wiiu_loadiine_folder_is_a_bundle(self, tmp_path):
+        """A decrypted ``code``/``content``/``meta`` layout is a bundle too,
+        even without a ``title.tmd``.
+        """
+        from app.services import rom_db, rom_scanner
+
+        rom_db.init_db(tmp_path)
+        rom_dir = tmp_path / "roms"
+
+        game = rom_dir / "wiiu" / "Splatoon"
+        for sub in ("code", "content", "meta"):
+            (game / sub).mkdir(parents=True)
+        (game / "code" / "Splatoon.rpx").write_bytes(b"r" * 512)
+        (game / "content" / "data.bin").write_bytes(b"d" * 256)
+        (game / "meta" / "meta.xml").write_bytes(b"<menu/>")
+
+        catalog = rom_scanner.RomCatalog()
+        catalog.scan(rom_dir, use_crc32=False)
+
+        entries = catalog.list_by_system("WIIU")
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.is_bundle is True
+        assert e.name == "Splatoon"
+        # No embedded title id → falls back to the slug namespace.
+        assert e.title_id == "WIIU_splatoon"
+        assert sorted(f["name"] for f in e.bundle_files) == [
+            "code/Splatoon.rpx",
+            "content/data.bin",
+            "meta/meta.xml",
+        ]
+
+    def test_wiiu_single_file_images_and_archives(self, tmp_path):
+        """``.wua``/``.wud``/``.wux`` and zipped dumps stay single entries,
+        and a zip that lives *inside* a WUP folder is owned by the bundle.
+        """
+        from app.services import rom_db, rom_scanner
+
+        rom_db.init_db(tmp_path)
+        rom_dir = tmp_path / "roms"
+        wiiu = rom_dir / "wiiu"
+        wiiu.mkdir(parents=True)
+
+        (wiiu / "Bayonetta 2 [0005000010157F00].wua").write_bytes(b"w" * 1024)
+        (wiiu / "Xenoblade Chronicles X.wux").write_bytes(b"x" * 2048)
+        (wiiu / "Pikmin 3 [0005000010144F00].zip").write_bytes(b"z" * 512)
+
+        catalog = rom_scanner.RomCatalog()
+        catalog.scan(rom_dir, use_crc32=False)
+
+        entries = {e.filename: e for e in catalog.list_by_system("WIIU")}
+        assert len(entries) == 3
+        assert all(not e.is_bundle for e in entries.values())
+
+        wua = entries["Bayonetta 2 [0005000010157F00].wua"]
+        assert wua.title_id == "0005000010157F00"
+
+        zipped = entries["Pikmin 3 [0005000010144F00].zip"]
+        assert zipped.title_id == "0005000010144F00"
+
+        # No title id in the name → DAT slug namespace, name keeps the stem.
+        wux = entries["Xenoblade Chronicles X.wux"]
+        assert wux.title_id.startswith("WIIU_")
+        assert wux.name == "Xenoblade Chronicles X"
+
+    def test_wiiu_title_id_split_helper(self):
+        """The id parser tolerates brackets, parens, archive suffixes and
+        rejects 16-hex runs outside the Wii U ``0005`` space.
+        """
+        from app.services.rom_scanner import _wiiu_split_title_id
+
+        assert _wiiu_split_title_id("Game [0005000010145C00].zip") == (
+            "0005000010145C00",
+            "Game",
+        )
+        assert _wiiu_split_title_id("Game (0005000E10145C00).wud.zip") == (
+            "0005000E10145C00",
+            "Game",
+        )
+        assert _wiiu_split_title_id("0005000010145C00") == (
+            "0005000010145C00",
+            "",
+        )
+        # A CRC-ish 16-hex run that isn't a Wii U title id is left alone.
+        assert _wiiu_split_title_id("Game [DEADBEEFCAFEBABE].wud") == (
+            "",
+            "Game [DEADBEEFCAFEBABE]",
+        )
+
+    def test_wiiu_wup_advertises_cemu_formats_but_no_default(
+        self, tmp_path, client, auth_headers
+    ):
+        """A WUP bundle offers loadiine/wua to emulator clients, but has no
+        preferred ``extract_format`` — the plain download must stay the raw
+        encrypted ZIP that real Wii U hardware installs.
+        """
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+
+        original = settings.rom_dir
+        try:
+            rom_db.init_db(settings.save_dir)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+
+            wup = rom_dir / "wiiu" / "Bayonetta 2 [0005000010172600]"
+            wup.mkdir(parents=True)
+            (wup / "00000000.app").write_bytes(b"ENCRYPTED")
+            (wup / "title.tmd").write_bytes(b"TMD")
+            (wup / "title.tik").write_bytes(b"TIK")
+
+            rom_scanner.init(rom_dir)
+
+            resp = client.get("/api/v1/roms?system=WIIU", headers=auth_headers)
+            assert resp.status_code == 200
+            rom = resp.json()["roms"][0]
+            assert rom["extract_formats"] == ["loadiine", "wua"]
+            assert "extract_format" not in rom
+
+            # No ?extract → raw WUP ZIP, converter never consulted.
+            raw = client.get(
+                f"/api/v1/roms/{rom['rom_id']}", headers=auth_headers
+            )
+            assert raw.status_code == 200
+            with zipfile.ZipFile(io.BytesIO(raw.content)) as zf:
+                assert sorted(zf.namelist()) == [
+                    "00000000.app",
+                    "title.tik",
+                    "title.tmd",
+                ]
+                assert zf.read("00000000.app") == b"ENCRYPTED"
+        finally:
+            settings.rom_dir = original
+            rom_scanner._catalog = None
+
+    def test_wiiu_loadiine_extract_runs_the_decrypter(
+        self, tmp_path, client, auth_headers
+    ):
+        """``?extract=loadiine`` runs the configured command and zips the
+        code/content/meta tree it produced.
+        """
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+
+        original_dir = settings.rom_dir
+        original_cmd = settings.rom_wiiu_loadiine_command
+        original_cwd = settings.rom_wiiu_cwd
+        try:
+            rom_db.init_db(settings.save_dir)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+            settings.rom_wiiu_cwd = ""
+            # Stub CDecrypt: reads the .app from {input}, writes a decrypted
+            # tree under {output_dir}.
+            settings.rom_wiiu_loadiine_command = json.dumps(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; import sys; "
+                        "src, out = Path(sys.argv[1]), Path(sys.argv[2]); "
+                        "(out / 'code').mkdir(parents=True); "
+                        "(out / 'content').mkdir(); (out / 'meta').mkdir(); "
+                        "(out / 'code' / 'app.rpx').write_bytes("
+                        "b'DEC:' + (src / '00000000.app').read_bytes()); "
+                        "(out / 'meta' / 'meta.xml').write_bytes(b'<menu/>')"
+                    ),
+                    "{input}",
+                    "{output_dir}",
+                ]
+            )
+
+            wup = rom_dir / "wiiu" / "Bayonetta 2 [0005000010172600]"
+            wup.mkdir(parents=True)
+            (wup / "00000000.app").write_bytes(b"ENCRYPTED")
+            (wup / "title.tmd").write_bytes(b"TMD")
+
+            rom_scanner.init(rom_dir)
+            rom_id = rom_scanner.get().list_by_system("WIIU")[0].rom_id
+
+            resp = client.get(
+                f"/api/v1/roms/{rom_id}?extract=loadiine", headers=auth_headers
+            )
+            assert resp.status_code == 200
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                assert zf.read("code/app.rpx") == b"DEC:ENCRYPTED"
+                assert zf.read("meta/meta.xml") == b"<menu/>"
+        finally:
+            settings.rom_dir = original_dir
+            settings.rom_wiiu_loadiine_command = original_cmd
+            settings.rom_wiiu_cwd = original_cwd
+            rom_scanner._catalog = None
+
+    def test_wiiu_already_decrypted_needs_no_converter(
+        self, tmp_path, client, auth_headers
+    ):
+        """A loadiine bundle answers ``?extract=loadiine`` with a plain ZIP
+        even when no decrypt command is configured — there is nothing to
+        decrypt.
+        """
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+
+        original_dir = settings.rom_dir
+        original_cmd = settings.rom_wiiu_loadiine_command
+        try:
+            rom_db.init_db(settings.save_dir)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+            settings.rom_wiiu_loadiine_command = ""
+
+            game = rom_dir / "wiiu" / "Splatoon"
+            for sub in ("code", "content", "meta"):
+                (game / sub).mkdir(parents=True)
+            (game / "code" / "app.rpx").write_bytes(b"RPX")
+            (game / "content" / "data.bin").write_bytes(b"DATA")
+            (game / "meta" / "meta.xml").write_bytes(b"<menu/>")
+
+            rom_scanner.init(rom_dir)
+            rom_id = rom_scanner.get().list_by_system("WIIU")[0].rom_id
+
+            resp = client.get(
+                f"/api/v1/roms/{rom_id}?extract=loadiine", headers=auth_headers
+            )
+            assert resp.status_code == 200
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                assert zf.read("code/app.rpx") == b"RPX"
+        finally:
+            settings.rom_dir = original_dir
+            settings.rom_wiiu_loadiine_command = original_cmd
+            rom_scanner._catalog = None
+
+    def test_wiiu_extract_without_command_returns_503(
+        self, tmp_path, client, auth_headers
+    ):
+        """An encrypted WUP with no configured decrypter returns 503 and
+        names the env var, rather than silently serving unusable bytes.
+        """
+        from app.services import rom_db, rom_scanner
+        from app.config import settings
+
+        original_dir = settings.rom_dir
+        original_cmd = settings.rom_wiiu_loadiine_command
+        try:
+            rom_db.init_db(settings.save_dir)
+            rom_dir = tmp_path / "roms"
+            settings.rom_dir = rom_dir
+            settings.rom_wiiu_loadiine_command = ""
+
+            wup = rom_dir / "wiiu" / "Bayonetta 2 [0005000010172600]"
+            wup.mkdir(parents=True)
+            (wup / "00000000.app").write_bytes(b"ENCRYPTED")
+            (wup / "title.tmd").write_bytes(b"TMD")
+
+            rom_scanner.init(rom_dir)
+            rom_id = rom_scanner.get().list_by_system("WIIU")[0].rom_id
+
+            resp = client.get(
+                f"/api/v1/roms/{rom_id}?extract=loadiine", headers=auth_headers
+            )
+            assert resp.status_code == 503
+            assert "SYNC_ROM_WIIU_LOADIINE_COMMAND" in resp.text
+        finally:
+            settings.rom_dir = original_dir
+            settings.rom_wiiu_loadiine_command = original_cmd
+            rom_scanner._catalog = None
 
     def test_ps1_eboot_extract_route(self, rom_client_ps1_eboot, auth_headers):
         """``GET /api/v1/roms/<id>?extract=eboot`` runs the configured

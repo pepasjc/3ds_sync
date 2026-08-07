@@ -74,6 +74,15 @@ DownloadEntry *downloads_upsert_wbfs_part(DownloadList *list,
                                           uint64_t part_size,
                                           const char *game_dir);
 
+/* Queue one file of a Wii U WUP bundle (.app / .h3 / title.*).  ``game_dir``
+ * is the per-title folder under <install>/; the file keeps its bundle-relative
+ * name so the finished folder is exactly what MCP expects. */
+DownloadEntry *downloads_upsert_wup_file(DownloadList *list,
+                                         const RomEntry *rom,
+                                         const char *rel_name,
+                                         uint64_t file_size,
+                                         const char *game_dir);
+
 bool downloads_remove(DownloadList *list, const char *key);
 DownloadEntry *downloads_next_runnable(DownloadList *list);
 

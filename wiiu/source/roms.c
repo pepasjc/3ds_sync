@@ -23,8 +23,13 @@
 #define GC_DISC_MAGIC 0xC2339F3DU
 
 static char g_sd_root[64]        = SD_ROOT_DEFAULT;
+/* Root that downloaded games are written under.  Equals g_sd_root unless the
+ * user selected USB storage AND a FAT32 drive actually mounted. */
+static char g_storage_root[64]   = SD_ROOT_DEFAULT;
+static bool g_storage_is_usb     = false;
 static char g_games_dir[96]      = DEFAULT_GAMES_DIR;
 static char g_wbfs_dir[96]       = DEFAULT_WBFS_DIR;
+static char g_install_dir[96]    = DEFAULT_INSTALL_DIR;
 static char g_downloads_file[SAVE_DIR_LEN];
 
 static void normalise_folder(char *dst, size_t dst_size, const char *src) {
@@ -40,22 +45,43 @@ void roms_set_target(const SyncState *state) {
         g_sd_root[sizeof(g_sd_root) - 1] = '\0';
     }
     if (state) {
-        normalise_folder(g_games_dir, sizeof(g_games_dir), state->games_dir);
-        normalise_folder(g_wbfs_dir,  sizeof(g_wbfs_dir),  state->wbfs_dir);
+        normalise_folder(g_games_dir,   sizeof(g_games_dir),   state->games_dir);
+        normalise_folder(g_wbfs_dir,    sizeof(g_wbfs_dir),    state->wbfs_dir);
+        normalise_folder(g_install_dir, sizeof(g_install_dir), state->install_dir);
     }
+
+    /* "usb" only takes effect once the FAT32 drive is actually mounted —
+     * otherwise every download would fail at fopen with no explanation.
+     * roms_storage_is_usb() lets the UI show which one won. */
+    g_storage_is_usb = state && !strcasecmp(state->rom_storage, "usb") &&
+                       state->usb_fat_ready;
+    snprintf(g_storage_root, sizeof(g_storage_root), "%s",
+             g_storage_is_usb ? USB_ROOT_DEFAULT : g_sd_root);
+
+    /* The download ledger stays on SD with the rest of the app data: it must
+     * survive the USB drive being unplugged mid-queue. */
     snprintf(g_downloads_file, sizeof(g_downloads_file),
              "%s%s/downloads.dat", g_sd_root, APP_DATA_SUBDIR);
 }
 
 const char *roms_downloads_file(void) { return g_downloads_file; }
 
+bool roms_storage_is_usb(void) { return g_storage_is_usb; }
+
+const char *roms_storage_root(void) { return g_storage_root; }
+
 const char *roms_games_dir(char *out, size_t out_size) {
-    snprintf(out, out_size, "%s%s", g_sd_root, g_games_dir);
+    snprintf(out, out_size, "%s%s", g_storage_root, g_games_dir);
     return out;
 }
 
 const char *roms_wbfs_dir(char *out, size_t out_size) {
-    snprintf(out, out_size, "%s%s", g_sd_root, g_wbfs_dir);
+    snprintf(out, out_size, "%s%s", g_storage_root, g_wbfs_dir);
+    return out;
+}
+
+const char *roms_install_dir(char *out, size_t out_size) {
+    snprintf(out, out_size, "%s%s", g_storage_root, g_install_dir);
     return out;
 }
 
@@ -185,6 +211,8 @@ static bool parse_catalog_page(const char *scratch_buf, int n,
         if (v) extract_u64(v, obj_end, &e->size);
         v = find_key(p + 1, obj_end, "extract_format");
         if (v) extract_str(v, obj_end, e->extract_format, sizeof(e->extract_format));
+        v = find_key(p + 1, obj_end, "is_bundle");
+        if (v) e->is_bundle = (*skip_ws(v) == 't');
 
         if (!e->name[0] && e->filename[0])
             strncpy(e->name, e->filename, sizeof(e->name) - 1);
@@ -267,6 +295,9 @@ void roms_ensure_target_dirs(void) {
     roms_mkdir_p(dir);
     roms_wbfs_dir(dir, sizeof(dir));
     roms_mkdir_p(dir);
+    roms_install_dir(dir, sizeof(dir));
+    roms_mkdir_p(dir);
+    /* App data always on SD, never on the removable storage root. */
     snprintf(dir, sizeof(dir), "%s%s", g_sd_root, APP_DATA_SUBDIR);
     roms_mkdir_p(dir);
     roms_games_dir(dir, sizeof(dir));
@@ -343,6 +374,27 @@ int roms_install_gc_iso(const char *staging_path, char *msg, size_t msg_size) {
     }
     snprintf(msg, msg_size, "Installed %s", id6);
     return 0;
+}
+
+void roms_wup_game_dir(const char *name, char *out, size_t out_size) {
+    char clean[MAX_TITLE_LEN];
+    sanitise(name && name[0] ? name : "title", clean, sizeof(clean));
+    if (strlen(clean) > 80) clean[80] = '\0';
+
+    char root[SAVE_DIR_LEN];
+    roms_install_dir(root, sizeof(root));
+    snprintf(out, out_size, "%s/%s", root, clean);
+}
+
+bool roms_is_wup_dir(const char *dir) {
+    if (!dir || !dir[0]) return false;
+    char probe[SAVE_DIR_LEN];
+    struct stat st;
+    snprintf(probe, sizeof(probe), "%s/title.tmd", dir);
+    if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) return true;
+    /* Some dumps use the uppercase names WUP Installer also accepts. */
+    snprintf(probe, sizeof(probe), "%s/TITLE.TMD", dir);
+    return stat(probe, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 void roms_wbfs_game_dir(const char *name, const char *id6,
@@ -441,6 +493,45 @@ static void scan_wbfs_dir(LocalRomList *out) {
     closedir(d);
 }
 
+/* Wii U WUP folders staged for MCP install: <install>/<Name>/title.tmd */
+static void scan_install_dir(LocalRomList *out) {
+    char root[SAVE_DIR_LEN];
+    roms_install_dir(root, sizeof(root));
+
+    DIR *d = opendir(root);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && out->count < LOCAL_ROMS_MAX) {
+        if (de->d_name[0] == '.') continue;
+
+        char sub[SAVE_DIR_LEN];
+        snprintf(sub, sizeof(sub), "%s/%s", root, de->d_name);
+        struct stat st;
+        if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        /* A folder still downloading has no title.tmd yet, so this doubles
+         * as the "ready to install" filter. */
+        if (!roms_is_wup_dir(sub)) continue;
+
+        push_local(out, de->d_name, "title.tmd", sub, "WIIU");
+    }
+    closedir(d);
+}
+
+void roms_scan_installable(LocalRomList *out) {
+    if (!out) return;
+    out->count = 0;
+    out->last_error[0] = '\0';
+
+    scan_install_dir(out);
+
+    if (out->count == 0) {
+        char root[SAVE_DIR_LEN];
+        roms_install_dir(root, sizeof(root));
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "No WUP folders under %s", root);
+    }
+}
+
 void roms_scan_local(LocalRomList *out) {
     if (!out) return;
     out->count = 0;
@@ -448,6 +539,7 @@ void roms_scan_local(LocalRomList *out) {
 
     scan_games_dir(out);
     scan_wbfs_dir(out);
+    scan_install_dir(out);
 
     if (out->count > 0) out->last_error[0] = '\0';
     else if (out->last_error[0] == '\0')

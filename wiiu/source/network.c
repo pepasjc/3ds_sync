@@ -319,6 +319,73 @@ int network_fetch_wbfs_manifest(const SyncState *state, const char *rom_id,
     return 0;
 }
 
+int network_fetch_bundle_manifest(const SyncState *state, const char *rom_id,
+                                  char *scratch, uint32_t scratch_size,
+                                  BundleManifest *out) {
+    if (!state || !rom_id || !out || !scratch) return -1;
+    memset(out, 0, sizeof(*out));
+
+    char path[256];
+    snprintf(path, sizeof(path), "/api/v1/roms/%s/manifest", rom_id);
+
+    HttpRequest req = {0};
+    req.server_url = state->server_url;
+    req.api_key    = state->api_key;
+    req.console_id = state->console_id;
+    req.path       = path;
+    req.method     = "GET";
+
+    int status = 0;
+    int n = http_get_buf(&req, (uint8_t *)scratch, scratch_size, &status);
+    if (n < 0 || status != 200) {
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "manifest failed (HTTP %d, n=%d)", status, n);
+        return -1;
+    }
+
+    json_copy_string(scratch, "name", out->name, sizeof(out->name));
+
+    /* files: [ {"name": "00000000.app", "size": N}, ... ].  A WUP set is
+     * 20-50 entries; anything past BUNDLE_MAX_FILES is reported rather than
+     * silently truncated, because a partial install is worse than none. */
+    const char *p = strstr(scratch, "\"files\"");
+    if (p) p = strchr(p, '[');
+    while (p) {
+        p = strchr(p, '{');
+        if (!p) break;
+        const char *obj_end = strchr(p, '}');
+        if (!obj_end) break;
+
+        size_t len = (size_t)(obj_end - p) + 1;
+        char obj[512];
+        if (len >= sizeof(obj)) len = sizeof(obj) - 1;
+        memcpy(obj, p, len);
+        obj[len] = '\0';
+
+        if (out->file_count >= BUNDLE_MAX_FILES) {
+            snprintf(out->last_error, sizeof(out->last_error),
+                     "bundle has more than %d files", BUNDLE_MAX_FILES);
+            return -1;
+        }
+
+        BundleFile *bf = &out->files[out->file_count];
+        if (json_copy_string(obj, "name", bf->name, sizeof(bf->name)) == 0) {
+            const char *sv = json_value_start(obj, "size");
+            bf->size = sv ? strtoull(sv, NULL, 10) : 0;
+            out->total_size += bf->size;
+            out->file_count++;
+        }
+        p = obj_end + 1;
+    }
+
+    if (out->file_count == 0) {
+        snprintf(out->last_error, sizeof(out->last_error),
+                 "manifest returned no files");
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- smart sync ---- */
 
 void sync_plan_free(SyncPlan *p) {

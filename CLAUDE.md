@@ -164,6 +164,14 @@ Clients pick whichever fits their platform; all land in the same storage.
 | **GC card / GCI** | `/saves/{tid}/gc-card` | GC, Android (Dolphin) |
 | **VMC import** | `POST /saves/{ps1,ps2,gc}-vmc/import` | desktop, PS2 |
 
+Wii U ROMs are folder-shaped: an encrypted WUP/NUS set (`title.tmd` + `.app`)
+or a decrypted loadiine tree (`code`/`content`/`meta`). Both scan as bundles, and
+a title id embedded in the folder name (`Game [0005000010145C00]`) becomes the
+catalog `title_id` so a ROM and its save share one key. Real hardware installs
+the encrypted set as-is; Cemu cannot, so `?extract=loadiine` / `?extract=wua`
+shell out to an operator-configured decrypter (`SYNC_ROM_WIIU_*_COMMAND`, e.g.
+CDecrypt). GameSync ships neither the tool nor the Wii U common key.
+
 Bundle format (`server/app/services/bundle.py`): magic `3DSS`, version, title_id
 (u64 BE), timestamp (u32 LE), file count, total size, file table, file data.
 v2 zlib-compresses the payload and stores `uncompressed_size` last — this is what
@@ -262,7 +270,12 @@ the PS2's ACK-based SIO2.
 `nocopy/` is excluded by design (console-bound). Wii U saves are per-account: the
 bundle carries `user/common/` plus `user/<persistentId>/` verbatim. Under Cemu
 only the UI/network/config paths work; anything touching SLC/MLC needs real
-hardware.
+hardware. Catalog downloads land on SD or a FAT32 USB drive (`rom_storage=sd|usb`
+mounts `/dev/usb01` at `/vol/usb` — a *different* device from the WFS
+`storage_usb01:` that holds saves); app data always stays on SD. Wii U titles
+download as WUP folders under `<root>/install/<Name>/` and install through MCP
+(`install_target=mlc|usb`) — MCP wants an FSA path (`/vol/external01/...`), never
+a devoptab path, and its structs must be heap-allocated at 0x40 alignment.
 
 **PS3** — `PARAM.PFD` resigning and per-file save decryption via PolarSSL.
 Per-game `secure_file_id` keys come from `ps3/data/games.conf` (Apollo Save Tool

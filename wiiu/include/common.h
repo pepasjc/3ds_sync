@@ -44,9 +44,23 @@
 #define SD_ROOT_DEFAULT     "fs:/vol/external01"
 #define APP_DATA_SUBDIR     "/3dssync"
 
+/*
+ * Downloaded games may live on the SD card or on a FAT32 USB drive.  App data
+ * (config, state, hash cache) always stays on SD — it is small, and the SD is
+ * the only storage guaranteed to be present.
+ *
+ * The FAT32 USB root is a devoptab libmocha registers for us when
+ * natives_mount_usb_fat() succeeds.  It is NOT the same device as
+ * ``storage_usb01:``: that one is the console's own WFS-formatted drive,
+ * which holds Wii U *saves* and cannot carry a /games or /wbfs folder.
+ */
+#define USB_ROOT_DEFAULT    "usb:"
+#define USB_FAT_NAME        "usb"
+
 #define DEFAULT_NIN_SAVES_DIR "/saves"    /* Nintendont memcard images */
 #define DEFAULT_GAMES_DIR     "/games"    /* Nintendont GC ISOs */
 #define DEFAULT_WBFS_DIR      "/wbfs"     /* USB-loader Wii games */
+#define DEFAULT_INSTALL_DIR   "/install"  /* WUP folders for MCP install */
 
 /* Top-level views.  L/R cycle in order. */
 typedef enum {
@@ -76,6 +90,20 @@ typedef struct {
     char nin_saves_dir[96];       /* Nintendont memcard folder, "/saves" */
     char games_dir[96];           /* GC ISO folder, "/games" */
     char wbfs_dir[96];            /* Wii WBFS folder, "/wbfs" */
+    char install_dir[96];         /* WUP staging folder, "/install" */
+
+    /* Where downloaded games land: "sd" or "usb".  App data ignores this and
+     * always uses sd_root.  Selecting "usb" with no FAT32 drive attached
+     * falls back to SD rather than failing every download — usb_fat_ready
+     * says which one is actually in use. */
+    char rom_storage[8];
+    bool usb_fat_ready;           /* FAT32 USB mounted as "usb:" */
+    char usb_fat_error[96];
+
+    /* Where MCP installs a Wii U title: "mlc" (internal NAND) or "usb"
+     * (the console's own WFS-formatted USB drive).  Independent of
+     * rom_storage, which only says where the WUP folder was staged. */
+    char install_target[8];
 
     /* Smart-sync toggles. */
     bool sync_vwii;

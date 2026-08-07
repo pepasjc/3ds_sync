@@ -553,6 +553,23 @@ class SyncClient:
             stem = Path(filename).stem
             return f"{stem}.iso", "iso"
 
+        if system_up == "WIIU":
+            # Wii U catalog rows are WUP folders: AES-encrypted .app contents
+            # that real hardware installs but Cemu cannot read.  Ask the
+            # server for the decrypted code/content/meta tree, which it
+            # returns as a ZIP the bundle path extracts into a per-game
+            # folder.  An already-decrypted library answers the same request
+            # with a plain bundle ZIP, so one code path covers both.
+            advertised = [
+                str(v).strip().lower()
+                for v in (rom.get("extract_formats") or [])
+                if str(v).strip()
+            ]
+            if "loadiine" in advertised:
+                return f"{Path(filename).stem}.zip", "loadiine"
+            # Single-file .wua/.wud/.wux libraries need no conversion.
+            return filename, None
+
         extract = str(rom.get("extract_format") or "").strip().lower() or None
         return filename, extract
 

@@ -52,6 +52,9 @@ static void config_apply_defaults(SyncState *state) {
     strncpy(state->nin_saves_dir, DEFAULT_NIN_SAVES_DIR, sizeof(state->nin_saves_dir) - 1);
     strncpy(state->games_dir, DEFAULT_GAMES_DIR, sizeof(state->games_dir) - 1);
     strncpy(state->wbfs_dir, DEFAULT_WBFS_DIR, sizeof(state->wbfs_dir) - 1);
+    strncpy(state->install_dir, DEFAULT_INSTALL_DIR, sizeof(state->install_dir) - 1);
+    strncpy(state->rom_storage, "sd", sizeof(state->rom_storage) - 1);
+    strncpy(state->install_target, "usb", sizeof(state->install_target) - 1);
     state->sync_vwii = true;
     state->sync_wiiu = true;
     strncpy(state->exit_mode, "full", sizeof(state->exit_mode) - 1);
@@ -106,6 +109,18 @@ static void parse_config_text(SyncState *state, char *text) {
                     copy_folder(state->games_dir, sizeof(state->games_dir), val);
                 } else if (!strcmp(key, "wbfs_dir") || !strcmp(key, "wbfs_folder")) {
                     copy_folder(state->wbfs_dir, sizeof(state->wbfs_dir), val);
+                } else if (!strcmp(key, "install_dir") || !strcmp(key, "install_folder")) {
+                    copy_folder(state->install_dir, sizeof(state->install_dir), val);
+                } else if (!strcmp(key, "rom_storage")) {
+                    if (!strcasecmp(val, "sd") || !strcasecmp(val, "usb")) {
+                        strncpy(state->rom_storage, val, sizeof(state->rom_storage) - 1);
+                        state->rom_storage[sizeof(state->rom_storage) - 1] = '\0';
+                    }
+                } else if (!strcmp(key, "install_target")) {
+                    if (!strcasecmp(val, "mlc") || !strcasecmp(val, "usb")) {
+                        strncpy(state->install_target, val, sizeof(state->install_target) - 1);
+                        state->install_target[sizeof(state->install_target) - 1] = '\0';
+                    }
                 } else if (!strcmp(key, "sync_vwii")) {
                     bool en; if (parse_bool_value(val, &en)) state->sync_vwii = en;
                 } else if (!strcmp(key, "sync_wiiu")) {
@@ -135,6 +150,12 @@ static void format_config_text(const SyncState *state, char *out, size_t out_siz
              "nintendont_saves_dir=%s\n"
              "games_dir=%s\n"
              "wbfs_dir=%s\n"
+             "install_dir=%s\n"
+             "# rom_storage: sd | usb  (where downloaded games are written;\n"
+             "# usb means a FAT32 drive, not the console's own WFS drive)\n"
+             "rom_storage=%s\n"
+             "# install_target: mlc | usb  (where MCP installs a Wii U title)\n"
+             "install_target=%s\n"
              "sync_vwii=%s\n"
              "sync_wiiu=%s\n"
              "# exit_mode: full | minimal | relaunch | none\n"
@@ -142,6 +163,9 @@ static void format_config_text(const SyncState *state, char *out, size_t out_siz
              "%s%s%s",
              state->server_url, state->api_key,
              state->nin_saves_dir, state->games_dir, state->wbfs_dir,
+             state->install_dir,
+             state->rom_storage[0] ? state->rom_storage : "sd",
+             state->install_target[0] ? state->install_target : "usb",
              state->sync_vwii ? "true" : "false",
              state->sync_wiiu ? "true" : "false",
              state->exit_mode[0] ? state->exit_mode : "full",

@@ -219,6 +219,35 @@ DownloadEntry *downloads_upsert_wbfs_part(DownloadList *list,
     return e;
 }
 
+DownloadEntry *downloads_upsert_wup_file(DownloadList *list,
+                                         const RomEntry *rom,
+                                         const char *rel_name,
+                                         uint64_t file_size,
+                                         const char *game_dir) {
+    if (!list || !rom || !rel_name || !game_dir) return NULL;
+
+    char key[DOWNLOAD_KEY_LEN];
+    snprintf(key, sizeof(key), "%s#%s", rom->rom_id, rel_name);
+
+    DownloadEntry *e = upsert(list, key);
+    if (!e) return NULL;
+
+    strncpy(e->rom_id,   rom->rom_id, sizeof(e->rom_id)   - 1);
+    strncpy(e->filename, rel_name,    sizeof(e->filename) - 1);
+    snprintf(e->name, sizeof(e->name), "%s (%s)", rom->name, rel_name);
+    strncpy(e->system, "WIIU", sizeof(e->system) - 1);
+    e->extract_format[0] = '\0';
+    /* No post-download action: the folder becomes installable only once
+     * every file has landed, which the install view checks for itself by
+     * looking for title.tmd.  Auto-installing per file would be wrong. */
+    e->install = DL_INSTALL_NONE;
+    e->total   = file_size;
+    snprintf(e->url_path, sizeof(e->url_path),
+             "/api/v1/roms/%s/file/%s", rom->rom_id, rel_name);
+    snprintf(e->target_path, sizeof(e->target_path), "%s/%s", game_dir, rel_name);
+    return e;
+}
+
 bool downloads_remove(DownloadList *list, const char *key) {
     if (!list || !key) return false;
     for (int i = 0; i < list->count; i++) {

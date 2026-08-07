@@ -74,6 +74,33 @@ int network_fetch_wbfs_manifest(const SyncState *state, const char *rom_id,
                                 char *scratch, uint32_t scratch_size,
                                 WbfsManifest *out);
 
+/* ---- bundle manifest (Wii U WUP folders) ---- */
+
+/* A WUP set is one .app (+ .h3) per content plus title.tmd/tik/cert.  Real
+ * dumps run 20-50 files; 128 leaves headroom for titles with DLC/update
+ * contents merged in without letting a bad manifest blow the stack. */
+#define BUNDLE_MAX_FILES 128
+
+typedef struct {
+    char     name[128];        /* path relative to the bundle root */
+    uint64_t size;
+} BundleFile;
+
+typedef struct {
+    char       name[MAX_TITLE_LEN];
+    int        file_count;
+    uint64_t   total_size;
+    BundleFile files[BUNDLE_MAX_FILES];
+    char       last_error[160];
+} BundleManifest;
+
+/* GET /api/v1/roms/{rom_id}/manifest — the file list for a bundle entry.
+ * Each file is then fetched from /roms/{rom_id}/file/<name>, so a 15 GB Wii U
+ * title downloads incrementally and resumably instead of as one ZIP. */
+int network_fetch_bundle_manifest(const SyncState *state, const char *rom_id,
+                                  char *scratch, uint32_t scratch_size,
+                                  BundleManifest *out);
+
 /* ---- smart sync (vWii / Wii U) ---- */
 
 #define SYNC_MAX_TITLES SAVE_MAX_TITLES

@@ -4,17 +4,27 @@
 #include "common.h"
 
 /*
- * ROM catalog client.  Two systems are downloadable on a Wii U:
+ * ROM catalog client.  Three systems are downloadable on a Wii U:
  *
- *   GC   — Nintendont layout:  sd:/games/<GAMEID6>/game.iso
+ *   GC   — Nintendont layout:  <root>/games/<GAMEID6>/game.iso
  *          The catalog does not expose the disc's game code, so the download
  *          lands on a temporary name and is moved into place once the ISO
  *          header is readable (see roms_gameid_from_iso).
  *
- *   WII  — USB-loader layout:  sd:/wbfs/<Name> [ID6]/<ID6>.wbfs (+ .wbf1)
+ *   WII  — USB-loader layout:  <root>/wbfs/<Name> [ID6]/<ID6>.wbfs (+ .wbf1)
  *          The server converts RVZ -> ISO -> split WBFS and advertises the
  *          parts through /roms/{id}/wbfs-manifest; each part becomes its own
  *          resumable download entry.
+ *
+ *   WIIU — WUP layout:         <root>/install/<Name>/{*.app,*.h3,title.*}
+ *          Server-side these are bundle entries; each file is fetched
+ *          individually through /roms/{id}/file/<rel> so a 15 GB title never
+ *          has to be zipped or unzipped on the console.  Once complete the
+ *          folder is handed to MCP (see install.h), which writes it to NAND
+ *          or the console's WFS USB drive.
+ *
+ * <root> is the SD card or a FAT32 USB drive, per ``rom_storage`` in the
+ * config — see roms_storage_root().  App data always stays on SD.
  */
 
 #define ROM_CATALOG_MAX 2048
@@ -24,11 +34,14 @@ typedef struct {
     char     rom_id[ROM_ID_LEN];
     char     filename[160];
     char     name[MAX_TITLE_LEN];
-    char     system[8];          /* "GC" / "WII" */
+    char     system[8];          /* "GC" / "WII" / "WIIU" */
     uint64_t size;
     /* Server extract hint. RVZ entries advertise a format we pass back as
      * ?extract=<fmt> to get an ISO. Empty = raw download. */
     char     extract_format[8];
+    /* Bundle entries (Wii U WUP folders) are downloaded file-by-file rather
+     * than as one blob — see network_fetch_bundle_manifest. */
+    bool     is_bundle;
 } RomEntry;
 
 typedef struct {
@@ -49,10 +62,26 @@ const char *roms_preferred_extract_format(const RomEntry *rom);
 /* Target/storage config (set at boot and whenever the folders change). */
 void roms_set_target(const SyncState *state);
 const char *roms_downloads_file(void);
-const char *roms_games_dir(char *out, size_t out_size);   /* "<sd>/games" */
-const char *roms_wbfs_dir(char *out, size_t out_size);    /* "<sd>/wbfs"  */
+
+/* Root that game downloads are written under: the SD card, or "usb:" when
+ * the user picked USB storage AND a FAT32 drive mounted.  Selecting USB with
+ * no drive attached silently stays on SD — roms_storage_is_usb() reports
+ * which one is actually in effect so the UI can say so. */
+const char *roms_storage_root(void);
+bool roms_storage_is_usb(void);
+
+const char *roms_games_dir(char *out, size_t out_size);   /* "<root>/games"   */
+const char *roms_wbfs_dir(char *out, size_t out_size);    /* "<root>/wbfs"    */
+const char *roms_install_dir(char *out, size_t out_size); /* "<root>/install" */
 void roms_ensure_target_dirs(void);
 void roms_mkdir_p(const char *path);
+
+/* Per-title WUP staging folder: <install>/<sanitised name>. */
+void roms_wup_game_dir(const char *name, char *out, size_t out_size);
+
+/* True when ``dir`` holds a title.tmd — i.e. a complete WUP set ready for
+ * MCP.  A folder mid-download does not have one yet. */
+bool roms_is_wup_dir(const char *dir);
 
 /* Staging path for a GC download: <games>/_dl/<sanitised rom_id>.iso.
  * roms_install_gc_iso() moves it to <games>/<GAMEID6>/game.iso afterwards. */
@@ -89,8 +118,11 @@ typedef struct {
     char     last_error[160];
 } LocalRomList;
 
-/* Walk <games>/<GAMEID6>/game.iso (Nintendont) and the .wbfs files under
- * <wbfs>/<dir>/. */
+/* Walk <games>/<GAMEID6>/game.iso (Nintendont), the .wbfs files under
+ * <wbfs>/<dir>/, and the WUP folders under <install>/<dir>/. */
 void roms_scan_local(LocalRomList *out);
+
+/* Only the WUP folders under <install>/ — what the install view lists. */
+void roms_scan_installable(LocalRomList *out);
 
 #endif /* WIIUSYNC_ROMS_H */

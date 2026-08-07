@@ -25,6 +25,15 @@
 int  natives_init(SyncState *state);
 void natives_shutdown(SyncState *state);
 
+/* Mount a FAT32 USB drive as "usb:" so downloaded games can live there
+ * instead of on the SD card.  This is a different device from the WFS
+ * ``storage_usb01:`` mount above — that one is the console's own formatted
+ * drive and holds Wii U saves, not /games or /wbfs folders.
+ *
+ * Called by natives_init(); exposed so the Config view can retry after the
+ * user plugs a drive in.  Fills state->usb_fat_ready / usb_fat_error. */
+bool natives_mount_usb_fat(SyncState *state);
+
 /* ---- vWii ---- */
 
 void vwiisaves_scan(const SyncState *state, SaveTitleList *out);

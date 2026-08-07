@@ -92,6 +92,42 @@ class Settings(BaseSettings):
     # the server returns 503 with a hint pointing at SYNC_ROM_PS1_VCD_COMMAND.
     rom_ps1_vcd_command: str = ""
     rom_ps1_vcd_cwd: str = ""
+    # Optional command templates for decrypting a Wii U WUP/NUS title so
+    # emulators can use it.  A WUP dump (``title.tmd`` + ``title.tik`` +
+    # numbered ``.app`` contents) is AES-encrypted: real hardware installs it
+    # as-is, but Cemu needs either a decrypted ``code``/``content``/``meta``
+    # tree or a ``.wua`` archive.  Placeholders:
+    #   {input}      — the WUP bundle *directory* (not a file)
+    #   {output_dir} — fresh per-request scratch dir; the converter must
+    #                  write its result somewhere underneath
+    #   {output}     — suggested output path (``.wua`` command only)
+    #   {stem}       — bundle folder name
+    #   {title}      — game name (catalog ``name``)
+    #   {title_id}   — 16-hex Wii U title id (catalog ``title_id``)
+    # ``rom_wiiu_loadiine_command`` must leave ``code``/``content``/``meta``
+    # under {output_dir}; the server zips that tree.  ``rom_wiiu_wua_command``
+    # must produce exactly one ``.wua``.
+    #
+    # CDecrypt is the intended decrypter.  Check your build's own usage line
+    # for argument order; the common shape is input-dir then output-dir:
+    #   ["cdecrypt","{input}","{output_dir}"]
+    # Older forks read the Wii U common key from a ``keys.txt`` in the working
+    # directory — point ``rom_wiiu_cwd`` at the folder holding it.  GameSync
+    # does not ship that key and cannot redistribute it.
+    #
+    # ``rom_wiiu_wua_command`` has no widely-available CLI tool behind it:
+    # Cemu converts to .wua from its GUI, not a documented headless flag.
+    # Leave it empty and use loadiine unless you have your own packer — the
+    # clients only request 'loadiine' anyway.
+    #
+    # Both stay empty until configured — until then the server returns 503
+    # with a hint pointing at SYNC_ROM_WIIU_*.
+    rom_wiiu_loadiine_command: str = ""
+    rom_wiiu_wua_command: str = ""
+    # Working directory for the Wii U commands.  CDecrypt resolves its key
+    # file relative to cwd, so this usually points at the folder holding
+    # ``keys.txt``.  When unset we fall back to the per-request scratch dir.
+    rom_wiiu_cwd: str = ""
     api_key: str = "anything"
     host: str = "0.0.0.0"
     port: int = 8000

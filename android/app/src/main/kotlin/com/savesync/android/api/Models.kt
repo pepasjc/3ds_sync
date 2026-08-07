@@ -148,7 +148,10 @@ data class RomEntry(
     @SerializedName("extract_format")
     val extractFormat: String? = null,
     @SerializedName("extract_formats")
-    val extractFormats: List<String> = emptyList()
+    val extractFormats: List<String> = emptyList(),
+    /** True for folder-shaped catalog entries (PS3 packages, Wii U WUP sets). */
+    @SerializedName("is_bundle")
+    val isBundle: Boolean = false
 )
 
 data class RomsResponse(
@@ -206,6 +209,16 @@ fun RomEntry.preferredDownloadExtractFormat(): String? {
         return "iso"
     }
 
+    if (sysUp == "WIIU") {
+        // A Wii U catalog bundle is an AES-encrypted WUP set: real hardware
+        // installs it, Cemu cannot read it.  Ask for the decrypted
+        // code/content/meta tree, which arrives as a ZIP the download
+        // manager unpacks into a folder.  Already-decrypted libraries answer
+        // the same request with a plain bundle ZIP, so this is safe either
+        // way.  Single-file .wua/.wud/.wux entries need no conversion.
+        return if (isBundle) "loadiine" else null
+    }
+
     return null
 }
 
@@ -229,6 +242,10 @@ fun RomEntry.preferredDownloadFilename(extractFormat: String?): String {
         "rvz"           -> "$stem.iso"  // server's rvz → iso conversion
         "gdi"           -> "$stem.gdi"
         "cue"           -> "$stem.cue"
+        // The ZIP is a staging artifact only — DownloadManager unpacks it to
+        // "<stem>/" and deletes it.  Naming it here keeps the .part path and
+        // the extract target derivable from one field.
+        "loadiine"      -> "$stem.zip"
         else            -> filename
     }
 }

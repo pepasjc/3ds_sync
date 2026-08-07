@@ -128,7 +128,38 @@ int natives_init(SyncState *state) {
     state->usb_mounted = mount_verified(USB_NAME, NULL, "/vol/" USB_NAME,
                                         USB_NAME ":/usr", NULL, 0);
 
+    natives_mount_usb_fat(state);
+
     return 0;
+}
+
+bool natives_mount_usb_fat(SyncState *state) {
+    if (!state) return false;
+    state->usb_fat_ready = false;
+    state->usb_fat_error[0] = '\0';
+    if (!state->mocha_ok) {
+        snprintf(state->usb_fat_error, sizeof(state->usb_fat_error),
+                 "mocha not initialised");
+        return false;
+    }
+
+    /* A FAT32 stick shows up as /dev/usb01; a second partition or a second
+     * drive as /dev/usb02.  Unlike the WFS mount above we pass a device path
+     * (CafeOS does not mount FAT32 itself, so there is nothing to attach to)
+     * and probe the root, which every FAT volume has. */
+    static const char *const devices[] = { "/dev/usb01", "/dev/usb02", NULL };
+    char err[96] = "";
+    for (int i = 0; devices[i]; i++) {
+        if (mount_verified(USB_FAT_NAME, devices[i], "/vol/" USB_FAT_NAME,
+                           USB_ROOT_DEFAULT "/", err, sizeof(err))) {
+            state->usb_fat_ready = true;
+            return true;
+        }
+    }
+
+    snprintf(state->usb_fat_error, sizeof(state->usb_fat_error),
+             "%s", err[0] ? err : "no FAT32 USB drive found");
+    return false;
 }
 
 void natives_shutdown(SyncState *state) {
@@ -136,11 +167,13 @@ void natives_shutdown(SyncState *state) {
     if (state->slc_mounted) Mocha_UnmountFS(SLC_NAME);
     if (state->mlc_mounted) Mocha_UnmountFS(MLC_NAME);
     if (state->usb_mounted) Mocha_UnmountFS(USB_NAME);
+    if (state->usb_fat_ready) Mocha_UnmountFS(USB_FAT_NAME);
     Mocha_DeInitLibrary();
     state->mocha_ok = false;
     state->slc_mounted = false;
     state->mlc_mounted = false;
     state->usb_mounted = false;
+    state->usb_fat_ready = false;
 }
 
 /* ---- helpers ---- */

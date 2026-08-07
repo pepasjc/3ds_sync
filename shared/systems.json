@@ -285,6 +285,9 @@
     ".vec",
     ".ws",
     ".wsc",
+    ".wua",
+    ".wud",
+    ".wux",
     ".xdf",
     ".z64",
     ".zip"
@@ -511,6 +514,10 @@
       "Nintendo - Wii",
       "Wii"
     ],
+    "WIIU": [
+      "Nintendo - Wii U",
+      "Wii U"
+    ],
     "BS": [
       "Nintendo - Satellaview",
       "Satellaview",
@@ -660,6 +667,9 @@
     "tg-cd": "PCECD",
     "virtualboy": "VB",
     "wii": "WII",
+    "wiiu": "WIIU",
+    "wii-u": "WIIU",
+    "nintendowiiu": "WIIU",
     "wonderswan": "WSWAN",
     "wonderswancolor": "WSWANC",
     "xbox": "XBOX",

@@ -603,3 +603,47 @@ def test_plan_rom_download_x360_requests_iso():
     )
     assert filename == "Gears of War.iso"
     assert extract == "iso"
+
+
+# ---------------------------------------------------------------------------
+# plan_rom_download — Wii U decryption for Cemu
+# ---------------------------------------------------------------------------
+
+
+def test_plan_rom_download_wiiu_wup_requests_loadiine():
+    """A WUP bundle must be requested decrypted — Cemu cannot read the
+    encrypted .app contents real hardware installs."""
+    client = SyncClient("localhost", 8000, "key")
+    filename, extract = client.plan_rom_download(
+        {
+            "rom_id": "0005000010145C00",
+            "system": "WIIU",
+            "filename": "Super Mario 3D World (USA).zip",
+            "is_bundle": True,
+            "extract_formats": ["loadiine", "wua"],
+        },
+        "WIIU",
+    )
+    assert filename == "Super Mario 3D World (USA).zip"
+    assert extract == "loadiine"
+
+
+def test_plan_rom_download_wiiu_wua_needs_no_conversion():
+    """A single-file .wua library is already Cemu-native."""
+    client = SyncClient("localhost", 8000, "key")
+    filename, extract = client.plan_rom_download(
+        {
+            "rom_id": "0005000010157F00",
+            "system": "WIIU",
+            "filename": "Bayonetta 2.wua",
+        },
+        "WIIU",
+    )
+    assert filename == "Bayonetta 2.wua"
+    assert extract is None
+
+
+def test_rom_target_wiiu_folder(tmp_path):
+    assert resolve_rom_target_dir(tmp_path, "WIIU") == tmp_path / "wiiu"
+    (tmp_path / "Wii U").mkdir()
+    assert resolve_rom_target_dir(tmp_path, "WIIU") == tmp_path / "Wii U"

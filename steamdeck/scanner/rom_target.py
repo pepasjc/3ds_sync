@@ -45,6 +45,10 @@ SYSTEM_ROM_DIRS: dict[str, list[str]] = {
     "N64":    ["n64", "N64", "Nintendo 64", "Nintendo64"],
     "GC":     ["gc", "GC", "GameCube", "Nintendo GameCube"],
     "WII":    ["wii", "Wii"],
+    # Cemu reads a decrypted game as a folder, so a Wii U "ROM" is a
+    # directory (code/content/meta) rather than a file.  Same candidate
+    # ordering rules apply.
+    "WIIU":   ["wiiu", "WIIU", "Wii U", "WiiU"],
     "NDS":    ["nds", "NDS", "DS", "Nintendo DS"],
     "3DS":    ["3ds", "n3ds", "Nintendo 3DS"],
     "VB":     ["virtualboy", "VB", "Virtual Boy"],

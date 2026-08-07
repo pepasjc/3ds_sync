@@ -10,16 +10,19 @@ class RomEntryDownloadPolicyTest {
         system: String,
         extractFormat: String? = null,
         extractFormats: List<String> = emptyList(),
+        isBundle: Boolean = false,
+        filename: String = "Example.rom",
     ) = RomEntry(
         rom_id = "rom-1",
         title_id = "title-1",
         system = system,
         name = "Example",
-        filename = "Example.rom",
-        path = "Example.rom",
+        filename = filename,
+        path = filename,
         size = 123,
         extractFormat = extractFormat,
         extractFormats = extractFormats,
+        isBundle = isBundle,
     )
 
     @Test
@@ -28,6 +31,9 @@ class RomEntryDownloadPolicyTest {
             system = "3DS",
             extractFormat = "3ds",
             extractFormats = listOf("cia", "decrypted_cci"),
+            // The policy only converts sources it can convert (.3ds/.cci/
+            // .zip); the generic "Example.rom" fixture is not one of them.
+            filename = "Example.3ds",
         )
 
         assertEquals("decrypted_cci", entry.preferredDownloadExtractFormat())
@@ -70,5 +76,27 @@ class RomEntryDownloadPolicyTest {
             extractFormats = listOf("cci", "iso", "folder"),
         )
         assertEquals("iso", entry.preferredDownloadExtractFormat())
+    }
+
+    @Test
+    fun `Wii U WUP bundle requests the decrypted loadiine tree`() {
+        val entry = rom(
+            system = "WIIU",
+            extractFormats = listOf("loadiine", "wua"),
+            isBundle = true,
+            filename = "Super Mario 3D World (USA).zip",
+        )
+        assertEquals("loadiine", entry.preferredDownloadExtractFormat())
+        assertEquals(
+            "Super Mario 3D World (USA).zip",
+            entry.preferredDownloadFilename("loadiine"),
+        )
+    }
+
+    @Test
+    fun `Wii U single-file image needs no conversion`() {
+        val entry = rom(system = "WIIU", filename = "Bayonetta 2.wua")
+        assertNull(entry.preferredDownloadExtractFormat())
+        assertEquals("Bayonetta 2.wua", entry.preferredDownloadFilename(null))
     }
 }

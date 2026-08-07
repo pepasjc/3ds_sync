@@ -49,6 +49,17 @@ a ``.iso``, is collapsed into one catalog entry.  By default the bundle is
 served as a ZIP; clients can request ``?extract=iso`` to get just the disc
 image (converted from CCI or streamed directly if already ISO).  Loose
 top-level ``.iso`` files remain single-file entries.
+
+Wii U bundles
+-------------
+Wii U titles ship either as an installable WUP/NUS folder (``title.tmd`` +
+``title.tik`` + numbered ``.app`` contents) or as a decrypted loadiine
+layout (``code``/``content``/``meta``).  Both collapse into a single bundle
+entry so a console client can fetch one file at a time.  Single-file
+emulator images (``.wua``, ``.wud``, ``.wux``) and archives wrapping either
+layout stay individual entries.  When the name embeds a Wii U title id —
+``Super Mario 3D World [0005000010145C00]`` — that id becomes the catalog
+``title_id``, matching the key Wii U *saves* are stored under.
 """
 
 import binascii
@@ -112,6 +123,27 @@ _PS1_BUNDLE_COMPANION_EXTS = frozenset({
 _XBOX_BUNDLE_TRIGGER_EXTS = frozenset({".cci"})
 _XBOX_BUNDLE_XBE_NAME = "default.xbe"
 _XBOX_FILE_EXTS = frozenset({".iso", ".cci"})
+
+# Wii U titles arrive in three shapes:
+#   * WUP / NUS installable set — ``title.tmd`` + ``title.tik`` + ``title.cert``
+#     alongside numbered ``.app`` contents (and ``.h3`` hash trees).  This is
+#     what WUP Installer GX2 writes to a real console.
+#   * Decrypted "loadiine" layout — ``code/`` + ``content/`` + ``meta/``.
+#   * A single emulator image — ``.wua`` (Cemu archive), ``.wud``/``.wux``
+#     disc dump, or a ``.zip`` wrapping either folder layout.
+# The two folder layouts become bundles so a console client can pull one
+# ``.app`` at a time via ``/roms/{id}/file/...`` instead of a multi-GB ZIP.
+# Layout reference: https://wiiubrew.org/wiki/Title_metadata
+_WIIU_WUP_MARKER = "title.tmd"
+_WIIU_LOADIINE_DIRS = ("code", "content", "meta")
+_WIIU_FILE_EXTS = frozenset({".wua", ".wud", ".wux", ".iso", ".zip", ".7z", ".rar"})
+
+# Wii U title ids are 16 hex chars in the 0005xxxx space (0005000010… retail
+# game, 0005000E… update, 0005000C… DLC).  Requiring the ``0005`` prefix stops
+# a stray CRC or hash in a filename from being mistaken for a title id.
+_WIIU_TITLE_ID_RE = re.compile(
+    r"(?<![0-9A-Fa-f])(0005[0-9A-Fa-f]{12})(?![0-9A-Fa-f])"
+)
 
 
 class RomEntry:
@@ -297,6 +329,63 @@ def _lookup_filename(file_path: Path) -> str:
     return file_path.name
 
 
+def _wiiu_split_title_id(raw_name: str) -> tuple[str, str]:
+    """Split ``Super Mario 3D World [0005000010145C00]`` into (id, name).
+
+    Accepts a bare filename, a folder name, or a stem with archive suffixes
+    (``Game [tid].wud.zip``).  Returns ``("", cleaned_name)`` when no Wii U
+    title id is embedded.
+    """
+    stem = raw_name
+    while True:
+        suffix = Path(stem).suffix.lower()
+        if suffix and suffix in ROM_EXTENSIONS:
+            stem = Path(stem).stem
+            continue
+        break
+
+    match = _WIIU_TITLE_ID_RE.search(stem)
+    if not match:
+        return "", stem.strip()
+
+    cleaned = (stem[: match.start()] + stem[match.end() :]).strip()
+    # Drop the now-empty bracket/paren pair the id lived in.
+    cleaned = cleaned.replace("[]", "").replace("()", "").strip(" -_.[]()")
+    return match.group(1).upper(), cleaned
+
+
+def _identify_wiiu(raw_name: str, norm: Optional[object]) -> tuple[str, str, str]:
+    """Resolve a Wii U folder/file name to (title_id, name, source).
+
+    An embedded title id wins: it is the same identifier Wii U *saves* are
+    keyed by (``SYNC_ID_RULES`` uses the ``title_id`` strategy for WIIU), so
+    a catalog entry and its save land on the same key.  Without one we fall
+    back to the usual DAT-normalized slug.
+    """
+    title_id, display = _wiiu_split_title_id(raw_name)
+    if title_id:
+        dat_name = game_names.get_name(title_id)
+        if dat_name:
+            return title_id, dat_name, "title_id"
+        return title_id, display or title_id, "filename"
+
+    if norm is not None:
+        info = norm.normalize("WIIU", raw_name)
+        canonical = info["canonical_name"]
+        return f"WIIU_{normalize_rom_name(canonical)}", canonical, info["source"]
+
+    return f"WIIU_{normalize_rom_name(display)}", display, "filename"
+
+
+def _is_wiiu_bundle_dir(sub: Path) -> bool:
+    """True when ``sub`` holds a WUP set or a decrypted loadiine layout."""
+    for f in sub.rglob("*"):
+        if f.is_file() and f.name.lower() == _WIIU_WUP_MARKER:
+            return True
+    child_dirs = {c.name.lower() for c in sub.iterdir() if c.is_dir()}
+    return all(name in child_dirs for name in _WIIU_LOADIINE_DIRS)
+
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _MULTI_UNDERSCORE_RE = re.compile(r"_+")
 
@@ -475,6 +564,10 @@ class RomCatalog:
             self._scan_ps1_folder(folder, norm, rom_dir, use_crc32, scanned)
             return
 
+        if system.upper() == "WIIU":
+            self._scan_wiiu_folder(folder, norm, rom_dir, use_crc32, scanned)
+            return
+
         for file_path in sorted(folder.rglob("*")):
             if not file_path.is_file():
                 continue
@@ -642,6 +735,122 @@ class RomCatalog:
                     "filename": file_path.name,
                     "path": rel_path,
                     "size": size,
+                    "crc32": crc32,
+                    "source": source,
+                    "is_bundle": 0,
+                    "bundle_files": "",
+                }
+            )
+
+    def _scan_wiiu_folder(
+        self,
+        folder: Path,
+        norm: Optional[object],
+        rom_dir: Path,
+        use_crc32: bool,
+        scanned: list[dict],
+    ) -> None:
+        """Wii U scan — WUP / loadiine folders as bundles, images as files.
+
+        Pass 1 collapses every subfolder that looks like a WUP installable
+        set (``title.tmd`` present) or a decrypted loadiine layout
+        (``code``/``content``/``meta``) into one bundle entry.  Every regular
+        file inside is kept: ``.app``, ``.h3``, ``.tmd``, ``.tik`` and
+        ``.cert`` are all required to install and none of them are
+        ``ROM_EXTENSIONS`` members in their own right.
+
+        Pass 2 picks up single-file images (``.wua``/``.wud``/``.wux``) and
+        archives that wrap a folder layout.
+
+        Both passes prefer a title id embedded in the name — see
+        :func:`_identify_wiiu`.
+        """
+        system = "WIIU"
+
+        bundle_dirs: list[Path] = []
+        bundled_paths: set[Path] = set()
+
+        for sub in sorted(folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name in SKIP_DIR_NAMES:
+                continue
+            if not _is_wiiu_bundle_dir(sub):
+                continue
+            bundle_dirs.append(sub)
+            for f in sub.rglob("*"):
+                if f.is_file():
+                    bundled_paths.add(f.resolve())
+
+        # ── Pass 1: WUP / loadiine bundles ────────────────────────────
+        for bundle_dir in bundle_dirs:
+            files: list[tuple[str, int]] = []
+            total_size = 0
+            for f in sorted(bundle_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.lower() in SKIP_NAMES:
+                    continue
+                rel = f.relative_to(bundle_dir).as_posix()
+                size = f.stat().st_size
+                files.append((rel, size))
+                total_size += size
+
+            if not files:
+                continue
+
+            title_id, display_name, source = _identify_wiiu(bundle_dir.name, norm)
+            rel_dir = str(bundle_dir.relative_to(rom_dir).as_posix())
+
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": display_name,
+                    "filename": f"{display_name}.zip",
+                    "path": rel_dir,
+                    "size": total_size,
+                    "crc32": "",
+                    "source": source if source == "title_id" else "bundle",
+                    "is_bundle": 1,
+                    "bundle_files": json.dumps(
+                        [{"name": rel, "size": sz} for rel, sz in files]
+                    ),
+                }
+            )
+
+        # ── Pass 2: single-file images / archives ─────────────────────
+        for file_path in sorted(folder.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if _is_inside_skipped_dir(file_path):
+                continue
+            if file_path.resolve() in bundled_paths:
+                continue
+            if file_path.name.lower() in SKIP_NAMES:
+                continue
+
+            ext = file_path.suffix.lower()
+            if ext not in _WIIU_FILE_EXTS:
+                continue
+
+            title_id, display_name, source = _identify_wiiu(file_path.name, norm)
+
+            # CRC32 of an archive container tells us nothing about the title
+            # inside it, so only fingerprint raw disc images.
+            crc32 = ""
+            if use_crc32 and ext not in _ARCHIVE_EXTENSIONS:
+                crc32 = _compute_crc32(file_path)
+
+            rel_path = str(file_path.relative_to(rom_dir).as_posix())
+            scanned.append(
+                {
+                    "title_id": title_id,
+                    "system": system,
+                    "name": display_name,
+                    "filename": file_path.name,
+                    "path": rel_path,
+                    "size": file_path.stat().st_size,
                     "crc32": crc32,
                     "source": source,
                     "is_bundle": 0,
