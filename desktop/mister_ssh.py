@@ -51,6 +51,7 @@ class MiSTerSave:
     remote_path: str  # full SFTP path
     title_id: str     # e.g. "GBA_zelda_the_minish_cap_usa"
     size: int = 0
+    mtime: float = 0.0
 
     # Populated during scan
     local_hash: str = ""
@@ -200,6 +201,7 @@ class MiSTerSSH:
                         remote_path=remote_path,
                         title_id=title_id,
                         size=attr.st_size or 0,
+                        mtime=float(attr.st_mtime or 0),
                     )
                 )
                 if progress_cb:
@@ -240,6 +242,52 @@ class MiSTerSSH:
             self._sftp.mkdir(parent)
         with self._sftp.open(remote_path, "wb") as fh:
             fh.write(data)
+
+    def exec(self, command: str) -> tuple[int, str, str]:
+        """Run a shell command on the MiSTer. Returns (exit code, stdout, stderr)."""
+        assert self._client is not None, "Not connected"
+        _, out, err = self._client.exec_command(command)
+        rc = out.channel.recv_exit_status()
+        return rc, out.read().decode(errors="replace"), err.read().decode(errors="replace")
+
+    def makedirs(self, remote_dir: str) -> None:
+        """mkdir -p over SFTP (write_file only creates one parent level)."""
+        assert self._sftp is not None
+        path = PurePosixPath(remote_dir)
+        current = PurePosixPath("/") if path.is_absolute() else PurePosixPath(".")
+        for part in path.parts:
+            if part == "/":
+                continue
+            current = current / part
+            try:
+                self._sftp.stat(str(current))
+            except FileNotFoundError:
+                self._sftp.mkdir(str(current))
+
+    def upload_file(
+        self,
+        local_path: str | Path,
+        remote_path: str,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        """Stream a local file to the MiSTer, creating parent dirs.
+
+        Uploads to a ``.part`` name first so an interrupted transfer never
+        leaves a truncated file where a core would find it.
+        """
+        assert self._sftp is not None
+        self.makedirs(str(PurePosixPath(remote_path).parent))
+        tmp_remote = f"{remote_path}.part"
+        self._sftp.put(str(local_path), tmp_remote, callback=progress_cb)
+        try:
+            self._sftp.posix_rename(tmp_remote, remote_path)
+        except Exception:
+            # SFTP rename refuses to overwrite — drop the old file first.
+            try:
+                self._sftp.remove(remote_path)
+            except FileNotFoundError:
+                pass
+            self._sftp.rename(tmp_remote, remote_path)
 
     # ------------------------------------------------------------------
     # State file (last-synced hashes, one per title_id)

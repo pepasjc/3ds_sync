@@ -1149,6 +1149,23 @@ class SyncTab(QWidget):
             return None
 
         device_type = profile.get("device_type", "Generic")
+
+        # MiSTer over SSH: the save lives on the MiSTer itself, no local root.
+        if device_type == "MiSTer":
+            from sync_engine import build_mister_ssh_save_path, mister_profile_uses_ssh
+
+            if mister_profile_uses_ssh(profile):
+                ssh_system = (st.save.system or "").upper()
+                ssh_info = _system_profile_info(profile, ssh_system)
+                ssh_ext = ssh_info.get("save_ext", ".sav") or ".sav"
+                return build_mister_ssh_save_path(
+                    profile,
+                    st.save.title_id,
+                    ssh_system,
+                    st.save.game_name or st.save.title_id,
+                    ssh_ext,
+                )
+
         save_root_str = profile.get("save_folder") or profile.get("path", "")
         if not save_root_str:
             return None

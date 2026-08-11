@@ -6,6 +6,7 @@ import pytest
 from rom_installer import (
     PSIO_MAX_NAME,
     build_install_plan,
+    build_install_plans,
     choose_extract_format,
     clean_ps1_title,
     default_rom_format,
@@ -114,6 +115,228 @@ def test_emudeck_profile_uses_system_subfolder(tmp_path):
     }
 
     assert resolve_profile_rom_folder(profile, "GBA") == tmp_path / "gba"
+
+
+def _mister_profile(path: str = "", target: str = "") -> dict:
+    profile: dict = {
+        "name": "MiSTer",
+        "device_type": "MiSTer",
+        "path": path,
+        "systems": [
+            {"system": "PS1", "enabled": True},
+            {"system": "MD", "enabled": True},
+        ],
+    }
+    if target:
+        profile["mister_target"] = target
+    return profile
+
+
+def test_mister_local_prefers_existing_legacy_folder(tmp_path):
+    (tmp_path / "Genesis").mkdir()
+    profile = _mister_profile(str(tmp_path))
+    assert resolve_profile_rom_folder(profile, "MD") == tmp_path / "Genesis"
+
+
+def test_mister_local_defaults_to_modern_folder_name(tmp_path):
+    profile = _mister_profile(str(tmp_path))
+    assert resolve_profile_rom_folder(profile, "MD") == tmp_path / "MegaDrive"
+    assert resolve_profile_rom_folder(profile, "PS1") == tmp_path / "PSX"
+
+
+def test_mister_chd_installs_raw_no_conversion(tmp_path):
+    profile = _mister_profile(str(tmp_path))
+    rom = {
+        "rom_id": "SLUS00001",
+        "system": "PS1",
+        "name": "Example Game",
+        "filename": "Example Game (USA).chd",
+        "extract_format": "cue",
+        "extract_formats": ["cue", "eboot", "psio"],
+    }
+    assert default_rom_format(profile, rom, "PS1") is None
+    plan = build_install_plan(profile, rom, "PS1")
+    assert plan.extract_format is None
+    assert plan.extract_archive is False
+    # CD games get a per-game subfolder — the PSX core names the autosave
+    # memory card after the folder.
+    assert (
+        plan.target_path
+        == tmp_path / "PSX" / "Example Game (USA)" / "Example Game (USA).chd"
+    )
+
+
+def test_mister_network_usb_plan_targets_posix_path():
+    profile = _mister_profile(target="usb")
+    rom = {
+        "rom_id": "SLUS00001",
+        "system": "PS1",
+        "name": "Example Game",
+        "filename": "Example Game (USA).chd",
+        "extract_formats": ["cue", "eboot", "psio"],
+    }
+    plan = build_install_plan(profile, rom, "PS1")
+    assert plan.mister_remote == "usb"
+    assert (
+        str(plan.target_path)
+        == "/media/usb0/games/PSX/Example Game (USA)/Example Game (USA).chd"
+    )
+
+
+def test_mister_multidisc_chds_share_one_game_folder():
+    profile = _mister_profile(target="usb")
+    plans = [
+        build_install_plan(
+            profile,
+            {
+                "rom_id": f"SLUS0086{n}",
+                "system": "PS1",
+                "name": f"Final Fantasy VII (Disc {n}) (USA)",
+                "filename": f"Final Fantasy VII (Disc {n}) (USA).chd",
+            },
+            "PS1",
+        )
+        for n in (1, 2)
+    ]
+    parents = {str(p.target_path).rsplit("/", 1)[0] for p in plans}
+    # Disc tag stripped from the folder → both discs share one card.
+    assert parents == {"/media/usb0/games/PSX/Final Fantasy VII (USA)"}
+    assert str(plans[0].target_path).endswith("Final Fantasy VII (Disc 1) (USA).chd")
+
+
+def test_safe_folder_name_keeps_version_tags(tmp_path):
+    from rom_installer import safe_folder_name
+
+    # A real ROM extension is dropped …
+    assert safe_folder_name("Some Game (USA).chd") == "Some Game (USA)"
+    # … but a trailing version/translation tag is not an extension.
+    assert (
+        safe_folder_name("Ecsaform (Japan) [T-En by Aishsha & Pennywise v1.1]")
+        == "Ecsaform (Japan) [T-En by Aishsha & Pennywise v1.1]"
+    )
+    assert safe_folder_name("Game v1.2") == "Game v1.2"
+    assert safe_folder_name("") == "download"
+
+
+def test_mister_multidisc_folder_keeps_full_translation_tag():
+    profile = _mister_profile(target="usb")
+    rom = {
+        "rom_id": "SLPS00001",
+        "system": "PS1",
+        "name": "Ecsaform (Japan) (Disc 1) [T-En by Aishsha v1.1]",
+        "filename": "Ecsaform (Japan) (Disc 1) [T-En by Aishsha v1.1].chd",
+    }
+    plan = build_install_plan(profile, rom, "PS1")
+    assert (
+        str(plan.target_path.parent)
+        == "/media/usb0/games/PSX/Ecsaform (Japan) [T-En by Aishsha v1.1]"
+    )
+
+
+def test_mister_catalog_collapses_multidisc_into_one_row():
+    profile = _mister_profile(target="usb")
+    rows = group_multidisc_roms(profile, _multidisc_catalog(), "PS1")
+
+    # 3 FFVII discs collapse to one row; the single-disc game passes through.
+    assert len(rows) == 2
+    group = rows[0]
+    assert group["install_members"] is True
+    assert group["disc_total"] == 3
+    assert group["name"] == "Final Fantasy VII (USA)"  # disc tag stripped
+    assert group["size"] == 700 + 710 + 720
+    assert rows[1]["rom_id"] == "SLUS00001"
+    assert "disc_members" not in rows[1]
+
+
+def test_mister_grouped_row_expands_to_one_plan_per_disc():
+    profile = _mister_profile(target="usb")
+    rows = group_multidisc_roms(profile, _multidisc_catalog(), "PS1")
+
+    plans = build_install_plans(profile, rows[0], "PS1")
+    assert len(plans) == 3
+    assert {str(p.target_path.parent) for p in plans} == {
+        "/media/usb0/games/PSX/Final Fantasy VII (USA)"
+    }
+    assert [p.target_path.name for p in plans] == [
+        "Final Fantasy VII (Disc 1) (USA).chd",
+        "Final Fantasy VII (Disc 2) (USA).chd",
+        "Final Fantasy VII (Disc 3) (USA).chd",
+    ]
+    # Each disc is fetched by its own rom_id, not the group's primary.
+    assert [p.rom_id for p in plans] == ["SLUS00868", "SLUS00869", "SLUS00870"]
+
+    # A plain single-disc row still yields exactly one plan.
+    assert len(build_install_plans(profile, rows[1], "PS1")) == 1
+
+
+def test_psio_multidisc_still_collapses_to_one_combined_download(tmp_path):
+    profile = {
+        "device_type": "PSIO",
+        "path": str(tmp_path),
+        "system": "PS1",
+        "rom_format": "auto",
+    }
+    rows = group_multidisc_roms(profile, _multidisc_catalog(), "PS1")
+    group = rows[0]
+    assert group.get("install_members") is None  # server stitches the set
+    plans = build_install_plans(profile, group, "PS1")
+    assert len(plans) == 1
+    assert plans[0].rom_id == "SLUS00868"  # primary id returns all discs
+
+
+def test_mister_cart_systems_stay_flat(tmp_path):
+    profile = _mister_profile(str(tmp_path))
+    rom = {
+        "rom_id": "GBA_game",
+        "system": "GBA",
+        "name": "Game",
+        "filename": "Game (USA).gba",
+    }
+    profile["systems"].append({"system": "GBA", "enabled": True})
+    plan = build_install_plan(profile, rom, "GBA")
+    assert plan.target_path == tmp_path / "GBA" / "Game (USA).gba"
+
+
+def test_mister_saturn_chd_gets_game_folder(tmp_path):
+    profile = _mister_profile(str(tmp_path))
+    rom = {
+        "rom_id": "SAT_panzer",
+        "system": "SAT",
+        "name": "Panzer Dragoon",
+        "filename": "Panzer Dragoon (USA).chd",
+    }
+    plan = build_install_plan(profile, rom, "SAT")
+    assert plan.extract_format is None  # CHD stays raw on MiSTer
+    assert (
+        plan.target_path
+        == tmp_path / "Saturn" / "Panzer Dragoon (USA)" / "Panzer Dragoon (USA).chd"
+    )
+
+
+def test_mister_network_sd_plan_targets_fat_games():
+    profile = _mister_profile(target="sd")
+    rom = {
+        "rom_id": "MD_sonic",
+        "system": "MD",
+        "name": "Sonic",
+        "filename": "Sonic (USA).md",
+    }
+    plan = build_install_plan(profile, rom, "MD")
+    assert plan.mister_remote == "sd"
+    assert str(plan.target_path) == "/media/fat/games/MegaDrive/Sonic (USA).md"
+
+
+def test_mister_local_target_keeps_local_paths(tmp_path):
+    profile = _mister_profile(str(tmp_path), target="local")
+    rom = {
+        "rom_id": "MD_sonic",
+        "system": "MD",
+        "name": "Sonic",
+        "filename": "Sonic (USA).md",
+    }
+    plan = build_install_plan(profile, rom, "MD")
+    assert plan.mister_remote == ""
+    assert plan.target_path == tmp_path / "MegaDrive" / "Sonic (USA).md"
 
 
 def _multidisc_catalog():

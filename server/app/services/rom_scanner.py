@@ -77,6 +77,7 @@ from app.services.rom_id import (
     SYSTEM_CODES,
     normalize_rom_name,
 )
+from shared.systems import SYSTEM_ALIASES
 # rom_id imports `shared` onto sys.path for us, so this stays a plain import.
 from shared import wiiu_meta
 
@@ -261,13 +262,21 @@ def _compute_crc32(file_path: Path) -> str:
 
 
 def _system_for_folder(folder_name: str) -> str | None:
+    """Canonical system code for a ROM folder name, else None.
+
+    Always resolves through ``SYSTEM_ALIASES``: ``SYSTEM_CODES`` contains
+    aliases too, so a folder named ``SCD`` must still index as ``SEGACD`` —
+    otherwise its ROMs and its saves end up under different keys.
+    """
     key = folder_name.lower().strip()
     if key in FOLDER_TO_SYSTEM:
-        return FOLDER_TO_SYSTEM[key]
-    upper = key.upper()
-    if upper in SYSTEM_CODES:
-        return upper
-    return None
+        code = FOLDER_TO_SYSTEM[key]
+    else:
+        upper = key.upper()
+        if upper not in SYSTEM_CODES:
+            return None
+        code = upper
+    return SYSTEM_ALIASES.get(code, code)
 
 
 def _identify_rom_slug(

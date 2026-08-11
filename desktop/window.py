@@ -8,7 +8,6 @@ from tabs.sync_tab import SyncTab
 from tabs.normalizer_tab import RomNormalizerTab
 from tabs.rom_collection_tab import RomCollectionTab
 from tabs.rom_installer_tab import RomInstallerTab
-from tabs.mister_tab import MiSTerTab
 
 
 class SaveManagerWindow(QMainWindow):
@@ -29,12 +28,10 @@ class SaveManagerWindow(QMainWindow):
         self.normalizer_tab = RomNormalizerTab()
         self.collection_tab = RomCollectionTab()
         self.rom_installer_tab = RomInstallerTab(self.profiles_tab)
-        self.mister_tab = MiSTerTab()
 
         self.tabs.addTab(self.server_tab, "Server Saves")
         self.tabs.addTab(self.profiles_tab, "Sync Profiles")
         self.tabs.addTab(self.sync_tab, "Sync")
-        self.tabs.addTab(self.mister_tab, "MiSTer SSH")
         self.tabs.addTab(self.rom_installer_tab, "ROM Installer")
         self.tabs.addTab(self.normalizer_tab, "ROM Normalizer")
         self.tabs.addTab(self.collection_tab, "ROM Collection")

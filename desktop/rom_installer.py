@@ -3,16 +3,21 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 import unicodedata
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 import requests
 
-from config import get_api_headers, get_base_url
-from systems import MISTER_SYSTEM_TO_FOLDER
+from config import get_api_headers, get_base_url, load_config
+from systems import (
+    MISTER_CD_SYSTEMS,
+    MISTER_GAMES_ROOTS,
+    mister_system_folder_candidates,
+)
 
 
 ROM_FORMAT_OPTIONS: list[tuple[str, str]] = [
@@ -121,6 +126,12 @@ class InstallPlan:
     # drop a renamed POPSTARTER.ELF launcher beside it and register the game in
     # the USB-root conf_apps.cfg so it shows in OPL's Applications menu.
     opl_popstarter: bool = False
+    # MiSTer network install: "sd" or "usb" storage key.  When set,
+    # ``target_path`` is a POSIX path on the MiSTer and the install goes over
+    # SSH/SFTP using ``mister_ssh`` (profile SSH fields; legacy global
+    # ``mister_ssh`` config as fallback).
+    mister_remote: str = ""
+    mister_ssh: dict | None = None
 
     @property
     def format_label(self) -> str:
@@ -204,6 +215,11 @@ def default_rom_format(profile: dict, rom: dict, system: str) -> str | None:
         if system_up == "PS2":
             return "iso"
 
+    # MiSTer CD cores (PSX, Saturn, MegaCD, TGFX16-CD, NeoGeo-CD, ...) read
+    # CHD natively — install the catalog file as-is, no conversion.
+    if device_type == "MiSTer" and source_ext == ".chd":
+        return None
+
     if system_up in XBOX_SYSTEMS:
         return "iso"
 
@@ -279,16 +295,27 @@ def group_multidisc_roms(
 ) -> list[dict]:
     """Collapse multi-disc PS1 groups into one catalog entry per game.
 
-    Only collapses when the effective install format produces a single
-    combined output (see ``COMBINED_DISC_FORMATS``).  The merged entry keeps
-    the group's ``primary_rom_id`` as its ``rom_id`` — requesting that from the
-    server returns the full multi-disc set (the server groups siblings by
-    title_id).  A synthetic ``disc_members`` list and ``disc_total`` are
-    attached for display.  Non-PS1 / single-disc / non-combined rows pass
-    through unchanged and keep their original order.
+    Two cases collapse:
+
+    * the effective install format produces a single combined output (see
+      ``COMBINED_DISC_FORMATS``) — the merged entry keeps the group's
+      ``primary_rom_id`` as its ``rom_id`` and one request returns the whole
+      set (the server groups siblings by title_id);
+    * MiSTer CD systems — each disc stays its own file, but they install
+      side by side into one disc-tag-free game folder so the core's autosave
+      card is shared across discs.  The entry is flagged ``install_members``
+      so the installer expands it back into one plan per disc.
+
+    A synthetic ``disc_members`` list and ``disc_total`` are attached for
+    display.  Single-disc / non-collapsing rows pass through unchanged and
+    keep their original order.
     """
     result: list[dict] = []
     aggregates: dict[str, dict] = {}
+    mister_cd = (
+        str(profile.get("device_type", "")).strip() == "MiSTer"
+        and (system or "").upper() in MISTER_CD_SYSTEMS
+    )
     for rom in roms:
         try:
             fmt = choose_extract_format(profile, rom, system, override_format)
@@ -299,12 +326,16 @@ def group_multidisc_roms(
         has_disc_tag = bool(
             _DISC_TAG_RE.search(str(rom.get("filename") or rom.get("name") or ""))
         )
-        if fmt in COMBINED_DISC_FORMATS and total > 1 and primary and has_disc_tag:
+        combined = fmt in COMBINED_DISC_FORMATS
+        if (combined or mister_cd) and total > 1 and primary and has_disc_tag:
             agg = aggregates.get(primary)
             if agg is None:
                 agg = dict(rom)
                 agg["rom_id"] = primary
                 agg["disc_members"] = []
+                if not combined:
+                    # Discs install individually into the shared game folder.
+                    agg["install_members"] = True
                 aggregates[primary] = agg
                 result.append(agg)
             agg["disc_members"].append(rom)
@@ -367,9 +398,31 @@ def derive_download_filename(filename: str, extract_format: str | None) -> str:
     return filename
 
 
+# Extensions ``safe_folder_name`` drops when it's handed a filename.  An
+# explicit list — ``Path.stem`` alone truncates any trailing dot group, which
+# mangles version/translation tags like ``[T-En … v1.1]`` into ``[T-En … v1``.
+_FOLDER_NAME_STRIP_EXTS = frozenset(
+    {
+        ".chd", ".cue", ".bin", ".iso", ".img", ".mdf", ".gdi", ".ccd", ".sub",
+        ".zip", ".7z", ".rar", ".rvz", ".wbfs", ".cso", ".wua", ".wux",
+        ".nes", ".sfc", ".smc", ".md", ".gen", ".gg", ".sms", ".pce", ".gba",
+        ".gb", ".gbc", ".n64", ".z64", ".v64", ".nds", ".3ds", ".cci", ".cia",
+        ".exe", ".pbp", ".vcd", ".cu2",
+    }
+)
+
+
 def safe_folder_name(value: str) -> str:
-    text = Path(value or "download").stem.strip()
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    """Sanitize a game name (or filename) for use as a folder name.
+
+    A trailing extension is dropped only when it is a recognised ROM/disc
+    extension, so names ending in a version tag keep their final segment.
+    """
+    text = str(value or "download").strip()
+    suffix = Path(text).suffix
+    if suffix.lower() in _FOLDER_NAME_STRIP_EXTS:
+        text = text[: -len(suffix)]
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text.strip())
     text = re.sub(r"\s+", " ", text).strip(" .")
     return text or "download"
 
@@ -388,9 +441,13 @@ def safe_file_name(value: str) -> str:
 def _system_subdir(root: Path, system: str, device_type: str) -> Path:
     system_up = system.upper()
     if device_type == "MiSTer":
-        folder = MISTER_SYSTEM_TO_FOLDER.get(system_up)
-        if folder:
-            return root / folder
+        mister_candidates = mister_system_folder_candidates(system_up)
+        for name in mister_candidates:
+            candidate = root / name
+            if candidate.is_dir():
+                return candidate
+        if mister_candidates:
+            return root / mister_candidates[0]
 
     candidates = ROM_SUBDIRS.get(system_up, [system_up.lower(), system_up])
     for name in candidates:
@@ -401,6 +458,31 @@ def _system_subdir(root: Path, system: str, device_type: str) -> Path:
     if device_type in {"EmuDeck", "MiSTer"}:
         return root / candidates[0]
     return root
+
+
+def mister_remote_target(profile: dict) -> str:
+    """``"sd"`` / ``"usb"`` when this MiSTer profile installs over the network,
+    ``""`` for the classic local-folder (mounted card) mode."""
+    if str(profile.get("device_type", "")).strip() != "MiSTer":
+        return ""
+    target = str(profile.get("mister_target", "") or "").strip().lower()
+    return target if target in MISTER_GAMES_ROOTS else ""
+
+
+def mister_remote_rom_dir(profile: dict, system: str) -> PurePosixPath:
+    """POSIX game folder on the MiSTer for a network install.
+
+    A per-system ROM-folder override starting with ``/`` is honored as a
+    remote path; otherwise ``<games root>/<core folder>``.  The folder is
+    created on the MiSTer at install time.
+    """
+    info = system_profile_info(profile, system)
+    override = str(info.get("rom_folder", "")).strip()
+    if override.startswith("/"):
+        return PurePosixPath(override)
+    root = PurePosixPath(MISTER_GAMES_ROOTS[mister_remote_target(profile)])
+    candidates = mister_system_folder_candidates(system)
+    return root / candidates[0] if candidates else root
 
 
 def resolve_profile_rom_folder(profile: dict, system: str) -> Path:
@@ -613,18 +695,42 @@ def build_install_plan(
         raise ValueError("Catalog entry is missing a ROM id.")
     filename = safe_file_name(str(rom.get("filename") or f"{rom_id}.rom"))
     extract = choose_extract_format(profile, rom, system_up, override_format)
-    target_root = resolve_profile_rom_folder(profile, system_up)
+    remote = mister_remote_target(profile)
+    remote_ssh = mister_ssh_config(profile) if remote else None
+    target_root = (
+        mister_remote_rom_dir(profile, system_up)
+        if remote
+        else resolve_profile_rom_folder(profile, system_up)
+    )
     display_name = str(rom.get("name") or Path(filename).stem or rom_id)
     target_filename = derive_download_filename(filename, extract)
 
     if extract == "eboot":
         target_path = target_root / safe_folder_name(display_name) / "EBOOT.PBP"
-        return InstallPlan(rom_id, display_name, system_up, filename, target_path, extract)
+        return InstallPlan(
+            rom_id,
+            display_name,
+            system_up,
+            filename,
+            target_path,
+            extract,
+            mister_remote=remote,
+            mister_ssh=remote_ssh,
+        )
+
+    # MiSTer CD cores name the autosave memory card / backup RAM after the
+    # game's subfolder, so each CD game installs into its own folder.  The
+    # disc tag is stripped from the folder name so all discs of a multi-disc
+    # game land together and share one card.
+    is_mister = str(profile.get("device_type", "")).strip() == "MiSTer"
+    mister_cd = is_mister and system_up in MISTER_CD_SYSTEMS
 
     if extract in ARCHIVE_EXTRACT_FORMATS or bool(rom.get("is_bundle")):
         # PSIO installs into a bare game folder (translation/disc tags stripped);
         # the server already names the BIN/CU2 inside it.
         folder_name = clean_ps1_title(display_name) if extract == "psio" else display_name
+        if mister_cd:
+            folder_name = strip_disc_tag(display_name)
         target_dir = target_root / safe_folder_name(folder_name)
         return InstallPlan(
             rom_id=rom_id,
@@ -635,7 +741,13 @@ def build_install_plan(
             extract_format=extract,
             extract_archive=True,
             target_is_directory=True,
+            mister_remote=remote,
+            mister_ssh=remote_ssh,
         )
+
+    if mister_cd:
+        game_folder = safe_folder_name(strip_disc_tag(Path(target_filename).stem))
+        target_root = target_root / game_folder
 
     return InstallPlan(
         rom_id=rom_id,
@@ -644,7 +756,31 @@ def build_install_plan(
         source_filename=filename,
         target_path=target_root / target_filename,
         extract_format=extract,
+        mister_remote=remote,
+        mister_ssh=remote_ssh,
     )
+
+
+def build_install_plans(
+    profile: dict,
+    rom: dict,
+    system: str | None = None,
+    override_format: str = "",
+) -> list[InstallPlan]:
+    """Plans for one catalog row — several when the row is a disc group.
+
+    Rows collapsed by ``group_multidisc_roms`` for a device that installs each
+    disc separately (MiSTer CD cores) carry ``install_members``: every disc
+    gets its own plan, and they all resolve into the same disc-tag-free game
+    folder.  Every other row yields exactly one plan.
+    """
+    members = rom.get("disc_members") or []
+    if rom.get("install_members") and len(members) > 1:
+        return [
+            build_install_plan(profile, member, system, override_format)
+            for member in members
+        ]
+    return [build_install_plan(profile, rom, system, override_format)]
 
 
 def _safe_extract_zip(zip_path: Path, target_dir: Path) -> list[Path]:
@@ -667,21 +803,15 @@ def _safe_extract_zip(zip_path: Path, target_dir: Path) -> list[Path]:
     return written
 
 
-def install_rom(
+def _download_rom(
     plan: InstallPlan,
+    tmp_path: Path,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> list[Path]:
+) -> None:
+    """Stream the (optionally server-converted) ROM into ``tmp_path``."""
     params = {}
     if plan.extract_format:
         params["extract"] = plan.extract_format
-
-    target = plan.target_path
-    tmp_parent = target if plan.target_is_directory else target.parent
-    tmp_parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.part"
-    if plan.extract_archive:
-        tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.zip.part"
-
     downloaded = 0
     with requests.get(
         f"{get_base_url()}/api/v1/roms/{plan.rom_id}",
@@ -708,6 +838,118 @@ def install_rom(
                 downloaded += len(chunk)
                 if progress_callback:
                     progress_callback(downloaded, total)
+
+
+def mister_ssh_config(profile: dict) -> dict:
+    """SSH connection dict for a MiSTer profile.
+
+    Profile ``ssh_*`` fields win; profiles saved before the fields existed
+    fall back to the legacy global ``mister_ssh`` config key.
+    """
+    host = str(profile.get("ssh_host", "") or "").strip()
+    if host:
+        return {
+            "host": host,
+            "port": int(profile.get("ssh_port", 22) or 22),
+            "username": str(profile.get("ssh_username", "root") or "root"),
+            "password": str(profile.get("ssh_password", "") or ""),
+            "key_path": str(profile.get("ssh_key_path", "") or ""),
+        }
+    return dict(load_config().get("mister_ssh") or {})
+
+
+def _mister_ssh_client(cfg: dict | None):
+    """MiSTerSSH from a connection dict (see ``mister_ssh_config``)."""
+    from mister_ssh import MiSTerSSH  # deferred — paramiko is optional
+
+    cfg = cfg or {}
+    host = str(cfg.get("host", "") or "").strip()
+    if not host:
+        raise RuntimeError(
+            "MiSTer SSH is not configured.\n"
+            "Edit the profile and fill in the SSH host/credentials."
+        )
+    return MiSTerSSH(
+        host=host,
+        port=int(cfg.get("port", 22) or 22),
+        username=str(cfg.get("username", "root") or "root"),
+        password=str(cfg.get("password", "") or ""),
+        key_path=str(cfg.get("key_path", "") or ""),
+    )
+
+
+def _prepare_mister_usb_game_dir(ssh, sys_dir: PurePosixPath) -> None:
+    """Create a USB game folder and seed it with the SD folder's BIOS files.
+
+    MiSTer cores use ``/media/usb0/games/<Core>`` *instead of* the SD folder
+    once it exists, so a CD core (PSX, Saturn, MegaCD, ...) would lose its
+    ``boot.rom`` BIOS.  ``cp -n`` never overwrites files the user put there.
+    """
+    fat_dir = f"/media/fat/games/{sys_dir.name}"
+    try:
+        ssh.exec(
+            f"mkdir -p '{sys_dir}' && "
+            f"cp -n '{fat_dir}'/boot*.rom '{sys_dir}/' 2>/dev/null; true"
+        )
+    except Exception:
+        pass  # best-effort — the game upload itself creates the folder too
+
+
+def _install_rom_mister_remote(
+    plan: InstallPlan,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Path]:
+    """Download to a local temp file, then push to the MiSTer over SFTP.
+
+    The per-system game folder (e.g. ``/media/usb0/games/PSX``) is created on
+    the MiSTer as needed.
+    """
+    target = PurePosixPath(str(plan.target_path).replace("\\", "/"))
+    with tempfile.TemporaryDirectory(prefix="3dssync-rom-") as td:
+        tmp_dir = Path(td)
+        tmp_path = tmp_dir / f"{safe_folder_name(target.name)}.download"
+        _download_rom(plan, tmp_path, progress_callback)
+
+        ssh = _mister_ssh_client(plan.mister_ssh)
+        with ssh:
+            if plan.mister_remote == "usb":
+                # BIOS files belong in the system folder (games/PSX), which for
+                # CD cores is the *grandparent* of a per-game subfolder target.
+                games_root = PurePosixPath(MISTER_GAMES_ROOTS[plan.mister_remote])
+                try:
+                    sys_dir = games_root / target.relative_to(games_root).parts[0]
+                except ValueError:
+                    sys_dir = target.parent
+                _prepare_mister_usb_game_dir(ssh, sys_dir)
+            if plan.extract_archive:
+                extract_dir = tmp_dir / "extracted"
+                files = _safe_extract_zip(tmp_path, extract_dir)
+                written: list[Path] = []
+                for f in files:
+                    rel = f.relative_to(extract_dir.resolve())
+                    remote_file = target / PurePosixPath(*rel.parts)
+                    ssh.upload_file(f, str(remote_file), progress_callback)
+                    written.append(remote_file)
+                return written
+            ssh.upload_file(tmp_path, str(target), progress_callback)
+            return [target]
+
+
+def install_rom(
+    plan: InstallPlan,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Path]:
+    if plan.mister_remote:
+        return _install_rom_mister_remote(plan, progress_callback)
+
+    target = plan.target_path
+    tmp_parent = target if plan.target_is_directory else target.parent
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.part"
+    if plan.extract_archive:
+        tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.zip.part"
+
+    _download_rom(plan, tmp_path, progress_callback)
 
     try:
         if plan.extract_archive:

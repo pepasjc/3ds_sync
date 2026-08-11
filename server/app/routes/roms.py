@@ -263,7 +263,9 @@ router = APIRouter()
 _CUE_SYSTEMS = frozenset({
     'PSX', 'PS1',
     'SAT',
-    'SCD', 'MEGACD',
+    # Sega CD: ``SEGACD`` is canonical (shared.systems); ``SCD``/``MEGACD``
+    # are aliases that older catalog entries and external clients still use.
+    'SEGACD', 'SCD', 'MEGACD',
     'PCECD', 'PCENGINECD', 'TG16CD',
     '3DO',
     'PCFX',
@@ -422,6 +424,27 @@ _ALL_EXTRACT  = _CD_SYSTEMS | _PSP_SYSTEMS
 
 # ── List endpoint ────────────────────────────────────────────────────────────
 
+def _system_match_set(system: str) -> set[str]:
+    """Every spelling of a system code a catalog entry might carry.
+
+    Clients send the canonical code from ``shared.systems`` (``SEGACD``),
+    but entries indexed before an alias was normalised can still hold the
+    alias (``SCD``).  Matching the whole alias group keeps a client working
+    against a catalog that has not been rescanned yet.
+    """
+    from shared.systems import SYSTEM_ALIASES
+
+    requested = (system or "").strip().upper()
+    if not requested:
+        return set()
+    canonical = SYSTEM_ALIASES.get(requested, requested)
+    group = {requested, canonical}
+    group.update(
+        alias for alias, target in SYSTEM_ALIASES.items() if target == canonical
+    )
+    return group
+
+
 @router.get("/roms")
 async def list_roms(
     system: Optional[str] = Query(None),
@@ -437,8 +460,7 @@ async def list_roms(
     entries = catalog.list_all()
 
     if system:
-        sys_upper = system.upper()
-        entries = [e for e in entries if e.system == sys_upper]
+        entries = [e for e in entries if e.system in _system_match_set(system)]
 
     if search:
         term = search.lower()

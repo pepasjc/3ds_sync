@@ -14,6 +14,7 @@ import os
 import posixpath
 import re
 import socket
+import stat as stat_module
 import struct
 import time
 import zipfile
@@ -353,6 +354,11 @@ def _is_shared_saturn_backup(path: Path | None) -> bool:
 def _saturn_format_for_path(path: Path | None) -> str:
     if path is None:
         return "mednafen"
+    # MiSTer's Saturn core reads/writes the internal backup RAM byte-expanded
+    # to 64 KB (0xFF padding at even offsets) — the same layout Yabause uses —
+    # and always names it ``.sav``.
+    if is_ssh_save_path(path):
+        return "yabause"
     if _is_shared_saturn_backup(path) or path.suffix.lower() == ".bin":
         return "yabasanshiro"
     if path.suffix.lower() == ".srm":
@@ -614,6 +620,128 @@ class FtpSavePath:
         ) as ftp:
             _ftp_upload_bytes(ftp, self.remote_path, data)
         _invalidate_remote_hash_path(self.remote_path)
+
+
+# ---------------------------------------------------------------------------
+# SSH/SFTP-backed save paths (MiSTer)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SshSavePath:
+    """Path-like object for save files reached over SSH/SFTP (MiSTer).
+
+    ``assume_exists`` avoids one SSH round-trip per ``exists()`` call: scan
+    results are built from a live listing so existence is already known, and
+    download targets flip to existing once written.
+    """
+
+    host: str
+    port: int
+    username: str
+    password: str
+    key_path: str
+    remote_path: str
+    assume_exists: bool = True
+
+    @property
+    def name(self) -> str:
+        return posixpath.basename(self.remote_path.rstrip("/"))
+
+    @property
+    def stem(self) -> str:
+        return posixpath.splitext(self.name)[0]
+
+    @property
+    def suffix(self) -> str:
+        return posixpath.splitext(self.name)[1]
+
+    def __str__(self) -> str:
+        host = self.host or "unknown"
+        port = f":{self.port}" if self.port and self.port != 22 else ""
+        return f"ssh://{host}{port}{self.remote_path}"
+
+    def sync_key(self) -> str:
+        return str(self)
+
+    def _connection(self):
+        from mister_ssh import MiSTerSSH
+
+        return MiSTerSSH(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            key_path=self.key_path,
+        )
+
+    def exists(self) -> bool:
+        if self.assume_exists:
+            return True
+        try:
+            with self._connection() as ssh:
+                ssh._sftp.stat(self.remote_path)
+                return True
+        except Exception:
+            return False
+
+    def is_file(self) -> bool:
+        return self.exists()
+
+    def is_dir(self) -> bool:
+        return False
+
+    def read_bytes(self) -> bytes:
+        with self._connection() as ssh:
+            return ssh.read_file(self.remote_path)
+
+    def write_bytes(self, data: bytes) -> None:
+        with self._connection() as ssh:
+            ssh.makedirs(posixpath.dirname(self.remote_path))
+            ssh.write_file(self.remote_path, data)
+        _invalidate_remote_hash_path(self.remote_path)
+
+
+def is_ssh_save_path(path: object) -> bool:
+    return isinstance(path, SshSavePath)
+
+
+def mister_profile_uses_ssh(profile: dict) -> bool:
+    """True when a MiSTer profile carries SSH connection details."""
+    return (
+        str(profile.get("device_type", "")).strip() == "MiSTer"
+        and bool(str(profile.get("ssh_host", "") or "").strip())
+    )
+
+
+def _mister_ssh_from_profile(profile: dict):
+    from mister_ssh import MiSTerSSH
+
+    host = str(profile.get("ssh_host", "") or "").strip()
+    if not host:
+        raise SyncUserError(
+            "MiSTer SSH host is not set — edit the profile and fill in the "
+            "SSH connection fields."
+        )
+    return MiSTerSSH(
+        host=host,
+        port=int(profile.get("ssh_port", 22) or 22),
+        username=str(profile.get("ssh_username", "root") or "root"),
+        password=str(profile.get("ssh_password", "") or ""),
+        key_path=str(profile.get("ssh_key_path", "") or ""),
+    )
+
+
+def _mister_ssh_save_path(profile: dict, remote_path: str, assume_exists: bool = True) -> SshSavePath:
+    return SshSavePath(
+        host=str(profile.get("ssh_host", "") or "").strip(),
+        port=int(profile.get("ssh_port", 22) or 22),
+        username=str(profile.get("ssh_username", "root") or "root"),
+        password=str(profile.get("ssh_password", "") or ""),
+        key_path=str(profile.get("ssh_key_path", "") or ""),
+        remote_path=remote_path,
+        assume_exists=assume_exists,
+    )
 
 
 class _FtpSession:
@@ -1599,6 +1727,11 @@ def clear_slot_mappings() -> None:
         pass
 
 
+def clear_mister_catalog_cache() -> None:
+    """Drop the cached ROM-catalog name→title_id index (see scan helpers)."""
+    _mister_catalog_cache.clear()
+
+
 def clear_scan_cache() -> None:
     """Remove cached canonical scan matches so they can be recomputed."""
     global _SCAN_CACHE, _SCAN_CACHE_DIRTY
@@ -1609,6 +1742,7 @@ def clear_scan_cache() -> None:
     except Exception:
         pass
     _clear_remote_hash_cache()
+    clear_mister_catalog_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -2004,6 +2138,26 @@ def scan_profile(
             len(results),
         )
         return _dedup_saves(results)
+
+    if device_type == "MiSTer" and mister_profile_uses_ssh(profile):
+        results = _scan_mister_ssh(
+            profile,
+            systems_config,
+            progress_callback=progress_callback,
+            profile_scope=profile_scope,
+        )
+        _flush_scan_cache()
+        _flush_remote_hash_cache()
+        _emit_progress(
+            progress_callback,
+            f"Found {len(results)} MiSTer save entries.",
+            len(results),
+            len(results),
+        )
+        # No _dedup_saves() here: every entry is a real file the core wrote,
+        # so two cards for one game (folder-named + CD/disc-serial-named) must
+        # stay separate rows instead of merging into one multi-path entry.
+        return results
 
     save_folder = Path(save_folder_str) if save_folder_str else None
     rom_folder = Path(rom_folder_str) if rom_folder_str else None
@@ -3343,6 +3497,356 @@ def _scan_cd_game_folders(
             )
 
     return results
+
+
+# In-card PS1 save filenames look like ``BASLUS-01324DRACULA``: ``B`` + region
+# letter (A/E/I) + product code.  The product code is this project's PS1 sync
+# key (see CLAUDE.md — PS1 saves are keyed by the in-card code, not the disc
+# serial in the filename).
+_PS1_INCARD_SERIAL_RE = re.compile(r"^B[A-Z]([A-Z]{4})[-_]?(\d{5})")
+
+# A MiSTer PSX card written while booting a real CD is named after the disc
+# serial (``SLPM-86219.sav``) rather than the game folder.  Accept the usual
+# written forms: ``SLPM-86219``, ``SLPM_86219``, ``SLPM86219``, ``SLUS_012.34``.
+_PS1_FILENAME_SERIAL_RE = re.compile(
+    r"^([A-Z]{4})[-_ ]?(\d{3})[-_. ]?(\d{2})$", re.IGNORECASE
+)
+
+# Cache marker for "formatted PS1 card with no save blocks at all".
+_PS1_EMPTY_CARD_MARKER = "EMPTY"
+
+
+def _ps1_serial_from_filename(stem: str) -> str | None:
+    """Compact disc serial from a serial-named save file stem, else None.
+
+    Only recognised PlayStation disc prefixes match, so ordinary game names
+    can never be mistaken for a serial.
+    """
+    match = _PS1_FILENAME_SERIAL_RE.match(str(stem or "").strip())
+    if not match:
+        return None
+    prefix = match.group(1).upper()
+    if prefix not in _PSX_RETAIL_PREFIXES:
+        return None
+    return f"{prefix}{match.group(2)}{match.group(3)}"
+
+
+def _ps1_card_serial(card: bytes) -> str | None:
+    """Compact product code (``SLUS01324``) from a raw 128KB PS1 memory card.
+
+    Directory frames 1–15 live in block 0 (128 bytes each); an in-use
+    first-link frame (state ``0x51``) carries the in-card filename at +0x0A.
+    Returns None for empty/unformatted cards.
+    """
+    if len(card) < 2048 or card[:2] != b"MC":
+        return None
+    for frame in range(1, 16):
+        off = frame * 128
+        if card[off] != 0x51:
+            continue
+        raw_name = card[off + 0x0A : off + 0x0A + 20].split(b"\x00")[0]
+        match = _PS1_INCARD_SERIAL_RE.match(raw_name.decode("ascii", errors="ignore"))
+        if match:
+            return f"{match.group(1)}{match.group(2)}"
+    return None
+
+
+def _ps1_card_is_empty(card: bytes) -> bool:
+    """True for a formatted PS1 card that holds no save blocks at all.
+
+    The MiSTer PSX core creates one of these the first time a game runs, so
+    they are common and carry nothing worth syncing.
+    """
+    if len(card) < 2048 or card[:2] != b"MC":
+        return False
+    return all(card[frame * 128] != 0x51 for frame in range(1, 16))
+
+
+_mister_catalog_cache: dict[str, dict[str, str]] = {}
+
+
+def _mister_catalog_index(system: str) -> dict[str, str]:
+    """``{normalized rom name: server title_id}`` for one system.
+
+    MiSTer names a save after the game file/folder, which for a translation
+    patch bears no resemblance to the server's canonical title (``Castlevania
+    - Symphony of the Night …`` vs ``Akumajou Dracula X …``).  The ROM catalog
+    already carries the disc serial for both, so it is the bridge between the
+    on-device name and the server's key.  Cached per process; call
+    ``clear_scan_cache()`` to refresh.
+    """
+    system = (system or "").upper()
+    cached = _mister_catalog_cache.get(system)
+    if cached is not None:
+        return cached
+
+    index: dict[str, str] = {}
+    try:
+        from rom_installer import fetch_rom_catalog
+
+        for rom in fetch_rom_catalog(system):
+            title_id = str(rom.get("title_id") or "").strip()
+            filename = str(rom.get("filename") or "")
+            if not title_id or not filename:
+                continue
+            slug = normalize_rom_name(posixpath.splitext(filename)[0])
+            if slug and slug != "unknown":
+                index.setdefault(slug, title_id)
+            name_slug = normalize_rom_name(str(rom.get("name") or ""))
+            if name_slug and name_slug != "unknown":
+                index.setdefault(name_slug, title_id)
+    except Exception as exc:  # offline / server down — fall back to slug ids
+        _debug_scan(f"MiSTer: {system} catalog lookup unavailable: {exc}")
+
+    _mister_catalog_cache[system] = index
+    return index
+
+
+def _mister_catalog_title_id(system: str, save_stem: str) -> str | None:
+    """Server title_id for a MiSTer save named after its game, else None."""
+    slug = normalize_rom_name(str(save_stem or ""))
+    if not slug or slug == "unknown":
+        return None
+    return _mister_catalog_index(system).get(slug)
+
+
+def _scan_mister_ssh(
+    profile: dict,
+    systems_config: dict[str, dict],
+    progress_callback=None,
+    profile_scope: str = "",
+) -> list[SaveFile]:
+    """Scan /media/fat/saves on a MiSTer over SSH/SFTP.
+
+    Hashes are computed from a remote read and cached by (size, mtime) so
+    rescans only touch changed files.  MiSTer PSX ``.sav`` files are raw 128KB
+    PS1 memory cards: they are re-keyed to the in-card product code (e.g.
+    ``SLUS01324``) so they share a server slot with every other PS1 client,
+    and up/downloads then flow through the ``/ps1-card`` endpoints.  Cards the
+    core wrote while booting a real CD are named after the disc serial
+    (``SLPM-86219.sav``); that serial identifies the card until it holds a
+    save block of its own.  A folder-named and a serial-named card for the
+    same game can coexist — every file stays its own row (no dedup by
+    title_id) so each can be synced against the server slot on its own.
+    Blank cards (the core writes one on first boot) are listed with
+    ``save_exists=False``: they can receive a download but never upload.
+    """
+    ssh = _mister_ssh_from_profile(profile)
+    results: list[SaveFile] = []
+    host = ssh.host
+
+    _emit_progress(progress_callback, f"Connecting to MiSTer {host}…", 0, 0)
+    with ssh:
+        _emit_progress(progress_callback, f"Connected to MiSTer {host}.", 0, 0)
+        saves = ssh.scan_saves()
+        total = len(saves)
+        for idx, sv in enumerate(saves, start=1):
+            if systems_config and sv.system not in systems_config:
+                continue
+            remote = _mister_ssh_save_path(profile, sv.remote_path)
+            title_id = sv.title_id
+            cache_key = _remote_hash_cache_key(profile_scope, sv.remote_path)
+            save_hash = _get_cached_hash_for_key(cache_key, sv.size, sv.mtime)
+            stem = posixpath.splitext(sv.filename)[0]
+            serial: str | None = None
+            filename_serial: str | None = None
+            empty_card = False
+            if sv.system == "SAT":
+                # Saturn backup RAM carries no disc id, so the game name is
+                # the only handle we have — resolve it through the catalog.
+                catalog_id = _mister_catalog_title_id("SAT", stem)
+                if catalog_id:
+                    title_id = catalog_id
+            if sv.system == "PS1":
+                filename_serial = _ps1_serial_from_filename(stem)
+                # Cached markers: "-" = has data but no in-card serial,
+                # "" would be falsy so blank cards use "EMPTY".
+                cached_serial = _get_cached_hash_for_key(
+                    f"{cache_key}|ps1serial", sv.size, sv.mtime
+                )
+                empty_card = cached_serial == _PS1_EMPTY_CARD_MARKER
+                serial = (
+                    None
+                    if cached_serial in (None, "-", _PS1_EMPTY_CARD_MARKER)
+                    else cached_serial
+                )
+                need_read = not save_hash or cached_serial is None
+            elif sv.system == "SAT":
+                cached_marker = _get_cached_hash_for_key(
+                    f"{cache_key}|satempty", sv.size, sv.mtime
+                )
+                empty_card = cached_marker == _PS1_EMPTY_CARD_MARKER
+                need_read = not save_hash or cached_marker is None
+            else:
+                need_read = not save_hash
+            if need_read:
+                _emit_progress(
+                    progress_callback,
+                    f"Hashing MiSTer save {idx}/{total}: {sv.folder}/{sv.filename}",
+                    idx,
+                    total,
+                )
+                try:
+                    if sv.system == "PS1":
+                        # One read serves both the hash and the in-card serial.
+                        data = ssh.read_file(sv.remote_path)
+                        save_hash = hashlib.sha256(data).hexdigest()
+                        serial = _ps1_card_serial(data)
+                        empty_card = serial is None and _ps1_card_is_empty(data)
+                        _set_cached_hash_for_key(
+                            f"{cache_key}|ps1serial",
+                            sv.size,
+                            sv.mtime,
+                            serial
+                            or (_PS1_EMPTY_CARD_MARKER if empty_card else "-"),
+                        )
+                    elif sv.system == "SAT":
+                        # Hash the canonical 32 KB internal BRAM, not the
+                        # 64 KB byte-expanded file, so the hash lines up with
+                        # what the server (and every other Saturn client) has.
+                        from saroo_format import (
+                            list_saturn_archive_names,
+                            normalize_saturn_save,
+                        )
+
+                        data = ssh.read_file(sv.remote_path)
+                        save_hash = hashlib.sha256(
+                            normalize_saturn_save(data)
+                        ).hexdigest()
+                        empty_card = not list_saturn_archive_names(data)
+                        _set_cached_hash_for_key(
+                            f"{cache_key}|satempty",
+                            sv.size,
+                            sv.mtime,
+                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
+                        )
+                    else:
+                        save_hash = ssh.hash_file(sv.remote_path)
+                except Exception:
+                    save_hash = save_hash or ""
+                if save_hash:
+                    _set_cached_hash_for_key(
+                        cache_key, sv.size, sv.mtime, save_hash
+                    )
+            # The in-card code wins when the card holds a save (variant discs
+            # boot one serial but write another — see the PS1 identity rule);
+            # a disc-serial filename identifies an as-yet-unwritten CD card.
+            if serial or filename_serial:
+                title_id = serial or filename_serial
+            # A formatted-but-blank card (PS1 memory card / Saturn backup RAM
+            # with no entries) means "the game is here but hasn't saved yet":
+            # keep the row visible so a server save can be downloaded into it,
+            # but report it as having no save data so it can never upload an
+            # empty card over a real one.
+            if empty_card:
+                _debug_scan(f"MiSTer: blank card (no save data) {sv.remote_path}")
+                save_hash = ""
+            results.append(
+                SaveFile(
+                    title_id=title_id,
+                    path=remote,
+                    hash=save_hash,
+                    mtime=sv.mtime or time.time(),
+                    system=sv.system,
+                    game_name=posixpath.splitext(sv.filename)[0],
+                    save_exists=not empty_card,
+                    profile_scope=profile_scope,
+                )
+            )
+            if idx == 1 or idx % 10 == 0 or idx == total:
+                _emit_progress(
+                    progress_callback,
+                    f"Scanning MiSTer saves. {idx}/{total}",
+                    idx,
+                    total,
+                )
+    return results
+
+
+# CD image extensions the MiSTer CD cores load — a save is only picked up
+# when its name matches the loaded game's folder (or file stem) exactly.
+_MISTER_PS1_ROM_EXTS = {".chd", ".cue", ".iso", ".img", ".bin", ".exe"}
+
+
+def _mister_matching_rom_stem(ssh, folder: str, game_name: str) -> str | None:
+    """Find an installed MiSTer game whose name matches ``game_name``.
+
+    Checks USB first (cores prefer it), then SD.  CD games install as
+    per-game subfolders (``games/PSX/<Game>/``) and the core names the save
+    after the *folder*, so directory names are matched first; loose image
+    files are matched by stem for hand-copied setups.  Match is by
+    normalized slug so tag/spacing differences don't matter.
+    """
+    target = normalize_rom_name(str(game_name or ""))
+    if not target or target == "unknown":
+        return None
+    for root in ("/media/usb0/games", "/media/fat/games"):
+        try:
+            entries = ssh._sftp.listdir_attr(f"{root}/{folder}")
+        except Exception:
+            continue
+        loose_match = None
+        for attr in sorted(entries, key=lambda a: a.filename):
+            name = attr.filename
+            if stat_module.S_ISDIR(attr.st_mode or 0):
+                if normalize_rom_name(name) == target:
+                    return name
+                continue
+            stem, ext = posixpath.splitext(name)
+            if ext.lower() in _MISTER_PS1_ROM_EXTS and loose_match is None:
+                if normalize_rom_name(stem) == target:
+                    loose_match = stem
+        if loose_match:
+            return loose_match
+    return None
+
+
+def build_mister_ssh_save_path(
+    profile: dict,
+    title_id: str,
+    system: str,
+    game_name: str,
+    save_ext: str = ".sav",
+) -> SshSavePath | None:
+    """Remote path for downloading a server-only save onto a MiSTer.
+
+    Prefers an existing ``/media/fat/saves/<Folder>`` matching the system
+    (folder names drifted across MiSTer releases), else the modern name.
+    MiSTer cores always write ``.sav`` regardless of the profile's save
+    extension.  For PS1 the name must be what the core will look for: the
+    game's folder when that game is installed, otherwise the disc serial in
+    ``SLPM-86219`` form, which is what the core uses when booting a real CD.
+    """
+    from mister_ssh import MISTER_SAVES_DIR
+    from systems import mister_system_folder_candidates
+
+    system = (system or "").upper()
+    candidates = mister_system_folder_candidates(system)
+    if not candidates:
+        return None
+    folder = candidates[0]
+    stem = re.sub(r'[<>:"/\\|?*]', "_", str(game_name or "").strip()) or title_id
+    serial = _normalize_ps1_serial(title_id) if system == "PS1" else None
+    from systems import MISTER_CD_SYSTEMS
+
+    try:
+        with _mister_ssh_from_profile(profile) as ssh:
+            existing = set(ssh._sftp.listdir(MISTER_SAVES_DIR))
+            folder = next((c for c in candidates if c in existing), candidates[0])
+            if system in MISTER_CD_SYSTEMS:
+                # CD cores name the save after the installed game's folder.
+                rom_stem = _mister_matching_rom_stem(ssh, folder, game_name)
+                if rom_stem:
+                    stem = rom_stem
+                elif serial:
+                    # Game not installed — assume it will be played from CD.
+                    stem = _memcard_serial_dirname(serial)
+    except Exception:
+        if serial and stem == title_id:
+            stem = _memcard_serial_dirname(serial)
+
+    remote_path = f"{MISTER_SAVES_DIR}/{folder}/{stem}.sav"
+    return _mister_ssh_save_path(profile, remote_path, assume_exists=False)
 
 
 def _scan_mister(
@@ -4858,7 +5362,7 @@ def compare_with_server(
         save.title_id = effective_title_id
         if (
             save.system == "SAT"
-            and save.path is not None
+            and isinstance(save.path, Path)
             and save.path.exists()
             and save.save_exists
         ):
@@ -5193,14 +5697,15 @@ def upload_save(
         )
         local_hash = _hash_ps3_dir_files(path)
     else:
+        # Saturn container/archive handling needs a local filesystem path;
+        # remote (SSH/FTP) Saturn saves upload as raw bytes.
+        is_local_sat = (system or "").upper() == "SAT" and isinstance(path, Path)
         saroo_payload = (
-            _resolve_saroo_native_payload(title_id, path)
-            if (system or "").upper() == "SAT"
-            else None
+            _resolve_saroo_native_payload(title_id, path) if is_local_sat else None
         )
         if saroo_payload is not None:
             data = saroo_payload[0]
-        elif (system or "").upper() == "SAT":
+        elif is_local_sat:
             data, archive_names = _canonical_saturn_payload(
                 title_id,
                 path,
@@ -5214,6 +5719,12 @@ def upload_save(
                 )
             if archive_names:
                 _set_saturn_archive_names(title_id, archive_names)
+        elif (system or "").upper() == "SAT" and isinstance(path, SshSavePath):
+            # MiSTer keeps the byte-expanded 64 KB image — store the canonical
+            # 32 KB internal BRAM so every Saturn client shares one payload.
+            from saroo_format import normalize_saturn_save
+
+            data = normalize_saturn_save(path.read_bytes())
         else:
             data = path.read_bytes()
         local_hash = hashlib.sha256(data).hexdigest()
@@ -5300,8 +5811,17 @@ def download_save(
             timeout=timeout,
         )
     resp.raise_for_status()
-    if isinstance(dest_path, FtpSavePath):
-        dest_path.write_bytes(resp.content)
+    if isinstance(dest_path, (FtpSavePath, SshSavePath)):
+        content = resp.content
+        if (system or "").upper() == "SAT" and isinstance(dest_path, SshSavePath):
+            # Server stores canonical 32 KB internal BRAM; the MiSTer core
+            # wants it byte-expanded to 64 KB.
+            from saroo_format import convert_saturn_save_format
+
+            content = convert_saturn_save_format(
+                content, _saturn_format_for_path(dest_path)
+            )
+        dest_path.write_bytes(content)
         headers_obj = getattr(resp, "headers", {}) or {}
         server_hash = headers_obj.get(
             "X-Save-Hash", hashlib.sha256(resp.content).hexdigest()

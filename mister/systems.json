@@ -610,12 +610,12 @@
     "sg-1000": "SG1000",
     "sg1000": "SG1000",
     "sc-3000": "SG1000",
-    "megacd": "SCD",
-    "megacdjp": "SCD",
+    "megacd": "SEGACD",
+    "megacdjp": "SEGACD",
     "sega32x": "32X",
     "sega32xjp": "32X",
     "sega32xna": "32X",
-    "segacd": "SCD",
+    "segacd": "SEGACD",
     "model2": "ARCADE",
     "model3": "ARCADE",
     "naomi": "ARCADE",
@@ -953,18 +953,30 @@
     "MegaDrive": "MD",
     "N64": "N64",
     "Gameboy": "GB",
+    "GAMEBOY": "GB",
     "GBC": "GBC",
     "GameGear": "GG",
     "SMS": "SMS",
     "PCEngine": "PCE",
     "TurboGrafx16": "PCE",
+    "TGFX16": "PCE",
+    "TGFX16-CD": "PCECD",
     "Atari2600": "A2600",
     "Atari7800": "A7800",
+    "ATARI7800": "A7800",
     "Lynx": "LYNX",
+    "AtariLynx": "LYNX",
     "NeoGeo": "NEOGEO",
+    "NeoGeo-CD": "NEOCD",
+    "NeoGeoPocket": "NGP",
+    "NeoGeoPocket-Color": "NGPC",
     "32X": "32X",
+    "S32X": "32X",
     "MegaCD": "SEGACD",
     "PSX": "PS1",
+    "WonderSwan": "WSWAN",
+    "WonderSwanColor": "WSWANC",
+    "3DO": "3DO",
     "GG": "GG",
     "NEOGEO": "NEOGEO",
     "Lynx48": "LYNX",
@@ -989,5 +1001,102 @@
     "SEGACD": "MegaCD",
     "PS1": "PSX",
     "SAT": "Saturn"
-  }
+  },
+  "mister_system_folder_candidates": {
+    "GBA": [
+      "GBA"
+    ],
+    "SNES": [
+      "SNES"
+    ],
+    "NES": [
+      "NES"
+    ],
+    "MD": [
+      "MegaDrive",
+      "Genesis"
+    ],
+    "N64": [
+      "N64"
+    ],
+    "GB": [
+      "GAMEBOY",
+      "Gameboy"
+    ],
+    "GBC": [
+      "GBC"
+    ],
+    "GG": [
+      "GameGear"
+    ],
+    "SMS": [
+      "SMS"
+    ],
+    "PCE": [
+      "TGFX16",
+      "PCEngine",
+      "TurboGrafx16"
+    ],
+    "PCECD": [
+      "TGFX16-CD"
+    ],
+    "A2600": [
+      "Atari2600"
+    ],
+    "A7800": [
+      "ATARI7800",
+      "Atari7800"
+    ],
+    "LYNX": [
+      "AtariLynx",
+      "Lynx"
+    ],
+    "NEOGEO": [
+      "NEOGEO",
+      "NeoGeo"
+    ],
+    "NEOCD": [
+      "NeoGeo-CD"
+    ],
+    "NGP": [
+      "NeoGeoPocket"
+    ],
+    "NGPC": [
+      "NeoGeoPocket-Color"
+    ],
+    "32X": [
+      "S32X",
+      "32X"
+    ],
+    "SEGACD": [
+      "MegaCD"
+    ],
+    "PS1": [
+      "PSX"
+    ],
+    "SAT": [
+      "Saturn"
+    ],
+    "WSWAN": [
+      "WonderSwan"
+    ],
+    "WSWANC": [
+      "WonderSwanColor"
+    ],
+    "3DO": [
+      "3DO"
+    ]
+  },
+  "mister_games_roots": {
+    "sd": "/media/fat/games",
+    "usb": "/media/usb0/games"
+  },
+  "mister_cd_systems": [
+    "3DO",
+    "NEOCD",
+    "PCECD",
+    "PS1",
+    "SAT",
+    "SEGACD"
+  ]
 }

@@ -24,6 +24,7 @@ from rom_installer import (
     ROM_FORMAT_OPTIONS,
     available_systems_for_profiles,
     build_install_plan,
+    build_install_plans,
     fetch_rom_catalog,
     group_multidisc_roms,
     install_rom,
@@ -292,7 +293,11 @@ class RomInstallerTab(QWidget):
             filename = rom.get("filename", "")
             if len(members) > 1:
                 name = f"{name} ({len(members)} discs)"
-                filename = f"{len(members)} discs combined"
+                filename = (
+                    f"{len(members)} discs in one folder"
+                    if rom.get("install_members")
+                    else f"{len(members)} discs combined"
+                )
             values = [
                 rom.get("system", ""),
                 name,
@@ -332,7 +337,9 @@ class RomInstallerTab(QWidget):
             if not isinstance(rom, dict):
                 continue
             try:
-                plans.append(build_install_plan(profile, rom, system, override))
+                # One row can expand to several plans (multi-disc groups that
+                # install disc-by-disc into a shared game folder).
+                plans.extend(build_install_plans(profile, rom, system, override))
             except Exception as exc:
                 errors.append(f"{rom.get('name') or rom.get('filename', '?')}: {exc}")
         if not plans:
@@ -347,7 +354,10 @@ class RomInstallerTab(QWidget):
         else:
             preview = "\n".join(f"  • {p.display_name} ({p.format_label})" for p in plans[:15])
             more = f"\n  … and {len(plans) - 15} more" if len(plans) > 15 else ""
-            prompt = f"Install {len(plans)} ROMs (one at a time)?\n\n{preview}{more}"
+            # All discs of one game land in the same folder — show it.
+            parents = {str(p.target_path.parent) for p in plans}
+            dest = f"\n\nInto:\n{parents.pop()}" if len(parents) == 1 else ""
+            prompt = f"Install {len(plans)} ROMs (one at a time)?\n\n{preview}{more}{dest}"
         reply = QMessageBox.question(
             self,
             "Install ROM",

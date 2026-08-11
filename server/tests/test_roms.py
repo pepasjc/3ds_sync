@@ -393,6 +393,22 @@ class TestRomCatalog:
         assert body["total"] == 1
         assert body["roms"][0]["system"] == "GBA"
 
+    def test_filter_by_system_accepts_aliases(self, rom_client, auth_headers):
+        """A catalog indexed before an alias was normalised must still match.
+
+        Sega CD ROMs indexed as ``SCD`` have to answer a request for the
+        canonical ``SEGACD`` (and vice versa), otherwise the ROM installer
+        shows an empty list until the server is rescanned.
+        """
+        from app.routes.roms import _system_match_set
+
+        assert _system_match_set("SEGACD") == {"SEGACD", "SCD"}
+        assert _system_match_set("SCD") == {"SEGACD", "SCD"}
+        assert _system_match_set("segacd") == {"SEGACD", "SCD"}
+        # A system with no aliases matches only itself.
+        assert _system_match_set("GBA") == {"GBA"}
+        assert _system_match_set("") == set()
+
     def test_search_roms(self, rom_client, auth_headers):
         resp = rom_client.get("/api/v1/roms?search=mario", headers=auth_headers)
         assert resp.status_code == 200
@@ -2299,6 +2315,32 @@ class TestRomDbCache:
             "PS1_final_fantasy_vii_usa_disc_1",
             "PS1_final_fantasy_vii_usa_disc_2",
         ]
+
+    def test_scan_indexes_sega_cd_under_the_canonical_code(self, rom_dir, tmp_path):
+        """Every Sega CD folder spelling must index as SEGACD, not the SCD alias.
+
+        Saves are keyed ``SEGACD_<slug>``; indexing ROMs as ``SCD_<slug>``
+        split the same game across two keys and made the catalog look empty
+        to a client asking for the canonical code.
+        """
+        from app.services import rom_db, rom_scanner
+
+        rom_db.init_db(tmp_path / "saves")
+
+        for folder, name in (
+            ("segacd", "Sonic CD (USA).chd"),
+            ("megacd", "Snatcher (USA).chd"),
+            ("scd", "Popful Mail (USA).chd"),
+        ):
+            (rom_dir / folder).mkdir()
+            (rom_dir / folder / name).write_bytes(b"\x00" * 64)
+
+        catalog = rom_scanner.RomCatalog()
+        assert catalog.scan(rom_dir, use_crc32=False) == 3
+
+        rows = rom_db.list_all()
+        assert {row["system"] for row in rows} == {"SEGACD"}
+        assert all(row["title_id"].startswith("SEGACD_") for row in rows)
 
     def test_scan_maps_3do_and_virtualboy_to_native_systems(self, rom_dir, tmp_path):
         from app.services import rom_db, rom_scanner
