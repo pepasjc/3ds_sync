@@ -238,6 +238,85 @@ def test_blank_ps1_cards_stay_visible_but_cannot_upload(monkeypatch):
     assert all(s.hash == "" and s.save_exists is False for s in saves)
 
 
+class _FakeAttr:
+    def __init__(self, filename, is_dir=False):
+        self.filename = filename
+        self.st_mode = 0o040755 if is_dir else 0o100644
+
+
+class _RomListingSSH:
+    """Serves a fake games/<folder> listing over the SFTP surface we use."""
+
+    host = "h"
+
+    def __init__(self, listings: dict):
+        self.listings = listings
+        self._sftp = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def listdir(self, path):
+        if path == "/media/fat/saves":
+            return ["SNES", "PSX"]
+        raise FileNotFoundError(path)
+
+    def listdir_attr(self, path):
+        if path not in self.listings:
+            raise FileNotFoundError(path)
+        return self.listings[path]
+
+
+def test_download_path_uses_the_installed_rom_name(monkeypatch):
+    """Server display names differ from on-device ROM names; the core only
+    finds ``<rom stem>.sav``."""
+    rom = "Ganbare Goemon 2 - Kiteretsu Shougun McGuiness (Japan).sfc"
+    ssh = _RomListingSSH({"/media/usb0/games/SNES": [_FakeAttr(rom)]})
+    monkeypatch.setattr(se, "_mister_ssh_from_profile", lambda p: ssh)
+
+    path = se.build_mister_ssh_save_path(
+        _ssh_profile(),
+        "SNES_ganbare_goemon_2_kiteretsu_shougun_mcguiness_japan",
+        "SNES",
+        "Ganbare Goemon 2 Kiteretsu Shougun Mcguiness Japan",  # server's name
+    )
+    assert path.remote_path == (
+        "/media/fat/saves/SNES/"
+        "Ganbare Goemon 2 - Kiteretsu Shougun McGuiness (Japan).sav"
+    )
+
+
+def test_download_path_falls_back_to_the_server_name_when_not_installed(monkeypatch):
+    ssh = _RomListingSSH({"/media/usb0/games/SNES": [_FakeAttr("Other Game.sfc")]})
+    monkeypatch.setattr(se, "_mister_ssh_from_profile", lambda p: ssh)
+
+    path = se.build_mister_ssh_save_path(
+        _ssh_profile(), "SNES_some_game", "SNES", "Some Game"
+    )
+    assert path.remote_path == "/media/fat/saves/SNES/Some Game.sav"
+
+
+def test_download_path_prefers_a_cd_game_folder(monkeypatch):
+    """CD cores name the card after the folder, so directories win."""
+    ssh = _RomListingSSH(
+        {
+            "/media/usb0/games/PSX": [
+                _FakeAttr("Final Fantasy VII (USA)", is_dir=True),
+                _FakeAttr("Final Fantasy VII (Disc 1) (USA).chd"),
+            ]
+        }
+    )
+    monkeypatch.setattr(se, "_mister_ssh_from_profile", lambda p: ssh)
+
+    path = se.build_mister_ssh_save_path(
+        _ssh_profile(), "SLUS00868", "PS1", "Final Fantasy VII (USA)"
+    )
+    assert path.remote_path == "/media/fat/saves/PSX/Final Fantasy VII (USA).sav"
+
+
 def test_blank_cd_card_offers_a_download_when_the_server_has_the_save(monkeypatch):
     """Boot the CD once to make the card, then pull the save down into it."""
     blank = se.SaveFile(
@@ -277,6 +356,73 @@ def test_blank_cd_card_offers_a_download_when_the_server_has_the_save(monkeypatc
     assert local[0].status == "server_newer"
     # Download targets the card the core already created, not a new file.
     assert local[0].save.path.remote_path == "/media/fat/saves/PSX/SLPM-86219.sav"
+
+
+def _segacd_bram(entry: bytes | None = None) -> bytes:
+    """8 KB Sega CD internal backup RAM with the standard format footer."""
+    data = bytearray(8192)
+    footer = bytes.fromhex(
+        "5f5f5f5f5f5f5f5f5f5f5f00000000400"
+        "07d007d007d007d0000000000000000"
+    )
+    data[-0x40 : -0x40 + len(footer)] = footer
+    data[-0x20:] = b"SEGA_CD_ROM\x00\x01\x00\x00\x00RAM_CARTRIDGE___"
+    if entry:
+        data[-0x60:-0x40] = entry.ljust(0x20, b"\x00")
+    return bytes(data)
+
+
+def test_segacd_blank_bram_detection():
+    blank = _segacd_bram()
+    assert len(blank) == 8192
+    assert b"SEGA_CD_ROM" in blank[-0x40:]
+    assert se._segacd_bram_is_empty(blank) is True
+    # One directory entry present -> real save data.
+    assert se._segacd_bram_is_empty(_segacd_bram(b"SNATCHER___\x00\x01")) is False
+    # Not a Sega CD image at all.
+    assert se._segacd_bram_is_empty(b"\x00" * 8192) is False
+    assert se._segacd_bram_is_empty(b"") is False
+
+
+def test_blank_segacd_card_cannot_upload_over_a_real_save(monkeypatch):
+    """Regression: a freshly formatted BRAM compared as if it held a save."""
+    import mister_ssh as ms
+
+    blank = _segacd_bram()
+
+    class FakeSSH:
+        host = "h"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def scan_saves(self, progress_cb=None):
+            return [
+                ms.MiSTerSave(
+                    system="SEGACD",
+                    folder="MegaCD",
+                    filename="Snatcher (USA).sav",
+                    remote_path="/media/fat/saves/MegaCD/Snatcher (USA).sav",
+                    title_id="SEGACD_snatcher_usa",
+                    size=len(blank),
+                    mtime=1000.0,
+                )
+            ]
+
+        def read_file(self, path):
+            return blank
+
+    monkeypatch.setattr(se, "_mister_ssh_from_profile", lambda p: FakeSSH())
+    monkeypatch.setattr(se, "_get_cached_hash_for_key", lambda *a: None)
+    monkeypatch.setattr(se, "_set_cached_hash_for_key", lambda *a: None)
+
+    (save,) = se._scan_mister_ssh(_ssh_profile(), {})
+    assert save.title_id == "SEGACD_snatcher_usa"  # matches the server's key
+    assert save.save_exists is False
+    assert save.hash == ""
 
 
 def test_scan_mister_ssh_keys_cd_card_by_filename_serial(monkeypatch):

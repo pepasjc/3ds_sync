@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 from shared.rom_id import make_title_id, normalize_rom_name, parse_title_id
-from shared.systems import SYNC_ID_RULES, normalize_system_code
+from shared.systems import SYNC_ID_RULES, SYSTEM_ALIASES, normalize_system_code
 
 
 # Serial characters that survive canonicalisation.  Everything else is
@@ -327,6 +327,14 @@ def canonicalize_slug_title_id(
         return title_id  # not a slug form
 
     system, slug = parsed
+    # An alias in the system position is its own divergence: a client that
+    # sends GEN_sonic must land in the same slot as MD_sonic.  Do this before
+    # anything else so it applies to slug-canonical systems too.
+    canonical_system = SYSTEM_ALIASES.get(system, system)
+    if canonical_system != system:
+        system = canonical_system
+        title_id = f"{system}_{slug}"
+
     rule = SYNC_ID_RULES.get(system, {"strategy": "slug"})
     if rule.get("strategy") == "slug":
         return title_id  # system uses slugs as canonical — nothing to upgrade

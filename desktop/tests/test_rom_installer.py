@@ -204,6 +204,139 @@ def test_mister_multidisc_chds_share_one_game_folder():
     assert str(plans[0].target_path).endswith("Final Fantasy VII (Disc 1) (USA).chd")
 
 
+def test_index_catalog_by_title_groups_discs_and_dumps():
+    from rom_installer import index_catalog_by_title
+
+    index = index_catalog_by_title(_multidisc_catalog())
+    assert set(index) == {"SCUS94163", "SLUS00001"}
+    assert len(index["SCUS94163"]) == 3  # three discs of one game
+    assert len(index["SLUS00001"]) == 1
+
+
+def test_catalog_install_groups_collapses_discs_but_keeps_dumps():
+    """One entry per dump; a multi-disc set is a single entry."""
+    from rom_installer import catalog_install_groups
+
+    profile = _mister_profile(target="usb")
+    # Two dumps of one Saturn game (the real SAT_T-9527G case) …
+    dumps = [
+        {
+            "rom_id": "SAT_T-9527G__castlevania",
+            "title_id": "SAT_T-9527G",
+            "system": "SAT",
+            "name": "Castlevania - Symphony of the Night (Japan) (2M) [T-En]",
+            "filename": "Castlevania - Symphony of the Night (Japan) (2M) [T-En].chd",
+        },
+        {
+            "rom_id": "SAT_T-9527G__dracula_x",
+            "title_id": "SAT_T-9527G",
+            "system": "SAT",
+            "name": "Dracula X - Nocturne in the Moonlight (Japan) [T-En]",
+            "filename": "Dracula X - Nocturne in the Moonlight (Japan) [T-En].chd",
+        },
+    ]
+    assert len(catalog_install_groups(profile, dumps, "SAT")) == 2
+
+    # … while three discs of one PS1 game collapse into a single entry.
+    discs = [r for r in _multidisc_catalog() if r["title_id"] == "SCUS94163"]
+    groups = catalog_install_groups(profile, discs, "PS1")
+    assert len(groups) == 1
+    assert groups[0]["disc_total"] == 3
+
+
+def test_saturn_discs_group_without_server_disc_metadata():
+    """The server only computes disc groups for PS1.
+
+    A Saturn set arrives as unrelated rows sharing a serial, so the disc tag
+    in the filename has to do the grouping — while two different dumps of
+    the same game stay separate entries.
+    """
+    from rom_installer import build_title_install_plans, catalog_install_groups
+
+    profile = _mister_profile(target="usb")
+    rows = [
+        {
+            "rom_id": f"SAT_T-4507G__{dump}_{disc}",
+            "title_id": "SAT_T-4507G",
+            "system": "SAT",
+            "name": f"Grandia (Japan) (Disc {disc}) (4M) [{dump}]",
+            "filename": f"Grandia (Japan) (Disc {disc}) (4M) [{dump}].chd",
+            # No disc_total / primary_rom_id — exactly what the server sends.
+        }
+        for dump in ("T-En v0.9.3", "T-En v1.1.1")
+        for disc in (2, 1)  # deliberately out of order
+    ]
+
+    groups = catalog_install_groups(profile, rows, "SAT")
+    assert len(groups) == 2  # one per dump, not four loose discs
+    assert all(g["disc_total"] == 2 for g in groups)
+
+    plans = build_title_install_plans(profile, groups[0], "SAT")
+    assert len(plans) == 2
+    # Both discs share one folder, and Disc 1 comes first.
+    assert {str(p.target_path.parent) for p in plans} == {
+        "/media/usb0/games/Saturn/Grandia (Japan) (4M) [T-En v0.9.3]"
+    }
+    assert "(Disc 1)" in plans[0].target_path.name
+    assert "(Disc 2)" in plans[1].target_path.name
+
+
+def test_mister_refuses_a_system_it_has_no_folder_for():
+    """A 3DS ROM must not land loose in the MiSTer games root."""
+    profile = _mister_profile(target="usb")
+    rom = {
+        "rom_id": "0004000000030800",
+        "system": "3DS",
+        "name": "Mario Kart 7",
+        "filename": "Mario Kart 7 (USA).cia",
+    }
+    with pytest.raises(ValueError, match="no games folder"):
+        build_install_plan(profile, rom, "3DS")
+
+
+def test_build_title_install_plans_covers_every_disc():
+    from rom_installer import build_title_install_plans, catalog_install_groups
+
+    profile = _mister_profile(target="usb")
+    discs = [r for r in _multidisc_catalog() if r["title_id"] == "SCUS94163"]
+    group = catalog_install_groups(profile, discs, "PS1")[0]
+    plans = build_title_install_plans(profile, group, "PS1")
+
+    assert len(plans) == 3
+    assert {str(p.target_path.parent) for p in plans} == {
+        "/media/usb0/games/PSX/Final Fantasy VII (USA)"
+    }
+
+
+def test_profile_can_install():
+    from rom_installer import profile_can_install
+
+    assert profile_can_install({"device_type": "Generic", "path": "C:/roms"}) is True
+    assert profile_can_install(_mister_profile(target="usb")) is True  # no path
+    assert profile_can_install({"device_type": "Generic", "path": ""}) is False
+    assert profile_can_install(None) is False
+
+
+def test_catalog_for_system_is_cached(monkeypatch):
+    import rom_installer
+
+    calls = []
+
+    def fake_fetch(system="", search=""):
+        calls.append(system)
+        return [{"title_id": "GBA_x", "filename": "x.gba"}]
+
+    monkeypatch.setattr(rom_installer, "fetch_rom_catalog", fake_fetch)
+    rom_installer.clear_catalog_cache()
+
+    assert rom_installer.catalog_for_system("GBA")
+    assert rom_installer.catalog_for_system("gba")  # same system, cached
+    assert calls == ["GBA"]
+    assert rom_installer.catalog_roms_for_title("GBA", "GBA_x")
+    assert rom_installer.catalog_roms_for_title("GBA", "GBA_missing") == []
+    rom_installer.clear_catalog_cache()
+
+
 def test_safe_folder_name_keeps_version_tags(tmp_path):
     from rom_installer import safe_folder_name
 

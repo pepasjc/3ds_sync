@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 
-from shared.systems import SYSTEM_CODES
+from shared.systems import SYSTEM_ALIASES, SYSTEM_CODES
 
 
 # Regex for emulator title_id format: SYSTEM_slug.
@@ -96,6 +96,11 @@ def normalize_rom_name(filename: str) -> str:
 def make_title_id(system: str, rom_filename: str) -> str:
     """Return the canonical title_id, e.g. ``GBA_legend_of_zelda_the_minish_cap_usa``.
 
+    The system is resolved through ``SYSTEM_ALIASES`` first: ``SYSTEM_CODES``
+    deliberately contains aliases so they validate, but an alias must never
+    reach a title_id or the same game ends up in two server slots
+    (``GEN_sonic`` next to ``MD_sonic``).
+
     Raises ``ValueError`` when ``system`` isn't in the shared registry —
     callers should either pass a canonicalised code or fall back to a
     free-form composition.
@@ -105,6 +110,7 @@ def make_title_id(system: str, rom_filename: str) -> str:
         raise ValueError(
             f"Unknown system code: {system!r}. Valid codes: {sorted(SYSTEM_CODES)}"
         )
+    system = SYSTEM_ALIASES.get(system, system)
     return f"{system}_{normalize_rom_name(rom_filename)}"
 
 

@@ -3551,6 +3551,31 @@ def _ps1_card_serial(card: bytes) -> str | None:
     return None
 
 
+# A Sega CD backup RAM ends with a 0x40-byte format footer; save directory
+# entries are 0x20 bytes each and grow backwards from it, an unused slot
+# being all zero.  Same layout for the internal 8 KB BRAM and for RAM carts.
+_SEGACD_FOOTER_SIZE = 0x40
+_SEGACD_DIR_ENTRY_SIZE = 0x20
+_SEGACD_FOOTER_MAGIC = b"SEGA_CD_ROM"
+
+
+def _segacd_bram_is_empty(data: bytes) -> bool:
+    """True for a formatted Sega CD backup RAM holding no save files.
+
+    The MegaCD core writes the format footer the first time a game
+    initialises the BRAM, so a freshly created ``.sav`` is 99% zeros with a
+    valid footer and an empty directory.
+    """
+    if len(data) < _SEGACD_FOOTER_SIZE + _SEGACD_DIR_ENTRY_SIZE:
+        return False
+    if _SEGACD_FOOTER_MAGIC not in data[-_SEGACD_FOOTER_SIZE:]:
+        return False
+    first_entry = data[
+        -_SEGACD_FOOTER_SIZE - _SEGACD_DIR_ENTRY_SIZE : -_SEGACD_FOOTER_SIZE
+    ]
+    return not any(first_entry)
+
+
 def _ps1_card_is_empty(card: bytes) -> bool:
     """True for a formatted PS1 card that holds no save blocks at all.
 
@@ -3671,9 +3696,9 @@ def _scan_mister_ssh(
                     else cached_serial
                 )
                 need_read = not save_hash or cached_serial is None
-            elif sv.system == "SAT":
+            elif sv.system in ("SAT", "SEGACD"):
                 cached_marker = _get_cached_hash_for_key(
-                    f"{cache_key}|satempty", sv.size, sv.mtime
+                    f"{cache_key}|blank", sv.size, sv.mtime
                 )
                 empty_card = cached_marker == _PS1_EMPTY_CARD_MARKER
                 need_read = not save_hash or cached_marker is None
@@ -3715,7 +3740,20 @@ def _scan_mister_ssh(
                         ).hexdigest()
                         empty_card = not list_saturn_archive_names(data)
                         _set_cached_hash_for_key(
-                            f"{cache_key}|satempty",
+                            f"{cache_key}|blank",
+                            sv.size,
+                            sv.mtime,
+                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
+                        )
+                    elif sv.system == "SEGACD":
+                        # Raw 8 KB internal BRAM — the same bytes Genesis Plus
+                        # GX keeps in a .brm, so it needs no conversion; only
+                        # the "formatted but no saves in it" case matters.
+                        data = ssh.read_file(sv.remote_path)
+                        save_hash = hashlib.sha256(data).hexdigest()
+                        empty_card = _segacd_bram_is_empty(data)
+                        _set_cached_hash_for_key(
+                            f"{cache_key}|blank",
                             sv.size,
                             sv.mtime,
                             _PS1_EMPTY_CARD_MARKER if empty_card else "-",
@@ -3733,8 +3771,8 @@ def _scan_mister_ssh(
             # a disc-serial filename identifies an as-yet-unwritten CD card.
             if serial or filename_serial:
                 title_id = serial or filename_serial
-            # A formatted-but-blank card (PS1 memory card / Saturn backup RAM
-            # with no entries) means "the game is here but hasn't saved yet":
+            # A formatted-but-blank card (PS1 memory card, Saturn or Sega CD
+            # backup RAM with no entries) means "here but hasn't saved yet":
             # keep the row visible so a server save can be downloaded into it,
             # but report it as having no save data so it can never upload an
             # empty card over a real one.
@@ -3763,23 +3801,47 @@ def _scan_mister_ssh(
     return results
 
 
-# CD image extensions the MiSTer CD cores load — a save is only picked up
-# when its name matches the loaded game's folder (or file stem) exactly.
-_MISTER_PS1_ROM_EXTS = {".chd", ".cue", ".iso", ".img", ".bin", ".exe"}
+def _mister_matching_rom_stem(
+    ssh,
+    folder: str,
+    game_name: str,
+    system: str = "",
+    title_id: str = "",
+) -> str | None:
+    """Name the installed MiSTer game a save belongs to, else None.
 
+    Cores load ``<name>.sav`` beside the game they booted, so a save
+    downloaded for a game that is already installed must take that game's
+    on-device name — not the server's display name.  The two diverge badly
+    in practice: the server stores ``Ganbare Goemon 2 Kiteretsu Shougun
+    Mcguiness Japan`` while the card holds ``Ganbare Goemon 2 - Kiteretsu
+    Shougun McGuiness (Japan).sfc``.
 
-def _mister_matching_rom_stem(ssh, folder: str, game_name: str) -> str | None:
-    """Find an installed MiSTer game whose name matches ``game_name``.
-
-    Checks USB first (cores prefer it), then SD.  CD games install as
-    per-game subfolders (``games/PSX/<Game>/``) and the core names the save
-    after the *folder*, so directory names are matched first; loose image
-    files are matched by stem for hand-copied setups.  Match is by
-    normalized slug so tag/spacing differences don't matter.
+    Matching is by ``make_title_id`` — the same function that keys the save
+    in the first place — so a hit is exact by construction; a normalized
+    name comparison is kept as a fallback.  USB is searched before SD
+    because the cores prefer it.  CD games live in per-game subfolders and
+    are named after the *folder*, so directories are matched first.
     """
-    target = normalize_rom_name(str(game_name or ""))
-    if not target or target == "unknown":
+    target_id = str(title_id or "").strip()
+    target_name = normalize_rom_name(str(game_name or ""))
+    if not target_id and (not target_name or target_name == "unknown"):
         return None
+
+    def _matches(name: str, stem: str) -> bool:
+        if target_id and system:
+            try:
+                if make_title_id(system, name) == target_id:
+                    return True
+            except Exception:
+                pass
+            # Serial-keyed systems (Saturn, PS1) can't derive their id from a
+            # filename, and a translation patch shares no words with the
+            # server's title — the ROM catalog knows both, so ask it.
+            if _mister_catalog_title_id(system, stem) == target_id:
+                return True
+        return bool(target_name) and normalize_rom_name(stem) == target_name
+
     for root in ("/media/usb0/games", "/media/fat/games"):
         try:
             entries = ssh._sftp.listdir_attr(f"{root}/{folder}")
@@ -3789,13 +3851,16 @@ def _mister_matching_rom_stem(ssh, folder: str, game_name: str) -> str | None:
         for attr in sorted(entries, key=lambda a: a.filename):
             name = attr.filename
             if stat_module.S_ISDIR(attr.st_mode or 0):
-                if normalize_rom_name(name) == target:
+                # A folder name is already the stem — never split it, game
+                # folders routinely contain dots ("… v1.021+hotfix").
+                if _matches(name, name):
                     return name
                 continue
             stem, ext = posixpath.splitext(name)
-            if ext.lower() in _MISTER_PS1_ROM_EXTS and loose_match is None:
-                if normalize_rom_name(stem) == target:
-                    loose_match = stem
+            if ext.lower() not in ROM_EXTENSIONS:
+                continue
+            if loose_match is None and _matches(name, stem):
+                loose_match = stem
         if loose_match:
             return loose_match
     return None
@@ -3827,20 +3892,22 @@ def build_mister_ssh_save_path(
     folder = candidates[0]
     stem = re.sub(r'[<>:"/\\|?*]', "_", str(game_name or "").strip()) or title_id
     serial = _normalize_ps1_serial(title_id) if system == "PS1" else None
-    from systems import MISTER_CD_SYSTEMS
 
     try:
         with _mister_ssh_from_profile(profile) as ssh:
             existing = set(ssh._sftp.listdir(MISTER_SAVES_DIR))
             folder = next((c for c in candidates if c in existing), candidates[0])
-            if system in MISTER_CD_SYSTEMS:
-                # CD cores name the save after the installed game's folder.
-                rom_stem = _mister_matching_rom_stem(ssh, folder, game_name)
-                if rom_stem:
-                    stem = rom_stem
-                elif serial:
-                    # Game not installed — assume it will be played from CD.
-                    stem = _memcard_serial_dirname(serial)
+            # Every core loads ``<game>.sav`` beside the game it booted, so
+            # an installed game's on-device name wins over the server's.
+            rom_stem = _mister_matching_rom_stem(
+                ssh, folder, game_name, system, title_id
+            )
+            if rom_stem:
+                stem = rom_stem
+            elif serial:
+                # PS1 game not installed — assume it will be played from CD,
+                # where the core names the card after the disc serial.
+                stem = _memcard_serial_dirname(serial)
     except Exception:
         if serial and stem == title_id:
             stem = _memcard_serial_dirname(serial)

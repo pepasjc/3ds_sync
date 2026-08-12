@@ -60,3 +60,35 @@ def test_sega_cd_is_segacd_everywhere():
 
 def test_default_save_ext_keys_are_canonical():
     assert [s for s in SYSTEM_DEFAULT_SAVE_EXT if s in SYSTEM_ALIASES] == []
+
+
+def test_make_title_id_never_emits_an_alias():
+    """An alias reaching a title_id splits one game across two server slots.
+
+    ``SYSTEM_CODES`` contains aliases on purpose so they validate, which is
+    why the check has to live in ``make_title_id`` itself — this is how
+    ``GEN_phantasy_star_iv_usa`` ended up beside ``MD_phantasy_star_iv_usa``.
+    """
+    from shared.rom_id import make_title_id
+
+    for alias, canonical in SYSTEM_ALIASES.items():
+        made = make_title_id(alias, "Some Game (USA).bin")
+        assert made == make_title_id(canonical, "Some Game (USA).bin")
+        assert made.startswith(f"{canonical}_")
+
+
+def test_slug_title_ids_canonicalize_alias_systems():
+    """An older client still sending an alias must land in the right slot."""
+    from shared.sync_id import canonicalize_slug_title_id
+
+    assert (
+        canonicalize_slug_title_id("GEN_phantasy_star_iv_usa")
+        == "MD_phantasy_star_iv_usa"
+    )
+    assert canonicalize_slug_title_id("SCD_snatcher_usa") == "SEGACD_snatcher_usa"
+    # Canonical ids and non-slug ids pass through untouched.
+    assert (
+        canonicalize_slug_title_id("MD_phantasy_star_iv_usa")
+        == "MD_phantasy_star_iv_usa"
+    )
+    assert canonicalize_slug_title_id("SLUS01324") == "SLUS01324"

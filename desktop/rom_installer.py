@@ -154,6 +154,80 @@ def fetch_rom_catalog(system: str = "", search: str = "") -> list[dict]:
     return list(resp.json().get("roms", []))
 
 
+_catalog_cache: dict[str, list[dict]] = {}
+
+
+def catalog_for_system(system: str, refresh: bool = False) -> list[dict]:
+    """Catalog rows for one system, fetched once per process.
+
+    The Sync tab asks per system while deciding which saves have an
+    installable game, so the same list would otherwise be pulled repeatedly.
+    """
+    key = (system or "").upper()
+    if refresh:
+        _catalog_cache.pop(key, None)
+    if key not in _catalog_cache:
+        _catalog_cache[key] = fetch_rom_catalog(key)
+    return _catalog_cache[key]
+
+
+def clear_catalog_cache() -> None:
+    _catalog_cache.clear()
+
+
+def index_catalog_by_title(roms: Iterable[dict]) -> dict[str, list[dict]]:
+    """``{title_id: [rom rows]}`` — several rows share one title_id when a
+    game has multiple discs or several dumps (translations, revisions)."""
+    index: dict[str, list[dict]] = {}
+    for rom in roms:
+        title_id = str(rom.get("title_id") or "").strip()
+        if title_id:
+            index.setdefault(title_id, []).append(rom)
+    return index
+
+
+def catalog_roms_for_title(system: str, title_id: str) -> list[dict]:
+    """Catalog rows whose title_id matches a save's, i.e. the game itself."""
+    title_id = str(title_id or "").strip()
+    if not title_id:
+        return []
+    return index_catalog_by_title(catalog_for_system(system)).get(title_id, [])
+
+
+def catalog_install_groups(
+    profile: dict,
+    roms: list[dict],
+    system: str,
+    override_format: str = "",
+) -> list[dict]:
+    """Installable entries for one title: one per distinct dump.
+
+    Multi-disc sets collapse into a single entry (every disc installs
+    together); different dumps of the same game — a translation patch and
+    the original, say — stay separate so the caller can pick one.
+    """
+    return group_multidisc_roms(profile, roms, system, override_format)
+
+
+def build_title_install_plans(
+    profile: dict,
+    rom: dict,
+    system: str,
+    override_format: str = "",
+) -> list[InstallPlan]:
+    """Every plan needed to install one catalog entry (all of its discs)."""
+    return build_install_plans(profile, rom, system, override_format)
+
+
+def profile_can_install(profile: dict) -> bool:
+    """True when a profile has somewhere to put a ROM."""
+    if not isinstance(profile, dict):
+        return False
+    if str(profile.get("path") or "").strip():
+        return True
+    return bool(mister_remote_target(profile))
+
+
 def profile_systems(profile: dict) -> list[str]:
     if "systems" in profile:
         systems = [
@@ -327,7 +401,22 @@ def group_multidisc_roms(
             _DISC_TAG_RE.search(str(rom.get("filename") or rom.get("name") or ""))
         )
         combined = fmt in COMBINED_DISC_FORMATS
-        if (combined or mister_cd) and total > 1 and primary and has_disc_tag:
+        # The server only computes disc groups (primary_rom_id / disc_total)
+        # for PS1, so a Saturn or Mega CD set arrives as unrelated rows.  For
+        # a device that installs discs side by side, the disc tag in the
+        # filename is enough: rows of one title whose names match once the
+        # tag is stripped are the same game.  Different dumps keep different
+        # stripped names, so they stay apart.
+        group_key = primary
+        if mister_cd and has_disc_tag and not (total > 1 and primary):
+            title_key = str(rom.get("title_id") or "").strip()
+            stripped = strip_disc_tag(
+                Path(str(rom.get("filename") or rom.get("name") or "")).stem
+            )
+            if title_key and stripped:
+                group_key = f"{title_key}|{stripped}"
+        if (combined or mister_cd) and has_disc_tag and group_key:
+            primary = group_key
             agg = aggregates.get(primary)
             if agg is None:
                 agg = dict(rom)
@@ -343,13 +432,23 @@ def group_multidisc_roms(
             result.append(rom)
 
     for agg in aggregates.values():
+        # Systems without server-side disc metadata have no disc_index, so
+        # fall back to the filename to keep Disc 1 first.
         members = sorted(
-            agg["disc_members"], key=lambda r: int(r.get("disc_index") or 0)
+            agg["disc_members"],
+            key=lambda r: (
+                int(r.get("disc_index") or 0),
+                str(r.get("filename") or ""),
+            ),
         )
         primary_member = next(
             (m for m in members if str(m.get("rom_id")) == str(agg["rom_id"])),
             members[0],
         )
+        if agg.get("install_members"):
+            # The group key is synthetic for filename-grouped sets; keep a
+            # real rom_id on the row so anything reading it still works.
+            agg["rom_id"] = primary_member.get("rom_id") or agg["rom_id"]
         agg["disc_members"] = members
         agg["disc_total"] = len(members)
         agg["size"] = sum(int(m.get("size") or 0) for m in members)
@@ -482,7 +581,11 @@ def mister_remote_rom_dir(profile: dict, system: str) -> PurePosixPath:
         return PurePosixPath(override)
     root = PurePosixPath(MISTER_GAMES_ROOTS[mister_remote_target(profile)])
     candidates = mister_system_folder_candidates(system)
-    return root / candidates[0] if candidates else root
+    if not candidates:
+        # No core folder for this system — refuse rather than dumping the
+        # file loose in the games root, where no core would ever find it.
+        raise ValueError(f"MiSTer has no games folder for {system or 'this system'}.")
+    return root / candidates[0]
 
 
 def resolve_profile_rom_folder(profile: dict, system: str) -> Path:
