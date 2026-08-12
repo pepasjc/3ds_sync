@@ -187,6 +187,65 @@ def test_ps1_serial_from_filename_accepts_cd_written_names():
     assert f("") is None
 
 
+def test_segacd_uploads_raw_and_unconverted(monkeypatch):
+    """Sega CD backup RAM is identical on both sides — it must not be
+    converted like Saturn or Mega Drive, and must use the plain /raw
+    endpoint rather than a card endpoint."""
+    card = _segacd_bram(b"SNATCHER\x01")
+    sent = {}
+
+    class FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, **kw):
+        sent["url"] = url
+        sent["data"] = kw.get("data")
+        return FakeResp()
+
+    monkeypatch.setattr(se.requests, "post", fake_post)
+    monkeypatch.setattr(se, "_update_state", lambda *a: None)
+    monkeypatch.setattr(se.SshSavePath, "read_bytes", lambda self: card)
+
+    se.upload_save(
+        "SEGACD_snatcher_usa",
+        _ssh_path("/media/fat/saves/MegaCD/Snatcher (USA).sav"),
+        "http://s",
+        {},
+        system="SEGACD",
+    )
+    assert sent["url"].endswith("/saves/SEGACD_snatcher_usa/raw")
+    assert sent["data"] == card  # byte-for-byte, no conversion
+
+
+def test_segacd_download_writes_the_card_unchanged(monkeypatch):
+    card = _segacd_bram(b"SNATCHER\x01")
+    written = {}
+
+    class FakeResp:
+        status_code = 200
+        content = card
+        headers = {"X-Save-Hash": "abc"}
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(se.requests, "get", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(se.SshSavePath, "write_bytes", lambda self, d: written.update(d=d))
+    monkeypatch.setattr(se, "_update_state", lambda *a: None)
+
+    se.download_save(
+        "SEGACD_snatcher_usa",
+        _ssh_path("/media/fat/saves/MegaCD/Snatcher (USA).sav"),
+        "http://s",
+        {},
+        system="SEGACD",
+    )
+    assert written["d"] == card
+
+
 def test_blank_ps1_cards_stay_visible_but_cannot_upload(monkeypatch):
     """A blank card is 'no save data yet' — listed, downloadable, not uploadable."""
     import mister_ssh as ms
