@@ -372,6 +372,70 @@ def _segacd_bram(entry: bytes | None = None) -> bytes:
     return bytes(data)
 
 
+def _md_packed(payload: bytes, sram: int = 8192) -> bytes:
+    """A game's SRAM contents as the MegaDrive core stores them."""
+    packed = bytearray(b"\x00" * sram)
+    packed[64 : 64 + len(payload)] = payload
+    return bytes(packed)
+
+
+def _md_core_image(payload: bytes, sram: int = 8192) -> bytes:
+    """What the core writes: packed SRAM padded with 0xFF to 64 KB."""
+    packed = _md_packed(payload, sram)
+    return packed + b"\xff" * (65536 - len(packed))
+
+
+def _md_emulator_image(payload: bytes, sram: int = 8192) -> bytes:
+    """What emulators and the server keep: one SRAM byte per odd offset."""
+    return se._md_packed_to_expanded(_md_packed(payload, sram))
+
+
+def test_md_layouts_convert_both_ways():
+    """MD SRAM lives on the odd byte of the 68000 bus, so emulators store it
+    expanded while the MiSTer core stores it packed and padded to 64 KB."""
+    emu = _md_emulator_image(b"BOWIE")
+    core = _md_core_image(b"BOWIE")
+
+    # Server -> MiSTer: packed, 0xFF-padded, and exactly 64 KB.
+    to_core = se._md_to_mister(emu)
+    assert len(to_core) == 65536
+    assert to_core == core
+    assert to_core[8192:] == b"\xff" * (65536 - 8192)
+    assert b"BOWIE" in to_core[:8192]
+
+    # MiSTer -> server: back to the expanded layout at the server's size.
+    back = se._md_from_mister(core, target_size=len(emu))
+    assert back == emu
+    assert bytes(back[1::2]) == core[: len(emu) // 2]
+
+
+def test_md_conversion_round_trips():
+    emu = _md_emulator_image(b"SARAH", sram=4096)
+    assert se._md_from_mister(se._md_to_mister(emu), target_size=len(emu)) == emu
+
+    core = _md_core_image(b"SARAH", sram=4096)
+    assert se._md_to_mister(se._md_from_mister(core, target_size=8192)) == core
+
+
+def test_md_sram_size_inferred_from_used_region():
+    """Without a server counterpart, size comes from the used bytes."""
+    assert len(se._md_from_mister(_md_core_image(b"x" * 10, sram=4096))) == 8192
+    assert len(se._md_from_mister(_md_core_image(b"x" * 6000, sram=8192))) == 16384
+    # A server counterpart always wins over the guess.
+    assert (
+        len(se._md_from_mister(_md_core_image(b"x", sram=8192), target_size=8192))
+        == 8192
+    )
+
+
+def test_md_passthrough_when_already_in_the_right_shape():
+    core = _md_core_image(b"x")
+    assert se._md_to_mister(core) is core or se._md_to_mister(core) == core
+    # Not a core image — leave it alone rather than mangling it.
+    odd_sized = b"\x01\x02\x03"
+    assert se._md_from_mister(odd_sized) == odd_sized
+
+
 def test_segacd_blank_bram_detection():
     blank = _segacd_bram()
     assert len(blank) == 8192

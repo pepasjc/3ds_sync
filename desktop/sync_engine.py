@@ -3576,6 +3576,91 @@ def _segacd_bram_is_empty(data: bytes) -> bool:
     return not any(first_entry)
 
 
+# ── Mega Drive SRAM: MiSTer vs emulator layout ──────────────────────────────
+#
+# Mega Drive cartridge SRAM sits on the odd byte of the 68000's 16-bit bus, so
+# the two worlds store it differently:
+#
+#   emulators (and this server)  <sram byte> at every ODD offset, filler at even
+#   MiSTer MegaDrive core        the sram bytes packed, padded with 0xFF to 64 KB
+#
+# The core's transfer loop is a fixed 128 sectors (``&sd_lba[6:0]``), which is
+# why its file is always 65536 bytes regardless of the game's real SRAM size.
+# Handing it a 16 KB emulator save leaves the game with no data.
+_MISTER_MD_SAVE_SIZE = 65536
+_MD_MIN_SRAM = 0x1000  # 4 KB — smallest size seen in the wild
+
+
+def _md_expanded_to_packed(data: bytes) -> bytes:
+    """Emulator/server layout -> the packed SRAM bytes the core stores."""
+    return bytes(data[1::2])
+
+
+def _md_packed_to_expanded(packed: bytes, filler: int = 0x00) -> bytes:
+    """Packed SRAM bytes -> emulator/server layout (byte at each odd offset)."""
+    out = bytearray(len(packed) * 2)
+    for idx, value in enumerate(packed):
+        out[idx * 2] = filler
+        out[idx * 2 + 1] = value
+    return bytes(out)
+
+
+def _md_to_mister(data: bytes) -> bytes:
+    """Server payload -> a 64 KB image the MegaDrive core will load."""
+    if len(data) == _MISTER_MD_SAVE_SIZE:
+        return data  # already core-shaped
+    packed = _md_expanded_to_packed(data)
+    if len(packed) >= _MISTER_MD_SAVE_SIZE:
+        return packed[:_MISTER_MD_SAVE_SIZE]
+    return packed + b"\xff" * (_MISTER_MD_SAVE_SIZE - len(packed))
+
+
+def _md_sram_size(packed: bytes) -> int:
+    """Guess a game's SRAM size from the used portion of a core image.
+
+    The core pads to 64 KB with 0xFF, so the tail says nothing; round the
+    used length up to the next power of two, which is how cartridges are
+    actually sized.
+    """
+    used = len(packed.rstrip(b"\xff"))
+    size = _MD_MIN_SRAM
+    while size < used and size < _MISTER_MD_SAVE_SIZE:
+        size *= 2
+    return size
+
+
+def _server_save_size(
+    title_id: str, base_url: str, headers: dict, timeout: int = 30
+) -> int:
+    """Size of the save already on the server, or 0 when there is none."""
+    try:
+        resp = requests.get(
+            f"{base_url}/api/v1/titles", headers=headers, timeout=timeout
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        titles = body if isinstance(body, list) else body.get("titles", [])
+        for entry in titles:
+            if str(entry.get("title_id", "")) == title_id:
+                return int(entry.get("save_size") or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _md_from_mister(data: bytes, target_size: int = 0) -> bytes:
+    """64 KB core image -> the expanded layout every other client reads.
+
+    ``target_size`` (the size already on the server) wins when known, so a
+    save keeps the exact shape its counterpart clients expect.
+    """
+    if len(data) != _MISTER_MD_SAVE_SIZE:
+        return data  # not a core image — pass through untouched
+    sram = (target_size // 2) if target_size else _md_sram_size(data)
+    sram = max(sram, _MD_MIN_SRAM)
+    return _md_packed_to_expanded(data[:sram])
+
+
 def _ps1_card_is_empty(card: bytes) -> bool:
     """True for a formatted PS1 card that holds no save blocks at all.
 
@@ -3696,7 +3781,9 @@ def _scan_mister_ssh(
                     else cached_serial
                 )
                 need_read = not save_hash or cached_serial is None
-            elif sv.system in ("SAT", "SEGACD"):
+            elif sv.system in ("SAT", "SEGACD") or (
+                sv.system == "MD" and sv.size == _MISTER_MD_SAVE_SIZE
+            ):
                 cached_marker = _get_cached_hash_for_key(
                     f"{cache_key}|blank", sv.size, sv.mtime
                 )
@@ -3739,6 +3826,20 @@ def _scan_mister_ssh(
                             normalize_saturn_save(data)
                         ).hexdigest()
                         empty_card = not list_saturn_archive_names(data)
+                        _set_cached_hash_for_key(
+                            f"{cache_key}|blank",
+                            sv.size,
+                            sv.mtime,
+                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
+                        )
+                    elif sv.system == "MD" and sv.size == _MISTER_MD_SAVE_SIZE:
+                        # Hash the expanded layout the server keeps, or a
+                        # core-written save never matches its own upload.
+                        data = ssh.read_file(sv.remote_path)
+                        save_hash = hashlib.sha256(
+                            _md_from_mister(data)
+                        ).hexdigest()
+                        empty_card = not data.rstrip(b"\xff")
                         _set_cached_hash_for_key(
                             f"{cache_key}|blank",
                             sv.size,
@@ -5792,6 +5893,13 @@ def upload_save(
             from saroo_format import normalize_saturn_save
 
             data = normalize_saturn_save(path.read_bytes())
+        elif (system or "").upper() == "MD" and isinstance(path, SshSavePath):
+            # The core stores packed SRAM padded to 64 KB; store the expanded
+            # layout emulators use, keeping the size a counterpart already has.
+            data = _md_from_mister(
+                path.read_bytes(),
+                target_size=_server_save_size(title_id, base_url, headers, timeout),
+            )
         else:
             data = path.read_bytes()
         local_hash = hashlib.sha256(data).hexdigest()
@@ -5880,14 +5988,17 @@ def download_save(
     resp.raise_for_status()
     if isinstance(dest_path, (FtpSavePath, SshSavePath)):
         content = resp.content
-        if (system or "").upper() == "SAT" and isinstance(dest_path, SshSavePath):
-            # Server stores canonical 32 KB internal BRAM; the MiSTer core
-            # wants it byte-expanded to 64 KB.
-            from saroo_format import convert_saturn_save_format
+        if isinstance(dest_path, SshSavePath):
+            if (system or "").upper() == "SAT":
+                # Server stores canonical 32 KB internal BRAM; the MiSTer core
+                # wants it byte-expanded to 64 KB.
+                from saroo_format import convert_saturn_save_format
 
-            content = convert_saturn_save_format(
-                content, _saturn_format_for_path(dest_path)
-            )
+                content = convert_saturn_save_format(
+                    content, _saturn_format_for_path(dest_path)
+                )
+            elif (system or "").upper() == "MD":
+                content = _md_to_mister(content)
         dest_path.write_bytes(content)
         headers_obj = getattr(resp, "headers", {}) or {}
         server_hash = headers_obj.get(
