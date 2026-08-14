@@ -132,6 +132,7 @@ are **not** covered by GameSync's license and retain their original terms:
 | Path | Origin |
 |---|---|
 | `server/data/dats/**` | libretro-database, libretro-dats (Rob Loach) — derived from No-Intro, Redump, GameTDB, Pleasuredome |
+| `server/data/dats/EN-Dats/**` | The [T-En] Collection — fan-translation DATs |
 | `server/data/3dsdb.txt`, `3dstdb.txt` | 3dsdb.com, ds-scene.net |
 | `server/data/ps3db.txt` | PS3 title lists |
 | `server/data/xbox_titleids.json`, `xbox_titleid_map.txt` | dbox.tools |
