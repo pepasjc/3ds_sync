@@ -13,6 +13,7 @@ from typing import Callable, Iterable
 import requests
 
 from config import get_api_headers, get_base_url, load_config
+from openmenu_image import GDI_LINE_RE
 from systems import (
     MISTER_CD_SYSTEMS,
     MISTER_GAMES_ROOTS,
@@ -68,9 +69,36 @@ HARDWARE_3DS_DEVICE_TYPES = {"Generic", "Everdrive", "CD Folder"}
 XBOX_SYSTEMS = {"XBOX", "X360", "XBOX360"}
 OPL_SYSTEMS = {"PS1", "PS2"}
 
+# Super SD System 3 (TerraOnion PC Engine ODE): a fixed card layout, not the
+# EmuDeck-style per-system folders.  HuCard dumps go in HuCard/ as loose files;
+# each CD game gets its own Cd/<Game>/ folder holding a CUE/BIN set.
+SUPERSD3_DEVICE = "Super SD System 3"
+SUPERSD3_CD_SYSTEMS = {"PCECD", "TGCD"}
+SUPERSD3_ROM_SUBDIRS: dict[str, str] = {
+    "PCE": "HuCard",
+    "PCSG": "HuCard",
+    "PCECD": "Cd",
+    "TGCD": "Cd",
+}
+
 # PSIO's menu refuses filenames > 60 chars and cannot render non-ASCII bytes.
 # We keep folder + member names within this limit for PSIO installs.
 PSIO_MAX_NAME = 60
+
+# ── GDEMU / openMenu (Dreamcast ODE) ────────────────────────────────────────
+#
+# GDEMU reads games from plain numbered folders at the SD card root — 01, 02,
+# 03 — one disc image per folder, with 01 reserved for the menu disc (GDMENU or
+# openMenu).  Managers write a name.txt in each folder holding the display
+# name; GDEMU ignores it, the menus and every other manager read it.  openMenu
+# uses the same card layout, so both profiles install identically.
+#
+# GDEMU cannot read CHD, so a catalog CHD is always fetched as a converted GDI
+# set (see ``default_rom_format``).  Layout reference:
+# https://github.com/sonik-br/GDMENUCardManager
+GDEMU_DEVICE_TYPES = {"GDEMU", "openMenu"}
+GDEMU_MENU_FOLDER = "01"
+GDEMU_NAME_FILE = "name.txt"
 
 
 ROM_SUBDIRS: dict[str, list[str]] = {
@@ -132,6 +160,9 @@ class InstallPlan:
     # ``mister_ssh`` config as fallback).
     mister_remote: str = ""
     mister_ssh: dict | None = None
+    # GDEMU / openMenu: display name to write into the folder's name.txt after
+    # the image lands.  Empty for every other device.
+    gdemu_name: str = ""
 
     @property
     def format_label(self) -> str:
@@ -294,6 +325,11 @@ def default_rom_format(profile: dict, rom: dict, system: str) -> str | None:
     if device_type == "MiSTer" and source_ext == ".chd":
         return None
 
+    # GDEMU / openMenu read GDI (and CDI) only.  A CHD must be converted; a
+    # loose .cdi / .gdi set installs as-is.
+    if device_type in GDEMU_DEVICE_TYPES and system_up == "DC":
+        return "gdi" if source_ext == ".chd" else (legacy or None)
+
     if system_up in XBOX_SYSTEMS:
         return "iso"
 
@@ -375,9 +411,9 @@ def group_multidisc_roms(
       ``COMBINED_DISC_FORMATS``) — the merged entry keeps the group's
       ``primary_rom_id`` as its ``rom_id`` and one request returns the whole
       set (the server groups siblings by title_id);
-    * MiSTer CD systems — each disc stays its own file, but they install
-      side by side into one disc-tag-free game folder so the core's autosave
-      card is shared across discs.  The entry is flagged ``install_members``
+    * folder-per-game CD devices (MiSTer CD cores, Super SD System 3) — each
+      disc stays its own file, but they install side by side into one
+      disc-tag-free game folder.  The entry is flagged ``install_members``
       so the installer expands it back into one plan per disc.
 
     A synthetic ``disc_members`` list and ``disc_total`` are attached for
@@ -386,10 +422,12 @@ def group_multidisc_roms(
     """
     result: list[dict] = []
     aggregates: dict[str, dict] = {}
-    mister_cd = (
-        str(profile.get("device_type", "")).strip() == "MiSTer"
-        and (system or "").upper() in MISTER_CD_SYSTEMS
-    )
+    device_type = str(profile.get("device_type", "")).strip()
+    system_up = (system or "").upper()
+    # Devices that install each disc as its own file into one shared game folder.
+    cd_folder_device = (
+        device_type == "MiSTer" and system_up in MISTER_CD_SYSTEMS
+    ) or (device_type == SUPERSD3_DEVICE and system_up in SUPERSD3_CD_SYSTEMS)
     for rom in roms:
         try:
             fmt = choose_extract_format(profile, rom, system, override_format)
@@ -408,14 +446,14 @@ def group_multidisc_roms(
         # tag is stripped are the same game.  Different dumps keep different
         # stripped names, so they stay apart.
         group_key = primary
-        if mister_cd and has_disc_tag and not (total > 1 and primary):
+        if cd_folder_device and has_disc_tag and not (total > 1 and primary):
             title_key = str(rom.get("title_id") or "").strip()
             stripped = strip_disc_tag(
                 Path(str(rom.get("filename") or rom.get("name") or "")).stem
             )
             if title_key and stripped:
                 group_key = f"{title_key}|{stripped}"
-        if (combined or mister_cd) and has_disc_tag and group_key:
+        if (combined or cd_folder_device) and has_disc_tag and group_key:
             primary = group_key
             agg = aggregates.get(primary)
             if agg is None:
@@ -537,8 +575,27 @@ def safe_file_name(value: str) -> str:
     return base or "download.rom"
 
 
+def _existing_child_dir(root: Path, name: str) -> Path:
+    """``root/name``, matched case-insensitively against existing children."""
+    direct = root / name
+    if direct.is_dir():
+        return direct
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir() and entry.name.lower() == name.lower():
+                return Path(entry.path)
+    except OSError:
+        pass
+    return direct
+
+
 def _system_subdir(root: Path, system: str, device_type: str) -> Path:
     system_up = system.upper()
+    if device_type == SUPERSD3_DEVICE:
+        name = SUPERSD3_ROM_SUBDIRS.get(system_up)
+        if name:
+            return _existing_child_dir(root, name)
+
     if device_type == "MiSTer":
         mister_candidates = mister_system_folder_candidates(system_up)
         for name in mister_candidates:
@@ -595,8 +652,9 @@ def resolve_profile_rom_folder(profile: dict, system: str) -> Path:
         return Path(override).expanduser()
 
     base = Path(str(profile.get("path") or ".")).expanduser()
-    if profile.get("systems"):
-        return _system_subdir(base, system, str(profile.get("device_type", "")))
+    device_type = str(profile.get("device_type", ""))
+    if profile.get("systems") or device_type == SUPERSD3_DEVICE:
+        return _system_subdir(base, system, device_type)
     return base
 
 
@@ -781,6 +839,266 @@ def _install_popstarter_app(vcd_path: Path, display_name: str) -> list[Path]:
     return written
 
 
+# ── GDEMU / openMenu install layout ─────────────────────────────────────────
+
+
+def _gdemu_folder_width(number: int) -> int:
+    """GDEMU folder names are zero-padded to two digits until they can't be."""
+    return 2 if number < 100 else len(str(number))
+
+
+def gdemu_folder_name(number: int) -> str:
+    return str(number).zfill(_gdemu_folder_width(number))
+
+
+def _gdemu_numbered_dirs(root: Path) -> dict[int, Path]:
+    """``{folder number: path}`` for every numeric folder at the card root."""
+    found: dict[int, Path] = {}
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        found[int(entry.name)] = Path(entry.path)
+    return found
+
+
+def gdemu_installed_name(folder: Path) -> str:
+    """Display name recorded in a game folder's ``name.txt`` (``""`` if none)."""
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_file() and entry.name.lower() == GDEMU_NAME_FILE:
+                return (
+                    Path(entry.path)
+                    .read_text(encoding="utf-8", errors="ignore")
+                    .strip()
+                )
+    except OSError:
+        pass
+    return ""
+
+
+def gdemu_target_folder(root: Path, display_name: str) -> Path:
+    """Folder this game installs into: its existing one, else the next number.
+
+    Reinstalling a game reuses the folder it already occupies (matched on
+    ``name.txt``) so the menu keeps its position.  New games take the first
+    number above every folder present — never ``01``, which holds the menu
+    disc, and never a gap, so the numbering stays contiguous for managers that
+    assume it.
+    """
+    numbered = _gdemu_numbered_dirs(root)
+    wanted = safe_folder_name(display_name).casefold()
+    for number, path in sorted(numbered.items()):
+        if number == int(GDEMU_MENU_FOLDER):
+            continue
+        existing = gdemu_installed_name(path)
+        if existing and safe_folder_name(existing).casefold() == wanted:
+            return path
+    next_number = max([*numbered, int(GDEMU_MENU_FOLDER)]) + 1
+    return root / gdemu_folder_name(next_number)
+
+
+def _build_gdemu_install_plan(
+    profile: dict,
+    rom: dict,
+    system_up: str,
+    override_format: str,
+) -> InstallPlan:
+    """Install one Dreamcast disc into its own numbered folder on the ODE card.
+
+    Multi-disc games are *not* collapsed: GDEMU boots one image per folder, so
+    each disc keeps its own folder (and its own ``(Disc N)`` name.txt label).
+    """
+    rom_id = str(rom.get("rom_id") or rom.get("title_id") or "")
+    if not rom_id:
+        raise ValueError("Catalog entry is missing a ROM id.")
+    filename = safe_file_name(str(rom.get("filename") or f"{rom_id}.rom"))
+    extract = choose_extract_format(profile, rom, system_up, override_format)
+    display_name = str(rom.get("name") or Path(filename).stem or rom_id)
+    root = resolve_profile_rom_folder(profile, system_up)
+    target_dir = gdemu_target_folder(root, display_name)
+
+    if extract in ARCHIVE_EXTRACT_FORMATS or bool(rom.get("is_bundle")):
+        # A GDI is a sheet plus its tracks — the whole set lands in the folder.
+        return InstallPlan(
+            rom_id=rom_id,
+            display_name=display_name,
+            system=system_up,
+            source_filename=filename,
+            target_path=target_dir,
+            extract_format=extract,
+            extract_archive=True,
+            target_is_directory=True,
+            gdemu_name=display_name,
+        )
+
+    # Single-file image (.cdi, or a .gdi already stored flat in the catalog).
+    return InstallPlan(
+        rom_id=rom_id,
+        display_name=display_name,
+        system=system_up,
+        source_filename=filename,
+        target_path=target_dir / derive_download_filename(filename, extract),
+        extract_format=extract,
+        gdemu_name=display_name,
+    )
+
+
+def _write_gdemu_name_file(folder: Path, display_name: str) -> Path | None:
+    """Write ``name.txt`` so GDMENU / openMenu (and other managers) can label
+    the folder.  Best-effort: a read-only card must not fail the install."""
+    name = str(display_name or "").strip()
+    if not name:
+        return None
+    path = folder / GDEMU_NAME_FILE
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path.write_text(name + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+# Metadata caches GD MENU Card Manager keeps beside each game so it needn't
+# re-read the disc header.  Writing the same files means the manager (and our
+# own list generator) sees a GameSync install exactly as one of its own.
+GDEMU_META_FILES = (
+    "name.txt",
+    "serial.txt",
+    "disc.txt",
+    "region.txt",
+    "version.txt",
+    "date.txt",
+    "vga.txt",
+    "type.txt",
+    "folder.txt",
+)
+
+
+def _normalize_gdemu_filenames(folder: Path) -> None:
+    """Rename the installed image to ``disc.gdi`` + ``trackNN.*``.
+
+    GDEMU parses the ``.gdi`` sheet itself, and a card written by GD MENU Card
+    Manager only ever holds short, unquoted, space-free track names.  Catalog
+    filenames carry the full game title, which means quoted entries in the sheet
+    — so they get renamed to the canonical form the firmware is known to read.
+    """
+    sheets = sorted(folder.glob("*.gdi"))
+    if not sheets:
+        for image in sorted(folder.glob("*.cdi")):
+            target = folder / "disc.cdi"
+            if image != target and not target.exists():
+                image.rename(target)
+            break
+        return
+
+    sheet = sheets[0]
+    try:
+        lines = sheet.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return
+
+    rewritten: list[str] = []
+    for index, line in enumerate(lines):
+        if index == 0:
+            rewritten.append(line.strip())
+            continue
+        parts = GDI_LINE_RE.match(line)
+        if parts is None:
+            rewritten.append(line.rstrip())
+            continue
+        source = folder / parts.group("name").strip('"')
+        number = int(parts.group("num"))
+        new_name = f"track{number:02d}{source.suffix.lower()}"
+        target = folder / new_name
+        if source != target:
+            if not source.exists():
+                return  # sheet doesn't match what's on disk — leave it alone
+            if target.exists():
+                target.unlink()
+            source.rename(target)
+        rewritten.append(
+            f"{number} {parts.group('lba')} {parts.group('type')} "
+            f"{parts.group('sector')} {new_name} {parts.group('offset')}"
+        )
+
+    text = "\n".join(rewritten) + "\n"
+    disc_gdi = folder / "disc.gdi"
+    try:
+        sheet.write_text(text, encoding="utf-8")
+        if sheet != disc_gdi:
+            if disc_gdi.exists():
+                disc_gdi.unlink()
+            sheet.rename(disc_gdi)
+    except OSError:
+        pass
+
+
+def _write_gdemu_metadata(folder: Path, display_name: str) -> list[Path]:
+    """Write the per-folder metadata caches, reading the disc header for them."""
+    written: list[Path] = []
+    values = {"name.txt": str(display_name or "").strip()}
+    try:
+        from dreamcast_ipbin import read_folder_ip_bin
+
+        ip = read_folder_ip_bin(folder)
+    except Exception:
+        ip = None
+    if ip is not None:
+        values.update(
+            {
+                "serial.txt": ip.product,
+                "disc.txt": ip.disc,
+                "region.txt": ip.region,
+                "version.txt": ip.version,
+                "date.txt": ip.date,
+                "vga.txt": "1" if ip.vga else "0",
+                "type.txt": "game",
+                "folder.txt": "",
+            }
+        )
+        values["name.txt"] = values["name.txt"] or ip.name
+    for filename in GDEMU_META_FILES:
+        if filename not in values:
+            continue
+        path = folder / filename
+        try:
+            path.write_text(values[filename], encoding="utf-8")
+            written.append(path)
+        except OSError:
+            continue
+    return written
+
+
+def _finish_gdemu_install(game_folder: Path, display_name: str) -> list[Path]:
+    """Make the new folder look like one GD MENU Card Manager wrote, then
+    update the menu's game list.
+
+    Three steps, all best-effort — none may fail an install that already copied
+    the game onto the card:
+
+    1. canonical ``disc.gdi`` / ``trackNN.*`` filenames;
+    2. the ``name.txt`` + friends metadata caches;
+    3. the game list — staged at the card root *and* patched into folder 01's
+       menu image, which is the copy the console actually reads.
+    """
+    _normalize_gdemu_filenames(game_folder)
+    written: list[Path] = _write_gdemu_metadata(game_folder, display_name)
+    try:
+        from gdemu_menu import update_card_menu
+
+        result = update_card_menu(game_folder.parent) or {}
+    except Exception:
+        result = {}
+    staged = result.get("staged")
+    if staged is not None:
+        written.append(staged)
+    return written
+
+
 def build_install_plan(
     profile: dict,
     rom: dict,
@@ -793,6 +1111,9 @@ def build_install_plan(
     # extract/archive logic below.
     if str(profile.get("device_type", "")).strip() == "OPL" and system_up in OPL_SYSTEMS:
         return _build_opl_install_plan(profile, rom, system_up, override_format)
+    # GDEMU / openMenu: numbered folder per disc at the SD card root.
+    if str(profile.get("device_type", "")).strip() in GDEMU_DEVICE_TYPES:
+        return _build_gdemu_install_plan(profile, rom, system_up, override_format)
     rom_id = str(rom.get("rom_id") or rom.get("title_id") or "")
     if not rom_id:
         raise ValueError("Catalog entry is missing a ROM id.")
@@ -824,15 +1145,19 @@ def build_install_plan(
     # MiSTer CD cores name the autosave memory card / backup RAM after the
     # game's subfolder, so each CD game installs into its own folder.  The
     # disc tag is stripped from the folder name so all discs of a multi-disc
-    # game land together and share one card.
-    is_mister = str(profile.get("device_type", "")).strip() == "MiSTer"
-    mister_cd = is_mister and system_up in MISTER_CD_SYSTEMS
+    # game land together and share one card.  The Super SD System 3 wants the
+    # same shape for a different reason: it only lists CD games that sit in
+    # their own Cd/<Game>/ folder.
+    device_type = str(profile.get("device_type", "")).strip()
+    cd_game_folder = (device_type == "MiSTer" and system_up in MISTER_CD_SYSTEMS) or (
+        device_type == SUPERSD3_DEVICE and system_up in SUPERSD3_CD_SYSTEMS
+    )
 
     if extract in ARCHIVE_EXTRACT_FORMATS or bool(rom.get("is_bundle")):
         # PSIO installs into a bare game folder (translation/disc tags stripped);
         # the server already names the BIN/CU2 inside it.
         folder_name = clean_ps1_title(display_name) if extract == "psio" else display_name
-        if mister_cd:
+        if cd_game_folder:
             folder_name = strip_disc_tag(display_name)
         target_dir = target_root / safe_folder_name(folder_name)
         return InstallPlan(
@@ -848,7 +1173,7 @@ def build_install_plan(
             mister_ssh=remote_ssh,
         )
 
-    if mister_cd:
+    if cd_game_folder:
         game_folder = safe_folder_name(strip_disc_tag(Path(target_filename).stem))
         target_root = target_root / game_folder
 
@@ -904,6 +1229,78 @@ def _safe_extract_zip(zip_path: Path, target_dir: Path) -> list[Path]:
                 shutil.copyfileobj(src, dst)
             written.append(destination)
     return written
+
+
+def _install_tmp_dir() -> Path | None:
+    """Scratch directory for staging downloads, or ``None`` for the system temp.
+
+    Optional ``install_tmp_dir`` config key, for when the system temp lives on
+    a small or slow volume.
+    """
+    raw = str(load_config().get("install_tmp_dir", "") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return path
+
+
+def _copy_tree_with_progress(
+    src_root: Path,
+    dst_root: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Path]:
+    """Copy every file under ``src_root`` into ``dst_root``, reporting bytes."""
+    files = [p for p in sorted(src_root.rglob("*")) if p.is_file()]
+    total = sum(p.stat().st_size for p in files)
+    copied = 0
+    written: list[Path] = []
+    for src in files:
+        dest = dst_root / src.relative_to(src_root)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(src, "rb") as sfh, open(dest, "wb") as dfh:
+            while True:
+                chunk = sfh.read(1024 * 1024)
+                if not chunk:
+                    break
+                dfh.write(chunk)
+                copied += len(chunk)
+                if progress_callback:
+                    progress_callback(copied, total)
+        shutil.copystat(src, dest)
+        written.append(dest)
+    if progress_callback:
+        progress_callback(total, total)
+    return written
+
+
+def _install_archive_local(
+    plan: InstallPlan,
+    target: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Path]:
+    """Download and unzip on local disk, then copy the result to the target.
+
+    Unzipping straight onto an SD card is slow — many small random writes on
+    slow flash, and the zip itself is written and re-read there.  Staging in a
+    temp dir keeps the card down to one sequential copy pass.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="3dssync-rom-", dir=_install_tmp_dir()
+    ) as td:
+        tmp_dir = Path(td)
+        zip_path = tmp_dir / "download.zip"
+        _download_rom(plan, zip_path, progress_callback)
+
+        extract_dir = (tmp_dir / "extracted").resolve()
+        _safe_extract_zip(zip_path, extract_dir)
+        zip_path.unlink(missing_ok=True)  # free the space before the copy
+
+        target.mkdir(parents=True, exist_ok=True)
+        return _copy_tree_with_progress(extract_dir, target, progress_callback)
 
 
 def _download_rom(
@@ -1046,19 +1443,19 @@ def install_rom(
         return _install_rom_mister_remote(plan, progress_callback)
 
     target = plan.target_path
+    if plan.extract_archive:
+        written = _install_archive_local(plan, target, progress_callback)
+        if plan.gdemu_name:
+            written.extend(_finish_gdemu_install(target, plan.gdemu_name))
+        return written
+
     tmp_parent = target if plan.target_is_directory else target.parent
     tmp_parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.part"
-    if plan.extract_archive:
-        tmp_path = tmp_parent / f".{safe_folder_name(target.name)}.zip.part"
 
     _download_rom(plan, tmp_path, progress_callback)
 
     try:
-        if plan.extract_archive:
-            written = _safe_extract_zip(tmp_path, target)
-            return written
-
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             tmp_path.replace(target)
@@ -1068,6 +1465,8 @@ def install_rom(
         written = [target]
         if plan.opl_popstarter:
             written.extend(_install_popstarter_app(target, plan.display_name))
+        if plan.gdemu_name:
+            written.extend(_finish_gdemu_install(target.parent, plan.gdemu_name))
         return written
     finally:
         try:
@@ -1341,15 +1740,179 @@ def repair_opl_popstarter(profile: dict, system: str) -> list[tuple[str, str]]:
     return fixed
 
 
+# Staging prefix for the two-phase folder renumber.  A folder can only be
+# renamed onto a free name, and sorting a card generally means every number
+# moves at once, so each mover parks under this prefix first.
+GDEMU_SORT_TMP_PREFIX = ".gs_sort_"
+
+
+def gdemu_sort_key(name: str) -> tuple[str, str]:
+    """Case-insensitive ordering for a game's display name.
+
+    Ties break on the raw name so the order is stable across runs regardless of
+    how the filesystem enumerated the folders.
+    """
+    text = str(name or "").strip()
+    return (text.casefold(), text)
+
+
+def _gdemu_game_label(folder: Path) -> str:
+    """Best display name for a game folder: ``name.txt``, else the disc header."""
+    from gdemu_menu import folder_name_txt
+
+    label = folder_name_txt(folder)
+    if label:
+        return label
+    try:
+        from dreamcast_ipbin import read_folder_ip_bin
+
+        ip = read_folder_ip_bin(folder)
+    except Exception:
+        ip = None
+    return ip.name if ip is not None else ""
+
+
+def sort_gdemu_folders(root: Path) -> list[tuple[str, str]]:
+    """Renumber the card's game folders so they run alphabetically from ``02``.
+
+    The folder number *is* the menu's sort order — the list is emitted in
+    folder order — so putting the games in alphabetical order on the card is
+    what puts them in alphabetical order in the menu.
+
+    Folder ``01`` is left where it is: that is the menu disc, and every manager
+    expects it at ``01``.  Renumbering happens in two phases (each mover parks
+    under a temporary name first) because a folder can only be renamed onto a
+    name nothing else holds, and a sort usually shifts every number at once.
+
+    Returns ``[(old folder, new folder)]`` for the folders that moved.
+    """
+    from gdemu_menu import numbered_folders
+
+    root = Path(root)
+    games = [
+        (number, folder)
+        for number, folder in numbered_folders(root)
+        if int(number) != int(GDEMU_MENU_FOLDER)
+    ]
+    if not games:
+        return []
+
+    leftovers = [d for d in root.glob(f"{GDEMU_SORT_TMP_PREFIX}*") if d.is_dir()]
+    if leftovers:
+        # A previous run died between the two phases.  Park the strays back into
+        # free numbers so this run sees a consistent card.
+        used = {int(number) for number, _folder in games}
+        next_free = max(used) + 1 if used else int(GDEMU_MENU_FOLDER) + 1
+        for stray in sorted(leftovers):
+            while next_free in used:
+                next_free += 1
+            target = root / gdemu_folder_name(next_free)
+            stray.rename(target)
+            used.add(next_free)
+            games.append((target.name, target))
+        games.sort(key=lambda item: int(item[0]))
+
+    ordered = sorted(games, key=lambda item: gdemu_sort_key(_gdemu_game_label(item[1])))
+    desired = {
+        old_number: gdemu_folder_name(index)
+        for index, (old_number, _folder) in enumerate(
+            ordered, start=int(GDEMU_MENU_FOLDER) + 1
+        )
+    }
+    movers = [
+        (old_number, folder)
+        for old_number, folder in games
+        if desired[old_number] != old_number
+    ]
+    if not movers:
+        return []
+
+    staged: list[tuple[Path, str]] = []
+    for old_number, folder in movers:
+        parked = root / f"{GDEMU_SORT_TMP_PREFIX}{old_number}"
+        folder.rename(parked)
+        staged.append((parked, desired[old_number]))
+    for parked, new_number in staged:
+        parked.rename(root / new_number)
+
+    return [
+        (f"{old_number}/", f"{desired[old_number]}/ {_gdemu_game_label(Path(root) / desired[old_number])}")
+        for old_number, _folder in movers
+    ]
+
+
+def repair_gdemu_card(profile: dict, system: str = "DC") -> list[tuple[str, str]]:
+    """Bring every game folder on a GDEMU card up to the layout we install.
+
+    Fixes cards holding games installed before this layout existed, or copied
+    on by hand: canonical ``disc.gdi`` / ``trackNN.*`` filenames, the metadata
+    caches, an alphabetical renumber of the game folders, and finally the
+    menu's game list (staged at the root and patched into the folder-01 menu
+    image).
+
+    Folder ``01`` is never touched — that is the menu disc itself, and only its
+    embedded list is rewritten, by ``update_card_menu``.
+
+    Returns ``[(before, after)]`` pairs describing what changed.
+    """
+    from gdemu_menu import folder_name_txt, numbered_folders, update_card_menu
+
+    root = resolve_profile_rom_folder(profile, system)
+    if not root or not Path(root).is_dir():
+        return []
+
+    changes: list[tuple[str, str]] = []
+    for number, folder in numbered_folders(Path(root)):
+        if int(number) == int(GDEMU_MENU_FOLDER):
+            continue  # the menu disc itself
+        try:
+            before = sorted(f.name for f in folder.iterdir() if f.is_file())
+        except OSError:
+            continue
+        _normalize_gdemu_filenames(folder)
+        _write_gdemu_metadata(folder, folder_name_txt(folder))
+        try:
+            after = sorted(f.name for f in folder.iterdir() if f.is_file())
+        except OSError:
+            continue
+        for name in before:
+            if name not in after:
+                changes.append((f"{number}/{name}", f"{number}/ (renamed)"))
+        for name in after:
+            if name not in before:
+                changes.append((f"{number}/", f"{number}/{name}"))
+
+    # Sort after normalizing: the labels the order is built from come from the
+    # metadata caches written above.
+    changes.extend(sort_gdemu_folders(Path(root)))
+
+    result = update_card_menu(Path(root)) or {}
+    if result.get("patched"):
+        patched = result["patched"]
+        changes.append(
+            (
+                "menu game list",
+                f"patched {patched['copies']} cop(y/ies) in 01/ "
+                f"({patched['written']} bytes, {len(result.get('entries') or [])} games)",
+            )
+        )
+    elif result.get("error"):
+        changes.append(("menu game list", f"NOT patched — {result['error']}"))
+    return changes
+
+
 def repair_installed_files(profile: dict, system: str) -> list[tuple[str, str]]:
     """Dispatch the "Sanitize/Repair Installed Files" action by device type.
 
     PSIO → enforce filename limits; OPL → backfill POPStarter launchers and
-    conf_apps.cfg entries.  Other devices → no-op.
+    conf_apps.cfg entries; GDEMU / openMenu → normalize game folders and
+    refresh the menu list.  Other devices → no-op.
     """
     device_type = str(profile.get("device_type", "")).strip().upper()
     if device_type == "OPL":
         return repair_opl_popstarter(profile, system)
     if device_type == "PSIO":
         return sanitize_installed_files(profile, system)
+    if device_type in {d.upper() for d in GDEMU_DEVICE_TYPES}:
+        return repair_gdemu_card(profile, system or "DC")
     return []

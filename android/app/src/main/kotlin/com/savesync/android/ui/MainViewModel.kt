@@ -42,6 +42,7 @@ import com.savesync.android.sync.DownloadManager
 import com.savesync.android.sync.HashUtils
 import com.savesync.android.sync.SaturnArchiveStateStore
 import com.savesync.android.sync.SaturnSyncFormat
+import com.savesync.android.sync.SegaCdSyncFormat
 import com.savesync.android.sync.SaturnSaveFormatConverter
 import com.savesync.android.sync.SyncEngine
 import com.savesync.android.sync.SyncResult
@@ -470,6 +471,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     romDirOverrides = romDirOverrides,
                     saveDirOverrides = saveDirOverrides,
                     saturnSyncFormat = currentSettings.saturnSyncFormat,
+                    segaCdSyncFormat = currentSettings.segaCdSyncFormat,
                     beetleSaturnPerCoreFolder = currentSettings.beetleSaturnPerCoreFolder,
                     cdGamesPerContentFolder = currentSettings.cdGamesPerContentFolder
                 )
@@ -483,6 +485,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     romDirOverrides = romDirOverrides,
                     saveDirOverrides = saveDirOverrides,
                     saturnSyncFormat = currentSettings.saturnSyncFormat,
+                    segaCdSyncFormat = currentSettings.segaCdSyncFormat,
                     beetleSaturnPerCoreFolder = currentSettings.beetleSaturnPerCoreFolder,
                     cdGamesPerContentFolder = currentSettings.cdGamesPerContentFolder
                 )
@@ -1547,6 +1550,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     saturnSyncFormat = saturnFormat,
                     beetleSaturnPerCoreFolder = perCore,
                     cdGamesPerContentFolder = perContent,
+                    segaCdSyncFormat = settings.value.segaCdSyncFormat,
                 )
                 Triple(file, null, false)
             }
@@ -2023,6 +2027,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         romDirOverrides = romDirOverrides,
                         saveDirOverrides = saveDirOverrides,
                         saturnSyncFormat = currentSettings.saturnSyncFormat,
+                        segaCdSyncFormat = currentSettings.segaCdSyncFormat,
                         beetleSaturnPerCoreFolder = currentSettings.beetleSaturnPerCoreFolder,
                         cdGamesPerContentFolder = currentSettings.cdGamesPerContentFolder
                     ).also { found ->
@@ -2078,7 +2083,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         emudeckDir: String = "",
         saturnSyncFormat: SaturnSyncFormat = SaturnSyncFormat.MEDNAFEN,
         beetleSaturnPerCoreFolder: Boolean = true,
-        cdGamesPerContentFolder: Boolean = false
+        cdGamesPerContentFolder: Boolean = false,
+        segaCdSyncFormat: SegaCdSyncFormat = SegaCdSyncFormat.GENESIS_PLUS_GX
     ) {
         viewModelScope.launch {
             settingsStore.updateSettings(
@@ -2090,7 +2096,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 emudeckDir = emudeckDir,
                 saturnSyncFormat = saturnSyncFormat,
                 beetleSaturnPerCoreFolder = beetleSaturnPerCoreFolder,
-                cdGamesPerContentFolder = cdGamesPerContentFolder
+                cdGamesPerContentFolder = cdGamesPerContentFolder,
+                segaCdSyncFormat = segaCdSyncFormat
             )
             ApiClient.invalidate()
             scheduleOrCancelAutoSync(autoSync, intervalMinutes)
@@ -2235,6 +2242,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 romDirOverrides = currentSettings.romDirOverrides,
                 saveDirOverrides = currentSettings.saveDirOverrides,
                 saturnSyncFormat = currentSettings.saturnSyncFormat,
+                segaCdSyncFormat = currentSettings.segaCdSyncFormat,
                 beetleSaturnPerCoreFolder = currentSettings.beetleSaturnPerCoreFolder,
                 cdGamesPerContentFolder = currentSettings.cdGamesPerContentFolder
             )

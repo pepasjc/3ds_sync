@@ -39,6 +39,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <malloc.h>
+
+#include <coreinit/core.h>
 #include <coreinit/systeminfo.h>
 #include <coreinit/title.h>
 #include <coreinit/thread.h>
@@ -48,7 +51,6 @@
 #include <vpad/input.h>
 #include <whb/log.h>
 #include <whb/log_udp.h>
-#include <whb/proc.h>
 #include <whb/sdcard.h>
 
 static SyncState     g_state;
@@ -91,6 +93,7 @@ static volatile uint64_t g_active_total = 0;
 static volatile uint64_t g_active_bps   = 0;
 static volatile bool     g_pause_req    = false;
 static uint64_t          g_last_draw    = 0;
+static uint64_t          g_pad_poll_ms  = 0;
 static uint64_t          g_spd_ms       = 0;
 static uint64_t          g_spd_bytes    = 0;
 
@@ -102,6 +105,18 @@ static void open_card(int idx);
 static void fetch_server(void);
 
 /* ---- input ---- */
+
+/* Set from the HOME_BUTTON_DENIED callback, which runs inside ProcUI while
+ * the code is blocked in app_running() — from the main loop or from any of
+ * the progress/wait callbacks.  Every input loop below must check it, or a
+ * HOME press during that loop does nothing (there is no VPAD bit for HOME). */
+static volatile bool g_quit_requested = false;
+
+static uint32_t home_button_denied(void *ctx) {
+    (void)ctx;
+    g_quit_requested = true;
+    return 0;
+}
 
 static uint32_t pad_read(uint32_t *held_out) {
     VPADStatus st;
@@ -164,7 +179,7 @@ static bool confirm(const char *fmt, ...) {
     char body[320];
     snprintf(body, sizeof(body), "%s\n\nA = Yes      B = No", msg);
     bool repaint = true;
-    while (app_running()) {
+    while (app_running() && !g_quit_requested) {
         if (repaint || ui_consume_repaint_request()) {
             ui_clear();
             ui_draw_message("Confirm", body);
@@ -220,7 +235,7 @@ static bool edit_text(char *out, size_t cap, const char *label) {
     int maxlen = (int)(cap < sizeof(buf) ? cap : sizeof(buf)) - 1;
 
     draw_edit(label, buf, cur);
-    while (app_running()) {
+    while (app_running() && !g_quit_requested) {
         if (ui_consume_repaint_request()) draw_edit(label, buf, cur);
         uint32_t d = pad_read(NULL);
         if (d == 0) { OSSleepTicks(OSMillisecondsToTicks(16)); continue; }
@@ -279,7 +294,10 @@ static void draw_config(void) {
     ui_text_hl(top + CF_APIKEY,     g_cfg_sel == CF_APIKEY,     UI_WHITE, " API Key    : %s", g_state.api_key);
     ui_text_hl(top + CF_STORAGE,    g_cfg_sel == CF_STORAGE,    UI_CYAN,  " Download to: %s", storage_label());
     ui_text_hl(top + CF_INSTTARGET, g_cfg_sel == CF_INSTTARGET, UI_CYAN,  " Install to : %s",
-               !strcasecmp(g_state.install_target, "usb") ? "USB (Wii U drive)" : "NAND (MLC)");
+               !strcasecmp(g_state.install_target, "usb")
+                   ? (g_state.usb_mounted ? "USB (Wii U drive)"
+                                          : "USB (NO DRIVE FOUND)")
+                   : "NAND (MLC)");
     ui_text_hl(top + CF_NINSAVES,   g_cfg_sel == CF_NINSAVES,   UI_WHITE, " GC memcards: %s", g_state.nin_saves_dir);
     ui_text_hl(top + CF_GAMES,      g_cfg_sel == CF_GAMES,      UI_WHITE, " GC games   : %s", g_state.games_dir);
     ui_text_hl(top + CF_WBFS,       g_cfg_sel == CF_WBFS,       UI_WHITE, " Wii wbfs   : %s", g_state.wbfs_dir);
@@ -370,11 +388,13 @@ static void config_input(uint32_t d) {
 
 static void fetch_catalog(void) {
     if (!network_is_ready(&g_state)) { ui_error("Network not ready (%s)", g_state.ip); return; }
-    g_catalog_loaded = true;
     ui_status("Fetching %s catalog...", g_cat_system);
     redraw();
     bool ok = roms_fetch_catalog(&g_state, g_cat_system,
                                  g_scratch, sizeof(g_scratch), &g_catalog);
+    /* Only a successful fetch counts as loaded — a failure (server briefly
+     * down at boot, say) retries the next time the view is entered. */
+    g_catalog_loaded = ok;
     if (!ok) ui_error("%s", g_catalog.last_error);
     else     ui_status("Catalog: %d %s ROM(s)", g_catalog.count, g_cat_system);
     g_rom_sel = 0; g_rom_scroll = 0;
@@ -390,7 +410,25 @@ static void toggle_catalog_system(void) {
     g_catalog.count = 0;
     g_catalog_loaded = false;
     g_rom_sel = 0; g_rom_scroll = 0;
-    ui_status("Catalog set to %s - press A to fetch", g_cat_system);
+    /* Fetch right away rather than asking for a button press. */
+    if (network_is_ready(&g_state)) fetch_catalog();
+    else ui_status("Catalog set to %s (no network - Y retries)", g_cat_system);
+}
+
+/* Staged WUP folders are named by title id, so give the list a real game name
+ * when the catalog has been fetched and knows one. */
+static void fill_wiiu_names(void) {
+    for (int i = 0; i < g_local.count; i++) {
+        LocalRom *r = &g_local.items[i];
+        if (strcmp(r->system, "WIIU") != 0) continue;
+        if (!roms_is_wiiu_title_id(r->name)) continue;
+        for (int j = 0; j < g_catalog.count; j++) {
+            if (strcasecmp(g_catalog.items[j].rom_id, r->name) != 0) continue;
+            if (!g_catalog.items[j].name[0]) break;
+            snprintf(r->name, sizeof(r->name), "%s", g_catalog.items[j].name);
+            break;
+        }
+    }
 }
 
 static void scan_local(void) {
@@ -398,6 +436,7 @@ static void scan_local(void) {
     ui_status("Scanning installed games...");
     redraw();
     roms_scan_local(&g_local);
+    fill_wiiu_names();
     if (g_local.count > 0) ui_status("Local: %d game(s)", g_local.count);
     else ui_status("%s", g_local.last_error);
     redraw();
@@ -407,11 +446,27 @@ static int progress_cb(uint64_t done, uint64_t total) {
     g_active_done  = done;
     g_active_total = total;
 
-    if (!app_running()) return 1;   /* HOME / shutdown -> pause cleanly */
+    /* On the download worker thread only the shared counters are touched —
+     * every UI/pad call belongs to the main thread (which watches these
+     * counters from its monitor loop). */
+    if (!OSIsMainCore())
+        return (g_pause_req || g_quit_requested) ? 1 : 0;
+
+    if (!app_running() || g_quit_requested)
+        return 1;                   /* HOME / shutdown -> pause cleanly */
     if (ui_consume_repaint_request()) redraw();
-    if (pad_read(NULL) & VPAD_BUTTON_B) g_pause_req = true;
 
     uint64_t now = now_ms();
+
+    /* This runs once per 64 KB chunk, which at full LAN speed is ~150x a
+     * second — well past the gamepad's own 60 Hz sample rate, so polling it
+     * every time is pure overhead in the transfer's hot loop.  10 Hz is still
+     * instant to a human pressing B. */
+    if (now - g_pad_poll_ms >= 100) {
+        g_pad_poll_ms = now;
+        if (pad_read(NULL) & VPAD_BUTTON_B) g_pause_req = true;
+    }
+
     if (g_spd_ms == 0) { g_spd_ms = now; g_spd_bytes = done; }
     else if (now - g_spd_ms >= 1000) {
         g_active_bps = (done - g_spd_bytes) * 1000 / (now - g_spd_ms);
@@ -429,13 +484,52 @@ static int progress_cb(uint64_t done, uint64_t total) {
 /* Pump the UI while the server prepares a response (RVZ->ISO / RVZ->WBFS
  * conversion can take minutes).  B cancels. */
 static int wait_cb(uint32_t ms) {
-    if (!app_running()) return 1;
+    if (!OSIsMainCore())            /* worker thread: no UI, just the flag */
+        return (g_pause_req || g_quit_requested) ? 1 : 0;
+
+    if (!app_running() || g_quit_requested) return 1;
     if (ui_consume_repaint_request()) redraw();
     if (pad_read(NULL) & VPAD_BUTTON_B) return 1;
     if (ms && (ms % 2000) == 0) {
         ui_status("Waiting for server... %us (converting? B=cancel)", ms / 1000);
         redraw();
     }
+    return 0;
+}
+
+/* ---- download worker thread ----
+ *
+ * The transfer itself runs on CPU0 (main loop: CPU1, file writer: CPU2) so
+ * its blocking recv() never waits on UI work and vice versa — the same
+ * three-way split NUSspli uses.  The main thread stays here in a monitor
+ * loop: pad polling, speed line, redraws, and the stall/cancel watchdog
+ * that unblocks the worker via http_abort_active(). */
+
+typedef struct {
+    DownloadEntry *e;
+    uint64_t       total;
+    int            rc;
+} DlWork;
+
+static DlWork   g_dlwork;
+static OSThread g_dlthread;
+static uint8_t *g_dlstack = NULL;
+
+#define DL_STACK_SIZE (128 * 1024)
+
+static int dl_worker(int argc, const char **argv) {
+    (void)argc;
+    DlWork *w = (DlWork *)argv;
+    DownloadEntry *e = w->e;
+    if (e->url_path[0])
+        w->rc = network_download_path_resumable(&g_state, e->url_path,
+                                                e->target_path, e->offset,
+                                                &w->total);
+    else
+        w->rc = network_download_rom_resumable(&g_state, e->rom_id,
+                                               e->extract_format,
+                                               e->target_path, e->offset,
+                                               &w->total);
     return 0;
 }
 
@@ -464,14 +558,73 @@ static void run_active_download(DownloadEntry *e) {
     ui_status("Requesting %s... (B=cancel)", e->name);
     redraw();
 
+    http_perf_reset();
     uint64_t total = 0;
     int rc;
-    if (e->url_path[0])
-        rc = network_download_path_resumable(&g_state, e->url_path,
-                                             e->target_path, e->offset, &total);
-    else
-        rc = network_download_rom_resumable(&g_state, e->rom_id, e->extract_format,
-                                            e->target_path, e->offset, &total);
+
+    if (!g_dlstack) g_dlstack = (uint8_t *)memalign(16, DL_STACK_SIZE);
+    g_dlwork = (DlWork){ e, 0, -1 };
+
+    if (g_dlstack &&
+        OSCreateThread(&g_dlthread, dl_worker, 0, (char *)&g_dlwork,
+                       g_dlstack + DL_STACK_SIZE, DL_STACK_SIZE,
+                       15, OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+        OSSetThreadName(&g_dlthread, "wiiusync dl");
+        OSResumeThread(&g_dlthread);
+
+        uint64_t last_bytes  = g_active_done;
+        uint64_t last_change = now_ms();
+        while (!OSIsThreadTerminated(&g_dlthread)) {
+            if (!app_running() || g_quit_requested) g_pause_req = true;
+            if (ui_consume_repaint_request()) redraw();
+
+            uint64_t now = now_ms();
+            if (now - g_pad_poll_ms >= 100) {
+                g_pad_poll_ms = now;
+                if (pad_read(NULL) & VPAD_BUTTON_B) g_pause_req = true;
+            }
+
+            uint64_t done = g_active_done;
+            if (done != last_bytes) { last_bytes = done; last_change = now; }
+
+            if (g_spd_ms == 0) { g_spd_ms = now; g_spd_bytes = done; }
+            else if (now - g_spd_ms >= 1000) {
+                g_active_bps = (done - g_spd_bytes) * 1000 / (now - g_spd_ms);
+                g_spd_ms = now;
+                g_spd_bytes = done;
+                redraw();
+            } else if (done - g_last_draw >= (1U << 20)) {
+                g_last_draw = done;
+                redraw();
+            }
+
+            /* The worker's blocking recv only returns when bytes land —
+             * cancel and stall detection have to reach in from here.  Before
+             * the first body byte the server may legitimately be converting
+             * a ROM for many minutes; once data flows, 60 s of silence is a
+             * dead link. */
+            uint64_t stall_limit = (done > e->offset) ? 60u * 1000
+                                                      : 30u * 60u * 1000;
+            if (g_pause_req || now - last_change > stall_limit)
+                http_abort_active();
+
+            OSSleepTicks(OSMillisecondsToTicks(16));
+        }
+        int trc;
+        OSJoinThread(&g_dlthread, &trc);
+        rc    = g_dlwork.rc;
+        total = g_dlwork.total;
+        /* A transfer killed by our own abort is a pause, not an error. */
+        if (g_pause_req && rc < 0) rc = 1;
+    } else {
+        /* Thread setup failed — synchronous fallback on the main thread. */
+        if (e->url_path[0])
+            rc = network_download_path_resumable(&g_state, e->url_path,
+                                                 e->target_path, e->offset, &total);
+        else
+            rc = network_download_rom_resumable(&g_state, e->rom_id, e->extract_format,
+                                                e->target_path, e->offset, &total);
+    }
 
     network_set_progress64_cb(NULL);
     http_set_wait_cb(wait_cb);
@@ -490,7 +643,28 @@ static void run_active_download(DownloadEntry *e) {
                 ui_error("%s", msg);
             }
         } else {
-            ui_status("Done: %s", e->name);
+            /* Attribute the wall-clock so a slow link can be told apart from
+             * slow storage without another guess-and-reflash cycle. */
+            HttpPerf p;
+            http_perf_get(&p);
+            uint64_t mb = p.recv_bytes >> 20;
+            if (mb >= 4) {
+                uint64_t net_ms = p.recv_us / 1000;
+                uint64_t wr_ms  = p.write_us / 1000;
+                uint64_t ui_ms  = p.progress_us / 1000;
+                ui_status("Done: %s | %lluMB net=%llums wr=%llums ui=%llums "
+                          "chunks=%u avg=%lluKB rcvbuf=%dKB",
+                          e->name, (unsigned long long)mb,
+                          (unsigned long long)net_ms,
+                          (unsigned long long)wr_ms,
+                          (unsigned long long)ui_ms,
+                          (unsigned)p.recv_calls,
+                          (unsigned long long)(p.recv_calls
+                              ? (p.recv_bytes / p.recv_calls) >> 10 : 0),
+                          p.rcvbuf >> 10);
+            } else {
+                ui_status("Done: %s", e->name);
+            }
         }
     } else if (rc == 1) {
         e->status = DL_STATUS_PAUSED;
@@ -529,6 +703,122 @@ static void run_download_queue(void) {
     redraw();
 }
 
+/* ---- download groups ----
+ *
+ * A Wii U WUP set is 25-47 queued files and a Wii game several WBFS parts;
+ * showing each file is noise (the PS3 client already folds these).  The
+ * Downloads view lists one row per title (rom_id), aggregated on the fly —
+ * the underlying per-file entries and their resume state are untouched. */
+
+typedef struct {
+    char     rom_id[ROM_ID_LEN];
+    char     name[DOWNLOAD_NAME_LEN];
+    int      files, files_done;
+    uint64_t done, total;
+    DownloadStatus status;
+} DlGroup;
+
+static DlGroup g_dl_groups[DOWNLOAD_MAX];
+static int     g_dl_group_count = 0;
+
+/* Which aggregate status represents the group: an active file makes the
+ * whole title "active", any error trumps paused, and only an entirely
+ * finished set shows "done". */
+static int dl_status_prio(DownloadStatus s) {
+    switch (s) {
+        case DL_STATUS_ACTIVE:    return 5;
+        case DL_STATUS_ERROR:     return 4;
+        case DL_STATUS_PAUSED:    return 3;
+        case DL_STATUS_QUEUED:    return 2;
+        case DL_STATUS_COMPLETED: return 1;
+    }
+    return 0;
+}
+
+/* Per-file entries are named "<Game> (<file>)" — fold back to the game. */
+static void dl_group_name(DlGroup *g, const DownloadEntry *e) {
+    snprintf(g->name, sizeof(g->name), "%s", e->name);
+    size_t nl = strlen(g->name), fl = strlen(e->filename);
+    if (fl && nl > fl + 3 && g->name[nl - 1] == ')' &&
+        g->name[nl - 3 - fl] == ' ' && g->name[nl - 2 - fl] == '(' &&
+        memcmp(g->name + nl - 1 - fl, e->filename, fl) == 0)
+        g->name[nl - 3 - fl] = '\0';
+}
+
+static void dl_build_groups(void) {
+    int n = 0;
+    for (int i = 0; i < g_downloads.count; i++) {
+        const DownloadEntry *e = &g_downloads.items[i];
+        const char *gid = e->rom_id[0] ? e->rom_id : e->key;
+
+        DlGroup *g = NULL;
+        for (int j = 0; j < n; j++)
+            if (strcmp(g_dl_groups[j].rom_id, gid) == 0) { g = &g_dl_groups[j]; break; }
+        if (!g) {
+            if (n >= DOWNLOAD_MAX) break;
+            g = &g_dl_groups[n++];
+            memset(g, 0, sizeof(*g));
+            snprintf(g->rom_id, sizeof(g->rom_id), "%s", gid);
+            dl_group_name(g, e);
+            g->status = e->status;
+        }
+
+        uint64_t done = e->status == DL_STATUS_COMPLETED ? e->total
+                      : e->status == DL_STATUS_ACTIVE    ? g_active_done
+                      : e->offset;
+        g->files++;
+        if (e->status == DL_STATUS_COMPLETED) g->files_done++;
+        g->done  += done;
+        g->total += e->total;
+        if (dl_status_prio(e->status) > dl_status_prio(g->status))
+            g->status = e->status;
+    }
+    g_dl_group_count = n;
+}
+
+static int dl_group_index(const char *rom_id) {
+    dl_build_groups();
+    for (int i = 0; i < g_dl_group_count; i++)
+        if (strcmp(g_dl_groups[i].rom_id, rom_id) == 0) return i;
+    return 0;
+}
+
+/* Run every runnable file of one title, in queue order. */
+static void run_download_group(const char *rom_id) {
+    if (!g_state.sd_ready) { ui_error("No SD - cannot download"); return; }
+    for (int i = 0; i < g_downloads.count; i++) {
+        DownloadEntry *e = &g_downloads.items[i];
+        const char *gid = e->rom_id[0] ? e->rom_id : e->key;
+        if (strcmp(gid, rom_id) != 0) continue;
+        if (e->status != DL_STATUS_QUEUED &&
+            e->status != DL_STATUS_PAUSED &&
+            e->status != DL_STATUS_ERROR)
+            continue;
+        run_active_download(e);
+        if (e->status == DL_STATUS_PAUSED) break;   /* user cancelled */
+        if (e->status != DL_STATUS_COMPLETED) break;
+    }
+    scan_local();
+}
+
+/* Drop every file of one title from the queue. */
+static void remove_download_group(const char *rom_id) {
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (int i = 0; i < g_downloads.count; i++) {
+            DownloadEntry *e = &g_downloads.items[i];
+            const char *gid = e->rom_id[0] ? e->rom_id : e->key;
+            if (strcmp(gid, rom_id) == 0) {
+                downloads_remove(&g_downloads, e->key);
+                removed = true;
+                break;
+            }
+        }
+    }
+    downloads_save(&g_downloads);
+}
+
 /* Expand a Wii catalog entry into one download per split WBFS part. */
 static int queue_wii_rom(const RomEntry *rom, bool run_now) {
     ui_status("Asking server for WBFS parts (may take minutes)...");
@@ -559,7 +849,7 @@ static int queue_wii_rom(const RomEntry *rom, bool run_now) {
     ui_status("Queued %s [%s]: %d part(s)", man.name, man.game_id, man.part_count);
 
     if (run_now && first) {
-        g_dl_sel = (int)(first - g_downloads.items);
+        g_dl_sel = dl_group_index(rom->rom_id);
         g_view = APP_VIEW_DOWNLOADS;
         run_download_queue();
     }
@@ -595,7 +885,7 @@ static int queue_wiiu_rom(const RomEntry *rom, bool run_now) {
     if (rc != 0) { ui_error("%s", man.last_error); return -1; }
 
     char game_dir[SAVE_DIR_LEN];
-    roms_wup_game_dir(man.name[0] ? man.name : rom->name,
+    roms_wup_game_dir(rom->rom_id, man.name[0] ? man.name : rom->name,
                       game_dir, sizeof(game_dir));
     roms_mkdir_p(game_dir);
 
@@ -613,7 +903,7 @@ static int queue_wiiu_rom(const RomEntry *rom, bool run_now) {
               (unsigned long long)(man.total_size >> 20));
 
     if (run_now && first) {
-        g_dl_sel = (int)(first - g_downloads.items);
+        g_dl_sel = dl_group_index(rom->rom_id);
         g_view = APP_VIEW_DOWNLOADS;
         run_download_queue();
     }
@@ -652,9 +942,10 @@ static void queue_selected_rom(bool run_now) {
     if (!e) { ui_error("Download list full"); return; }
     downloads_save(&g_downloads);
     if (run_now) {
-        g_dl_sel = (int)(e - g_downloads.items);
+        g_dl_sel = dl_group_index(rom->rom_id);
         g_view = APP_VIEW_DOWNLOADS;
         run_active_download(e);
+        scan_local();
     } else {
         ui_status("Queued: %s", e->name);
     }
@@ -728,23 +1019,6 @@ static int install_rank(const char *title_id) {
     return 9;
 }
 
-/* The 16-hex title id embedded in a staged folder name, or "" if absent. */
-static void wup_title_id_from_name(const char *name, char *out, size_t out_size) {
-    out[0] = '\0';
-    if (!name) return;
-    for (const char *p = name; *p; p++) {
-        if (strncasecmp(p, "0005", 4) != 0) continue;
-        int n = 0;
-        while (n < 16 && isxdigit((unsigned char)p[n])) n++;
-        if (n != 16) continue;
-        if (isxdigit((unsigned char)p[16])) continue;   /* longer run */
-        if (out_size < 17) return;
-        for (int i = 0; i < 16; i++) out[i] = (char)toupper((unsigned char)p[i]);
-        out[16] = '\0';
-        return;
-    }
-}
-
 /* Every staged WUP folder belonging to the same game as ``title_id`` — i.e.
  * sharing its low word — sorted into install order. */
 static int collect_install_set(const char *title_id, int *idx_out, int max) {
@@ -754,22 +1028,17 @@ static int collect_install_set(const char *title_id, int *idx_out, int max) {
 
     for (int i = 0; i < g_local.count && n < max; i++) {
         if (strcmp(g_local.items[i].system, "WIIU") != 0) continue;
-        char tid[24];
-        wup_title_id_from_name(g_local.items[i].name, tid, sizeof(tid));
-        if (!tid[0] || strcasecmp(tid + 8, low) != 0) continue;
+        const char *tid = g_local.items[i].title_id;
+        if (strlen(tid) != 16 || strcasecmp(tid + 8, low) != 0) continue;
         idx_out[n++] = i;
     }
 
     /* Insertion sort by install rank — n is <= 4 in practice. */
     for (int a = 1; a < n; a++) {
         int key = idx_out[a];
-        char ka[24];
-        wup_title_id_from_name(g_local.items[key].name, ka, sizeof(ka));
-        int rk = install_rank(ka), b = a - 1;
+        int rk = install_rank(g_local.items[key].title_id), b = a - 1;
         while (b >= 0) {
-            char kb[24];
-            wup_title_id_from_name(g_local.items[idx_out[b]].name, kb, sizeof(kb));
-            if (install_rank(kb) <= rk) break;
+            if (install_rank(g_local.items[idx_out[b]].title_id) <= rk) break;
             idx_out[b + 1] = idx_out[b];
             b--;
         }
@@ -794,13 +1063,24 @@ static void install_selected_local(void) {
 
     /* Pull in the update / DLC staged alongside this game so they install in
      * the right order without the user having to know there is one. */
-    char tid[24];
-    wup_title_id_from_name(r->name, tid, sizeof(tid));
     int set[WIIU_RELATED_MAX + 1];
-    int count = collect_install_set(tid, set, (int)(sizeof(set) / sizeof(set[0])));
+    int count = collect_install_set(r->title_id, set,
+                                    (int)(sizeof(set) / sizeof(set[0])));
     if (count == 0) { set[0] = g_loc_sel; count = 1; }
 
     bool to_usb = !strcasecmp(g_state.install_target, "usb");
+
+    /* Do NOT gate the install on g_state.usb_mounted.  That flag is our own
+     * libmocha attach-mount of storage_usb01, used only for *reading* saves —
+     * MCP installs to the WFS USB through IOSU and does not need our mount at
+     * all.  A failed (or simply not-yet-attempted) Mocha probe was blocking
+     * perfectly good USB installs here, which is why the install step never
+     * ran.  MCP_InstallSetTargetDevice reports a genuinely missing USB with a
+     * clear message, so let it be the authority.  Re-probe once so the flag
+     * and the UI label reflect reality, but proceed regardless. */
+    if (to_usb && !g_state.usb_mounted)
+        natives_mount_usb_wfs(&g_state);
+
     if (count > 1) {
         if (!confirm("Install %s\nand %d related title(s) to %s?\n\n"
                      "Base game first, then update, then DLC.",
@@ -836,37 +1116,44 @@ static void install_selected_local(void) {
 
 static void draw_downloads(void) {
     int top = ui_list_top(), vis = ui_list_visible();
-    if (g_downloads.count == 0) {
+    dl_build_groups();
+    if (g_dl_group_count == 0) {
         ui_text(top + 1, 0, UI_GREY, "Queue empty. Queue ROMs from the catalog (X).");
         return;
     }
     for (int i = 0; i < vis - 1; i++) {
         int idx = g_dl_scroll + i;
-        if (idx >= g_downloads.count) break;
-        DownloadEntry *e = &g_downloads.items[idx];
-        uint64_t done = (e->status == DL_STATUS_ACTIVE) ? g_active_done : e->offset;
-        uint64_t tot  = (e->status == DL_STATUS_ACTIVE && g_active_total)
-                            ? g_active_total : e->total;
-        int pct = tot ? (int)(done * 100 / tot) : 0;
-        int color = e->status == DL_STATUS_COMPLETED ? UI_GREEN
-                  : e->status == DL_STATUS_ERROR     ? UI_RED
-                  : e->status == DL_STATUS_ACTIVE    ? UI_YELLOW : UI_WHITE;
-        int namew = ui_cols() - 20;
+        if (idx >= g_dl_group_count) break;
+        DlGroup *g = &g_dl_groups[idx];
+        int pct = g->total ? (int)(g->done * 100 / g->total) : 0;
+        int color = g->status == DL_STATUS_COMPLETED ? UI_GREEN
+                  : g->status == DL_STATUS_ERROR     ? UI_RED
+                  : g->status == DL_STATUS_ACTIVE    ? UI_YELLOW : UI_WHITE;
+        char files[16] = "";
+        if (g->files > 1)
+            snprintf(files, sizeof(files), " %d/%d", g->files_done, g->files);
+        int namew = ui_cols() - 20 - (int)strlen(files);
         if (namew < 6) namew = 6;
-        ui_text_hl(top + i, idx == g_dl_sel, color, " %-9s %3d%% %-*.*s",
-                   downloads_status_to_str(e->status), pct, namew, namew, e->name);
+        ui_text_hl(top + i, idx == g_dl_sel, color, " %-9s %3d%% %-*.*s%s",
+                   downloads_status_to_str(g->status), pct,
+                   namew, namew, g->name, files);
+        if (g->status == DL_STATUS_ACTIVE && g->total)
+            ui_progress(top + i, g->done, g->total);
     }
 
     for (int i = 0; i < g_downloads.count; i++) {
-        if (g_downloads.items[i].status != DL_STATUS_ACTIVE) continue;
+        DownloadEntry *e = &g_downloads.items[i];
+        if (e->status != DL_STATUS_ACTIVE) continue;
         char a[24], b[24];
         human_size(g_active_done, a, sizeof(a));
         human_size(g_active_total, b, sizeof(b));
         uint64_t bps = g_active_bps;
         uint64_t eta = (bps && g_active_total > g_active_done)
                      ? (g_active_total - g_active_done) / bps : 0;
-        ui_text(top + vis - 1, 0, UI_CYAN, "%s/%s %lluKB/s ETA %llu:%02llu B=pause",
-                a, b, (unsigned long long)(bps / 1024),
+        ui_text(top + vis - 1, 0, UI_CYAN,
+                "%.24s %s/%s %lluKB/s ETA %llu:%02llu B=pause",
+                e->filename[0] ? e->filename : e->name, a, b,
+                (unsigned long long)(bps / 1024),
                 (unsigned long long)(eta / 60), (unsigned long long)(eta % 60));
         break;
     }
@@ -924,12 +1211,13 @@ static void mark_server_local(void) {
 
 static void fetch_server(void) {
     if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
-    g_server_loaded = true;
     ui_status("Fetching server GC saves...");
     redraw();
     gcsaves_fetch_server(&g_state, g_scratch, sizeof(g_scratch), &g_server);
     fill_card_names();
     mark_server_local();
+    /* An error leaves the view unloaded so the next entry retries. */
+    g_server_loaded = g_server.count > 0 || !g_server.last_error[0];
     if (g_server.count > 0) ui_status("Server: %d GC save(s)", g_server.count);
     else ui_error("%s", g_server.last_error);
     redraw();
@@ -1119,8 +1407,11 @@ static void scan_natives(void) {
 /* One combined plan covering both families — the server accepts a mixed
  * title list and the platforms filter keeps other consoles' saves out of the
  * server_only bucket. */
-static void compute_plan(void) {
-    if (!network_is_ready(&g_state)) { ui_error("Network not ready"); return; }
+static void compute_plan_ex(bool quiet) {
+    if (!network_is_ready(&g_state)) {
+        if (!quiet) ui_error("Network not ready");
+        return;
+    }
 
     static SaveTitleList merged;
     merged.title_count = 0;
@@ -1152,13 +1443,16 @@ static void compute_plan(void) {
         ui_error("%s", sync_last_message());
     } else {
         g_plan_valid = true;
-        ui_status("Plan: %d up, %d down, %d new, %d conflict, %d ok",
-                  g_plan.upload_count, g_plan.download_count,
-                  g_plan.server_only_count, g_plan.conflict_count,
-                  g_plan.up_to_date_count);
+        if (!quiet)
+            ui_status("Plan: %d up, %d down, %d new, %d conflict, %d ok",
+                      g_plan.upload_count, g_plan.download_count,
+                      g_plan.server_only_count, g_plan.conflict_count,
+                      g_plan.up_to_date_count);
     }
     redraw();
 }
+
+static void compute_plan(void) { compute_plan_ex(false); }
 
 static void sync_progress(const char *msg, int done, int total, void *user) {
     (void)user;
@@ -1189,10 +1483,12 @@ static void sync_all_natives(void) {
 
     SyncSummary sum;
     sync_run_all(&g_state, &merged, &g_plan, sync_progress, NULL, &sum);
+    scan_natives();
+    compute_plan_ex(true);
     ui_status("Sync done: %d up, %d down, %d failed, %d conflict",
               sum.uploaded, sum.downloaded,
               sum.upload_failed + sum.download_failed, sum.conflicts);
-    scan_natives();
+    redraw();
 }
 
 static void native_action(AppView view, int action) {
@@ -1232,9 +1528,15 @@ static void native_action(AppView view, int action) {
             break;
         default: return;
     }
-    if (rc == 0) ui_status("%s", sync_last_message());
-    else         ui_error("%s", sync_last_message());
+    /* Keep the action's outcome visible, but refresh the plan underneath —
+     * dropping it outright made the server-only rows vanish after every
+     * action. */
+    char outcome[256];
+    snprintf(outcome, sizeof(outcome), "%s", sync_last_message());
     g_plan_valid = false;
+    compute_plan_ex(true);
+    if (rc == 0) ui_status("%s", outcome);
+    else         ui_error("%s", outcome);
     redraw();
 }
 
@@ -1290,9 +1592,9 @@ static void draw_natives(AppView view) {
 
 static const char *hint_for(AppView v) {
     switch (v) {
-        case APP_VIEW_ROMS:      return "A=fetch X=queue Y=get now MINUS=GC/WII/WIIU  +=quit";
-        case APP_VIEW_LOCAL:     return "A=rescan X=delete Y=install(Wii U)  ZL/ZR=view  +=quit";
-        case APP_VIEW_DOWNLOADS: return "A=start one Y=run all X=remove B=pause  +=quit";
+        case APP_VIEW_ROMS:      return "A=download X=queue Y=refresh MINUS=GC/WII/WIIU  +=quit";
+        case APP_VIEW_LOCAL:     return "A=install(Wii U) X=delete Y=rescan  ZL/ZR=view  +=quit";
+        case APP_VIEW_DOWNLOADS: return "A=start title Y=run all X=remove B=pause  +=quit";
         case APP_VIEW_GCCARDS:   return "A=upload Y=restore R=next card X=rescan L=import all";
         case APP_VIEW_SERVER:    return "A=restore into card X=refresh Y=pull all GCI  +=quit";
         case APP_VIEW_VWII:
@@ -1325,58 +1627,65 @@ static void redraw(void) {
  * the user should not have to know that a view needs a manual refresh. */
 static void enter_view(void) {
     if (!network_is_ready(&g_state)) return;
-    if (g_view == APP_VIEW_ROMS && !g_catalog_loaded) {
-        g_catalog_loaded = true;
-        fetch_catalog();
-    } else if (g_view == APP_VIEW_SERVER && !g_server_loaded) {
-        g_server_loaded = true;
-        fetch_server();
+    if (g_view == APP_VIEW_ROMS && !g_catalog_loaded)
+        fetch_catalog();          /* sets g_catalog_loaded on success */
+    else if (g_view == APP_VIEW_SERVER && !g_server_loaded)
+        fetch_server();           /* sets g_server_loaded on success */
+    else if ((g_view == APP_VIEW_VWII || g_view == APP_VIEW_WIIU) && !g_plan_valid)
+        /* Without a plan the view only shows saves found on the console —
+         * after a drive swap that hides everything that lives on the server.
+         * Compute it on entry so server-only titles are always listed. */
+        compute_plan_ex(true);
+}
+
+/* Title ids libwhb itself recognises as "hosted by the Homebrew Launcher".
+ * Only for these is a SYSRelaunchTitle the canonical exit; everything else —
+ * Aroma's Health & Safety redirect (000500101004Ex00), standalone wuhb,
+ * forwarders — exits by simply returning from main, and the hosting loader
+ * brings the menu back itself. */
+static bool hosted_by_hbl(void) {
+    switch (OSGetTitleID()) {
+        case 0x0005000013374842ULL:  /* Homebrew Launcher */
+        case 0x000500101004A000ULL:  /* Mii Maker JPN */
+        case 0x000500101004A100ULL:  /* Mii Maker USA */
+        case 0x000500101004A200ULL:  /* Mii Maker EUR */
+            return true;
+        default:
+            return false;
     }
 }
 
-/* Set from the HOME_BUTTON_DENIED callback, which runs inside ProcUI while
- * the main loop is blocked in app_running(). */
-static volatile bool g_quit_requested = false;
-
-static uint32_t home_button_denied(void *ctx) {
-    (void)ctx;
-    g_quit_requested = true;
-    return 0;
-}
-
 /*
- * Leave the app.
+ * Leave the app — NUSspli's exit sequence (the reference that works
+ * everywhere): tear the app down, then ALWAYS issue a launch request
+ * (SYSLaunchMenu, or SYSRelaunchTitle for the classic HBL/Mii Maker hosts)
+ * and pump ProcUI until EXITING before ProcUIShutdown.  The previous flow
+ * skipped both the request and the pump under Aroma, trusting the host
+ * loader to relaunch the menu — nothing did, the process died holding the
+ * foreground, and the screen stayed black.
  *
- * WHBProcShutdown() only relaunches (SYSRelaunchTitle) when libwhb matched
- * the running title id against its three known launcher ids.  On this console
- * it evidently does not: the log shows the whole teardown completing, and
- * then the screen just stays black because nothing ever asked the system to
- * switch away.  So ask explicitly, and pump ProcUI until it reports EXITING
- * — that is what actually performs the foreground handover.
+ * Teardown is always full: mocha mounts, the AC connection and the SD
+ * devoptab must be gone before the process dies or the exit is not clean.
+ * (The old exit_mode=minimal skip is deliberately ignored for this reason.)
  */
 static void quit_to_menu(void) {
     /* Reachable twice — once from the + / HOME handler and once after the
-     * loop falls out — and a second SYSLaunchMenu() would be a competing
-     * launch request. */
+     * loop falls out — and a second launch request would compete. */
     static bool done = false;
     if (done) return;
     done = true;
 
-    const char *mode = g_state.exit_mode[0] ? g_state.exit_mode : "full";
-    bool skip_teardown = (strcmp(mode, "minimal") == 0);
+    const char *mode = g_state.exit_mode[0] ? g_state.exit_mode : "auto";
 
-    WHBLogPrintf("quit: closing down (exit_mode=%s, aroma=%d)",
-                 mode, (int)app_is_aroma());
-    ui_clear();
-    ui_draw_message("Save Sync", "Closing down...\n\nReturning to the Wii U Menu.");
-    ui_flush();
-    OSSleepTicks(OSMillisecondsToTicks(400));   /* let the message be seen */
-
-    if (skip_teardown) {
-        /* Only the screen has to go back — MEM1 belongs to ProcUI. */
-        WHBLogPrintf("exit: skipping teardown (minimal)");
-        ui_shutdown();
-    } else {
+    WHBLogPrintf("quit: closing down (exit_mode=%s, aroma=%d, exiting=%d, hbl=%d)",
+                 mode, (int)app_is_aroma(), (int)app_exit_pending(),
+                 (int)hosted_by_hbl());
+    if (!app_exit_pending()) {   /* screen is gone once EXITING is under way */
+        ui_clear();
+        ui_draw_message("Save Sync", "Closing down...\n\nReturning to the Wii U Menu.");
+        ui_flush();
+        OSSleepTicks(OSMillisecondsToTicks(400));   /* let the message be seen */
+    }
 
     /*
      * EVERYTHING is torn down here, while ProcUI is still alive.
@@ -1404,21 +1713,39 @@ static void quit_to_menu(void) {
 
     WHBLogPrintf("exit: releasing screen (MEM1) before ProcUI shuts down");
     ui_shutdown();
-    }
 
-    if (strcmp(mode, "none") == 0) {
-        WHBLogPrintf("quit: issuing NO launch request");
-    } else if (strcmp(mode, "relaunch") == 0) {
-        WHBLogPrintf("quit: SYSRelaunchTitle");
+    /*
+     * NUSspli's exit sequence, verbatim in spirit: unless CafeOS already
+     * ordered the exit, ALWAYS issue a launch request ourselves, then pump
+     * ProcUI (answering RELEASE_FOREGROUND with ProcUIDrawDoneRelease) until
+     * EXITING arrives.  The old "no launch request — host loader restores
+     * the menu" branch returned from main still holding the foreground with
+     * nothing scheduled to take it: that was the black screen on exit.
+     * SYSRelaunchTitle instead of SYSLaunchMenu only for the classic
+     * HBL / Mii Maker hijack hosts, where "back to the launcher" is the
+     * expected destination.
+     */
+    bool pump = true;
+    if (app_exit_pending()) {
+        WHBLogPrintf("quit: system already exiting - no launch request");
+    } else if (strcmp(mode, "none") == 0) {
+        /* Debug escape hatch: no request means EXITING never comes, so do
+         * not sit in the pump waiting for it either. */
+        WHBLogPrintf("quit: issuing NO launch request (exit_mode=none)");
+        pump = false;
+    } else if (strcmp(mode, "relaunch") == 0 ||
+               (strcmp(mode, "menu") != 0 && hosted_by_hbl())) {
+        WHBLogPrintf("quit: SYSRelaunchTitle (%s)",
+                     strcmp(mode, "relaunch") == 0 ? "exit_mode" : "HBL host");
         SYSRelaunchTitle(0, NULL);
     } else {
         WHBLogPrintf("quit: SYSLaunchMenu");
         SYSLaunchMenu();
     }
 
-    while (app_running())
-        OSSleepTicks(OSMillisecondsToTicks(16));
-    WHBLogPrintf("quit: ProcUI reported exiting");
+    if (pump)
+        app_wait_exit();
+    WHBLogPrintf("quit: done");
 }
 
 static void cycle_view(int delta) {
@@ -1432,26 +1759,19 @@ static void cycle_view(int delta) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    /* Do NOT call OSEnableHomeButtonMenu(TRUE) after this.
+    /* Do NOT call OSEnableHomeButtonMenu(TRUE) anywhere.
      *
-     * When homebrew is hosted by the Homebrew Launcher or the Health & Safety
-     * wrapper, WHBProcInit deliberately calls OSEnableHomeButtonMenu(FALSE)
-     * and registers a HOME_BUTTON_DENIED callback that clears its running
-     * flag — i.e. HOME means "quit back to the launcher", and there is no
-     * overlay.  Re-enabling the menu stops the press from being denied (so
-     * the app never quits) and asks the system for an overlay a hijacked
-     * wrapper title cannot render: a black screen either way. */
+     * Enabling the overlay asks the system to render the HOME menu over this
+     * process — which only works when the process is a real standalone
+     * title.  Hosted through any wrapper hijack (Homebrew Launcher .rpx,
+     * wiiload, the Health & Safety redirect) the overlay comes up black with
+     * no way back, and detecting Aroma does not prove which case we are in.
+     * app_init therefore disables it in both environments; the DENIED
+     * callback below turns the press into a clean quit — same path as +. */
     WHBLogUdpInit();
     app_init();
-
-    /* Under Aroma the HOME overlay works and app_init leaves it enabled.
-     * Everywhere else it renders black over a hijacked title, so disable it
-     * and treat the resulting DENIED callback as a quit — same path as +. */
-    if (!app_is_aroma()) {
-        OSEnableHomeButtonMenu(FALSE);
-        ProcUIRegisterCallback(PROCUI_CALLBACK_HOME_BUTTON_DENIED,
-                               home_button_denied, NULL, 100);
-    }
+    ProcUIRegisterCallback(PROCUI_CALLBACK_HOME_BUTTON_DENIED,
+                           home_button_denied, NULL, 100);
 
     /* The title id decides whether libwhb relaunches for us on exit; log it so
      * the launcher environment is never in doubt. */
@@ -1538,7 +1858,7 @@ int main(int argc, char **argv) {
     else if (!server_ok)
         ui_error("No reply from %s - check Config", g_state.server_url);
     else
-        ui_status("Ready - ip %s, server OK. A = fetch catalog", g_state.ip);
+        ui_status("Ready - ip %s, server OK", g_state.ip);
 
     enter_view();
     redraw();
@@ -1549,6 +1869,14 @@ int main(int argc, char **argv) {
          * this the app sits on a black screen until a button is pressed. */
         if (ui_consume_repaint_request()) redraw();
 
+        /* HOME sets g_quit_requested from inside app_running() and produces
+         * no VPAD bit — check it BEFORE the down==0 early-out or the press
+         * does nothing until some other button is hit. */
+        if (g_quit_requested) {
+            quit_to_menu();
+            break;
+        }
+
         uint32_t held = 0;
         uint32_t down = pad_read(&held);
         if (down == 0) {
@@ -1556,11 +1884,11 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* PLUS quits.  Wrapper-hosted homebrew gets no HOME overlay (libwhb
-         * turns the denied HOME press into a quit), so give the user an
-         * explicit, reliable way out that does not depend on it. */
-        if ((down & VPAD_BUTTON_PLUS) || g_quit_requested) {
-            if (!g_quit_requested && !confirm("Close Save Sync?")) {
+        /* PLUS quits too — an explicit, reliable way out that does not
+         * depend on the HOME press reaching us. */
+        if (down & VPAD_BUTTON_PLUS) {
+            if (!confirm("Close Save Sync?")) {
+                if (g_quit_requested) { quit_to_menu(); break; }
                 redraw();
                 continue;
             }
@@ -1576,10 +1904,20 @@ int main(int argc, char **argv) {
             else if (down & VPAD_BUTTON_DOWN)  g_rom_sel++;
             else if (down & VPAD_BUTTON_LEFT)  g_rom_sel -= ui_list_visible();
             else if (down & VPAD_BUTTON_RIGHT) g_rom_sel += ui_list_visible();
-            else if (down & VPAD_BUTTON_A)     fetch_catalog();
+            else if (down & VPAD_BUTTON_A) {
+                /* A is the confirm/primary action: download the selection.
+                 * On an empty list it (re)fetches instead. */
+                if (g_catalog.count == 0) fetch_catalog();
+                else if (g_rom_sel < g_catalog.count) {
+                    const RomEntry *rom = &g_catalog.items[g_rom_sel];
+                    char sz[16]; human_size(rom->size, sz, sizeof(sz));
+                    if (confirm("Download %s (%s) now?", rom->name, sz))
+                        queue_selected_rom(true);
+                }
+            }
             else if (down & VPAD_BUTTON_MINUS) toggle_catalog_system();
             else if (down & VPAD_BUTTON_X)     queue_selected_rom(false);
-            else if (down & VPAD_BUTTON_Y)     queue_selected_rom(true);
+            else if (down & VPAD_BUTTON_Y)     fetch_catalog();
             clamp_scroll(&g_rom_sel, &g_rom_scroll, g_catalog.count);
         }
         else if (g_view == APP_VIEW_LOCAL) {
@@ -1588,8 +1926,8 @@ int main(int argc, char **argv) {
             else if (down & VPAD_BUTTON_DOWN)  g_loc_sel++;
             else if (down & VPAD_BUTTON_LEFT)  g_loc_sel -= ui_list_visible();
             else if (down & VPAD_BUTTON_RIGHT) g_loc_sel += ui_list_visible();
-            else if (down & VPAD_BUTTON_A)     scan_local();
-            else if (down & VPAD_BUTTON_Y)     install_selected_local();
+            else if (down & VPAD_BUTTON_A)     install_selected_local();
+            else if (down & VPAD_BUTTON_Y)     scan_local();
             else if (down & VPAD_BUTTON_X) {
                 if (c > 0 && g_loc_sel < c &&
                     confirm("Delete %s\n(%s) from the SD card?",
@@ -1604,20 +1942,26 @@ int main(int argc, char **argv) {
             clamp_scroll(&g_loc_sel, &g_loc_scroll, g_local.count);
         }
         else if (g_view == APP_VIEW_DOWNLOADS) {
-            int c = g_downloads.count;
+            dl_build_groups();
+            int c = g_dl_group_count;
             if      (down & VPAD_BUTTON_UP)    g_dl_sel--;
             else if (down & VPAD_BUTTON_DOWN)  g_dl_sel++;
             else if (down & VPAD_BUTTON_A) {
-                if (c > 0 && g_dl_sel < c) run_active_download(&g_downloads.items[g_dl_sel]);
+                if (c > 0 && g_dl_sel < c)
+                    run_download_group(g_dl_groups[g_dl_sel].rom_id);
             }
             else if (down & VPAD_BUTTON_Y) run_download_queue();
             else if (down & VPAD_BUTTON_X) {
                 if (c > 0 && g_dl_sel < c) {
-                    downloads_remove(&g_downloads, g_downloads.items[g_dl_sel].key);
-                    downloads_save(&g_downloads);
+                    DlGroup *g = &g_dl_groups[g_dl_sel];
+                    if (g->files <= 1 ||
+                        confirm("Remove %s\n(%d files) from the queue?",
+                                g->name, g->files))
+                        remove_download_group(g->rom_id);
                 }
             }
-            clamp_scroll(&g_dl_sel, &g_dl_scroll, g_downloads.count);
+            dl_build_groups();
+            clamp_scroll(&g_dl_sel, &g_dl_scroll, g_dl_group_count);
         }
         else if (g_view == APP_VIEW_GCCARDS) {
             int vis = ui_list_visible() - 1;
@@ -1698,8 +2042,9 @@ int main(int argc, char **argv) {
      * ProcUI EXITING path — so run it here too; every step is idempotent. */
     quit_to_menu();
 
-    WHBLogPrintf("wiiusync exiting");
-    WHBLogUdpDeinit();
+    WHBLogPrintf("wiiusync exiting (ProcUIShutdown next)");
     app_shutdown();
+    WHBLogPrintf("wiiusync: shutdown complete, returning to loader");
+    WHBLogUdpDeinit();
     return 0;
 }

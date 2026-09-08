@@ -24,6 +24,16 @@
  * the system installer and nothing we do client-side changes that.
  */
 
+/* Poll cadence, and how long to wait for MCP to actually pick the job up
+ * before declaring it refused.  Without the timeout a rejected install spins
+ * forever waiting for an inProgress that never arrives. */
+#define INSTALL_POLL_MS           500u
+#define INSTALL_START_TIMEOUT_MS  15000u
+
+/* Contents listed in a TMD.  Retail titles run well under this; the cap just
+ * bounds the pre-flight scan. */
+#define INSTALL_MAX_CONTENTS      256
+
 typedef struct {
     bool     running;
     bool     done;
@@ -38,7 +48,34 @@ typedef struct {
 /* Translate a devoptab path ("fs:/vol/external01/install/Foo", "usb:/install/
  * Foo") into the FSA path MCP expects ("/vol/external01/install/Foo",
  * "/vol/usb/install/Foo").  Returns false when the root is unrecognised. */
+/* FSA path MCP sees the SD card at.  /vol/external01 is the application's
+ * own mount and is invisible to IOSU's installer, so it has to be bind
+ * mounted somewhere MCP can reach before any install will do anything. */
+#define MCP_SD_MOUNT "/vol/app_sd"
+
 bool install_fsa_path(const char *devoptab_path, char *out, size_t out_size);
+
+/* Bind /vol/external01 -> /vol/app_sd through a libmocha-unlocked FSA client.
+ * Idempotent; called automatically by install_wup_folder(). */
+bool install_mount_sd(char *err, size_t err_size);
+void install_unmount_sd(void);
+
+/* True when the console's USB drive is usb02 rather than the usual usb01. */
+bool install_usb_is_second(void);
+
+/*
+ * Verify a staged WUP folder before handing it to MCP.
+ *
+ * Reads title.tmd for the title id and its content list, then confirms every
+ * <content-id>.app is present and non-empty and that no .part file is left
+ * over.  MCP installs an incomplete set without complaining and the title
+ * then never shows up on the menu, so this is what turns "nothing happened"
+ * into an actionable message.
+ *
+ * Returns 0 when installable; -1 with a reason in ``msg``.
+ */
+int install_check_folder(const char *dir, uint64_t *title_id_out,
+                         char *msg, size_t msg_size);
 
 /*
  * Install the WUP folder at ``dir`` (a devoptab path).  ``target`` is "mlc"

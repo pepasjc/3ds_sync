@@ -106,6 +106,37 @@ MISTER_SYSTEM_FOLDER_CANDIDATES: dict[str, list[str]] = {
 }
 
 
+# Some cores keep their saves somewhere other than their own games folder.
+#
+# The TurboGrafx-16 core writes **both** HuCard and CD saves into
+# ``saves/TGFX16``; there is no ``saves/TGFX16-CD``, even though CD *games*
+# live in ``games/TGFX16-CD``. Writing a downloaded CD save to a folder named
+# after the games folder puts it somewhere the core never looks.
+MISTER_SYSTEM_SAVE_FOLDERS: dict[str, list[str]] = {
+    "PCECD": ["TGFX16"],
+}
+
+# The other half of that: one save folder now serves two systems, so the
+# folder alone no longer says which system a save belongs to. The games folders
+# are still separate, so an installed game is what disambiguates.
+MISTER_SHARED_SAVE_FOLDERS: dict[str, tuple] = {
+    "TGFX16": ("PCECD", "PCE"),
+}
+
+
+def mister_system_save_folder_candidates(system: str) -> list[str]:
+    """Ordered save-folder names for a system (best first).
+
+    Defaults to the games-folder names, since most cores use the same name for
+    both, and is overridden where a core does not.
+    """
+    system_up = (system or "").upper()
+    override = MISTER_SYSTEM_SAVE_FOLDERS.get(system_up)
+    if override:
+        return list(override)
+    return mister_system_folder_candidates(system_up)
+
+
 # CD-based cores.  Their games install into a per-game subfolder
 # (games/PSX/<Game>/<Game>.chd): the cores name the autosave memory card /
 # backup RAM after the game's folder, so each game gets a dedicated save and
@@ -125,6 +156,35 @@ def mister_system_folder_candidates(system: str) -> list[str]:
     return [fallback] if fallback else []
 
 
+# ── Where GameSync keeps its files on the device ────────────────────────────
+#
+# MiSTer scripts keep their data in ``/media/fat/Scripts/.config/<script>/``;
+# the stock ``downloader`` puts its config, state and log there together, so
+# GameSync follows suit rather than littering the SD card root.
+#
+# These constants are shared because three different programs read and write
+# the same state file - the on-device client, the desktop client over SFTP and
+# the legacy ``sync_saves.sh``. If they ever disagreed on the path, each would
+# keep its own idea of the last synced hash and every save would look like a
+# conflict.
+
+#: MiSTer's Saturn core reads and writes the internal backup RAM byte-expanded
+#: to 64 KB (0xFF padding at even offsets) - the same layout Yabause uses - and
+#: always names it ``.sav``. The server keeps the canonical 32 KB image, so a
+#: download has to be converted into this shape or the core ignores it.
+MISTER_SATURN_FORMAT = "yabause"
+
+MISTER_CONFIG_DIR = "/media/fat/Scripts/.config/gamesync"
+MISTER_CONFIG_FILE = MISTER_CONFIG_DIR + "/gamesync.cfg"
+MISTER_STATE_FILE = MISTER_CONFIG_DIR + "/state.json"
+MISTER_LOG_FILE = MISTER_CONFIG_DIR + "/gamesync.log"
+
+#: Pre-0.5.4 locations. Still read when the current path holds nothing, so an
+#: existing install keeps its sync state instead of re-conflicting everything.
+LEGACY_MISTER_CONFIG_FILE = "/media/fat/3dssync.cfg"
+LEGACY_MISTER_STATE_FILE = "/media/fat/3dssync_state.json"
+
+
 # Compatibility aliases for current desktop imports.
 FOLDER_TO_SYSTEM = MISTER_FOLDER_TO_SYSTEM
 SYSTEM_TO_FOLDER = MISTER_SYSTEM_TO_FOLDER
@@ -132,12 +192,22 @@ MISTER_FOLDER_MAP = MISTER_FOLDER_TO_SYSTEM
 
 __all__ = [
     "FOLDER_TO_SYSTEM",
+    "LEGACY_MISTER_CONFIG_FILE",
+    "LEGACY_MISTER_STATE_FILE",
     "MISTER_CD_SYSTEMS",
+    "MISTER_CONFIG_DIR",
+    "MISTER_CONFIG_FILE",
     "MISTER_FOLDER_MAP",
     "MISTER_FOLDER_TO_SYSTEM",
     "MISTER_GAMES_ROOTS",
+    "MISTER_LOG_FILE",
+    "MISTER_SATURN_FORMAT",
+    "MISTER_STATE_FILE",
+    "MISTER_SHARED_SAVE_FOLDERS",
     "MISTER_SYSTEM_FOLDER_CANDIDATES",
+    "MISTER_SYSTEM_SAVE_FOLDERS",
     "MISTER_SYSTEM_TO_FOLDER",
     "SYSTEM_TO_FOLDER",
     "mister_system_folder_candidates",
+    "mister_system_save_folder_candidates",
 ]

@@ -43,6 +43,7 @@ from shared.mister import (  # noqa: E402
     MISTER_SYSTEM_FOLDER_CANDIDATES,
     MISTER_SYSTEM_TO_FOLDER,
     mister_system_folder_candidates,
+    mister_system_save_folder_candidates,
 )
 
 __all__ = [
@@ -61,6 +62,7 @@ __all__ = [
     "MISTER_SYSTEM_FOLDER_CANDIDATES",
     "MISTER_SYSTEM_TO_FOLDER",
     "mister_system_folder_candidates",
+    "mister_system_save_folder_candidates",
     "PSX_RETAIL_PREFIXES",
     "ROM_EXTENSIONS",
     "SAVE_EXTENSIONS",

@@ -407,13 +407,43 @@ int roms_install_gc_iso(const char *staging_path, char *msg, size_t msg_size) {
     return 0;
 }
 
-void roms_wup_game_dir(const char *name, char *out, size_t out_size) {
+bool roms_is_wiiu_title_id(const char *s) {
+    if (!s) return false;
+    if (strncasecmp(s, "0005", 4) != 0) return false;
+    for (int i = 0; i < 16; i++)
+        if (!isxdigit((unsigned char)s[i])) return false;
+    return s[16] == '\0';
+}
+
+void roms_wup_game_dir(const char *title_id, const char *name,
+                       char *out, size_t out_size) {
+    char root[SAVE_DIR_LEN];
+    roms_install_dir(root, sizeof(root));
+
+    /* Name the folder after the title id, uppercase hex, exactly as NUSspli
+     * and WUP Installer do.
+     *
+     * This is not cosmetic.  A game-name folder puts spaces and parentheses
+     * into the FSA path handed to MCP_InstallTitleAsync, and that was the one
+     * structural difference between our staged folders (which MCP refused
+     * without reporting anything) and NUSspli's (which install fine) — the
+     * file sets themselves were byte-for-byte equivalent.  A hex id also
+     * makes the folder self-identifying and lets a re-download land on top of
+     * the previous one instead of creating a near-duplicate. */
+    if (roms_is_wiiu_title_id(title_id)) {
+        char upper[17];
+        for (int i = 0; i < 16; i++)
+            upper[i] = (char)toupper((unsigned char)title_id[i]);
+        upper[16] = '\0';
+        snprintf(out, out_size, "%s/%s", root, upper);
+        return;
+    }
+
+    /* No usable id (shouldn't happen for a catalog bundle) — fall back to the
+     * sanitised name so the download still has somewhere to go. */
     char clean[MAX_TITLE_LEN];
     sanitise(name && name[0] ? name : "title", clean, sizeof(clean));
     if (strlen(clean) > 80) clean[80] = '\0';
-
-    char root[SAVE_DIR_LEN];
-    roms_install_dir(root, sizeof(root));
     snprintf(out, out_size, "%s/%s", root, clean);
 }
 
@@ -544,6 +574,10 @@ static void scan_install_dir(LocalRomList *out) {
         if (!roms_is_wup_dir(sub)) continue;
 
         push_local(out, de->d_name, "title.tmd", sub, "WIIU");
+        if (roms_is_wiiu_title_id(de->d_name)) {
+            LocalRom *e = &out->items[out->count - 1];
+            snprintf(e->title_id, sizeof(e->title_id), "%s", de->d_name);
+        }
     }
     closedir(d);
 }

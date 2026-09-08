@@ -9,6 +9,7 @@
 #include "wiiunet.h"
 #include "bundle.h"
 #include "http.h"
+#include "iowrite.h"
 #include "state.h"
 
 #include <ctype.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <coreinit/core.h>
 #include <nn/ac.h>
 
 static NetProgress64Fn g_progress_cb   = NULL;
@@ -135,10 +137,6 @@ int network_download_path_resumable(const SyncState *state,
     FILE *fp = fopen(part, start_offset > 0 ? "ab" : "wb");
     if (!fp) return -2;
 
-    /* Large stdio buffer so recv chunks batch into big sequential SD writes. */
-    static char io_buf[256 * 1024];
-    setvbuf(fp, io_buf, _IOFBF, sizeof(io_buf));
-
     HttpRequest req = {0};
     req.server_url  = state->server_url;
     req.api_key     = state->api_key;
@@ -146,10 +144,34 @@ int network_download_path_resumable(const SyncState *state,
     req.path        = path;
     req.method      = "GET";
     req.range_start = start_offset;
+    /* On the download worker thread: blocking recv hot path; the main thread
+     * enforces stall/cancel via http_abort_active().  On the main thread
+     * (fallback path) nobody could do that, so keep the pumpable
+     * select-based receive there. */
+    req.io_blocking = !OSIsMainCore();
 
     HttpResponseInfo info;
     g_progress_base = start_offset;
-    int rc = http_get_stream(&req, fp, progress_bridge, &info);
+
+    /* Writes go through a background thread (iowrite.c) so the socket keeps
+     * draining while the SD/USB write is in flight — on one thread the
+     * transfer runs at the serial sum of the two.  The writer thread hands
+     * the filesystem 1 MB aligned blocks, so stdio buffering would only add
+     * a copy. */
+    IoWriter iow;
+    int rc;
+    if (iow_start(&iow, fp) == 0) {
+        setvbuf(fp, NULL, _IONBF, 0);
+        rc = http_get_stream_cb(&req, NULL, iow_stream_writer, &iow,
+                                progress_bridge, &info);
+        int werr = iow_finish(&iow);
+        if (werr != 0 && rc == 0) rc = -7;
+    } else {
+        /* Allocation failed — synchronous fallback. */
+        static char io_buf[256 * 1024];
+        setvbuf(fp, io_buf, _IOFBF, sizeof(io_buf));
+        rc = http_get_stream(&req, fp, progress_bridge, &info);
+    }
     g_progress_base = 0;
     fclose(fp);
 

@@ -45,6 +45,9 @@ async def lifespan(app: FastAPI):
         dats_dir / "Sony - PlayStation 2.dat"
     )
     count_sat = game_names.load_libretro_dat_to_dicts(dats_dir / "Sega - Saturn.dat")
+    count_dc = game_names.load_libretro_dat_to_dicts(
+        dats_dir / "Sega - Dreamcast.dat"
+    )
     count_ps3 = game_names.load_libretro_dat_to_dicts(
         dats_dir / "Sony - PlayStation 3.dat"
     )
@@ -79,13 +82,15 @@ async def lifespan(app: FastAPI):
 
     count_psn_retail = game_names.build_psx_psn_to_retail()
     count_sat_slugs = game_names.build_saturn_slug_index()
+    count_dc_slugs = game_names.build_dreamcast_slug_index()
     count_sat_archives = saturn_archives.load_seed(
         data_dir / "saturn_archive_names.json"
     )
     print(
         f"Loaded {count_3ds_title_ids} 3DS TitleIDs + {count_3ds} 3DS codes + {count_ds} DS + "
-        f"{count_psp} PSP + {count_vita} Vita + {count_psx} PSX + {count_ps2} PS2 + {count_sat} Saturn + {count_ps3} PS3 + {count_wii} GC/Wii + {count_wiiu} Wii U + {count_xbox} Xbox game names "
-        f"({count_psn_retail} PSN→retail mappings, {count_sat_slugs} Saturn slug mappings, {count_sat_archives} Saturn archive mappings)"
+        f"{count_psp} PSP + {count_vita} Vita + {count_psx} PSX + {count_ps2} PS2 + {count_sat} Saturn + {count_dc} Dreamcast + {count_ps3} PS3 + {count_wii} GC/Wii + {count_wiiu} Wii U + {count_xbox} Xbox game names "
+        f"({count_psn_retail} PSN→retail mappings, {count_sat_slugs} Saturn slug mappings, "
+        f"{count_dc_slugs} Dreamcast slug mappings, {count_sat_archives} Saturn archive mappings)"
     )
 
     # Load No-Intro / Redump DAT files for ROM normalization

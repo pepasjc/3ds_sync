@@ -811,6 +811,7 @@ fun systemChipColor(systemName: String): Color {
         "MAME"            -> Color(0xFFC62828)
         "NEOCD", "NGP"    -> Color(0xFFAD1457)
         "PCE", "TG16"     -> Color(0xFF00695C)
+        "PCECD", "TGCD"   -> Color(0xFF00838F)
         "PCSG"            -> Color(0xFF689F38)
         "PCFX"            -> Color(0xFF827717)
         "WSWAN", "WSWANC" -> Color(0xFF2E7D32)

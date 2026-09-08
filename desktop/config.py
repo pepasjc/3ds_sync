@@ -19,12 +19,16 @@ DEVICE_TYPES = [
     "Everdrive",
     "MEGA EverDrive",
     "SAROO",
+    "Super SD System 3",
     "EmuDeck",
     "MemCard Pro",
     "MemCard Pro FTP",
+    "MemCard Pro DC",
     "PSIO",
     "CD Folder",
     "OPL",
+    "GDEMU",
+    "openMenu",
 ]
 
 STATUS_COLORS = {
@@ -165,7 +169,10 @@ def get_base_url() -> str:
 
 _HEX_TITLE_RE = re.compile(r"^[0-9A-Fa-f]{16}$")
 _PS_PREFIX_RE = re.compile(r"^[A-Z]{4}\d{5}")
-_EMULATOR_RE = re.compile(r"^([A-Z0-9]{2,8})_[a-z0-9]")
+# Slug ids are lowercase (``GBA_zelda``), but serial/gamecode ids are not
+# (``DC_T1249M``, ``GC_GALE01``, ``SAT_T-4507G``) — both are emulator-format
+# title ids and both must resolve to their system here.
+_EMULATOR_RE = re.compile(r"^([A-Z0-9]{2,8})_[A-Za-z0-9]")
 
 _PS3_PREFIXES = {
     "BCAS",

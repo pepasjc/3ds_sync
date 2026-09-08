@@ -34,7 +34,7 @@ from rom_installer import (
 )
 
 # Device types that support the "Sanitize / Repair Installed Files" action.
-REPAIRABLE_DEVICE_TYPES = {"PSIO", "OPL"}
+REPAIRABLE_DEVICE_TYPES = {"PSIO", "OPL", "GDEMU", "OPENMENU"}
 
 
 def _fmt_size(num_bytes: int) -> str:
@@ -442,8 +442,9 @@ class RomInstallerTab(QWidget):
             QMessageBox.information(
                 self,
                 "ROM Installer",
-                "Repair is available for PSIO (filename limits) and OPL\n"
-                "(POPStarter APPS/ app-folder backfill) profiles.",
+                "Repair is available for PSIO (filename limits), OPL\n"
+                "(POPStarter APPS/ app-folder backfill) and GDEMU / openMenu\n"
+                "(folder layout + menu game list) profiles.",
             )
             return
         try:
@@ -462,6 +463,19 @@ class RomInstallerTab(QWidget):
                 ".VCD, create its APPS/ app folder (renamed POPSTARTER.ELF +\n"
                 "title.cfg) so the game appears on OPL's Apps page?\n\n"
                 "Requires POPSTARTER.ELF in POPS/.  Safe to run repeatedly.\n\n"
+                f"Folder:\n{root}"
+            )
+        elif device_type in {"GDEMU", "OPENMENU"}:
+            prompt = (
+                "Bring every game folder on this card up to the standard GDEMU\n"
+                "layout (disc.gdi + trackNN.* filenames, name.txt and the other\n"
+                "metadata caches), renumber the game folders so 02, 03, ... run\n"
+                "in alphabetical order, then rebuild the menu's game list?\n\n"
+                "Folder 01 keeps its place — only game folders are renumbered.\n"
+                "The list is also patched into the menu image in folder 01 — that\n"
+                "is the copy the console reads, and without it a newly installed\n"
+                "game never appears in the menu.  The original bytes are backed\n"
+                "up first, and folder 01 is otherwise left alone.\n\n"
                 f"Folder:\n{root}"
             )
         else:

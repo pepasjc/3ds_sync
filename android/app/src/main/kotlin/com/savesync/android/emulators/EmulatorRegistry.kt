@@ -11,6 +11,7 @@ import com.savesync.android.emulators.impl.MgbaEmulator
 import com.savesync.android.emulators.impl.PpssppEmulator
 import com.savesync.android.emulators.impl.RetroArchEmulator
 import com.savesync.android.sync.SaturnSyncFormat
+import com.savesync.android.sync.SegaCdSyncFormat
 import java.io.File
 
 /**
@@ -107,6 +108,7 @@ object EmulatorRegistry {
         romDirOverrides: Map<String, String> = emptyMap(),
         saveDirOverrides: Map<String, String> = emptyMap(),
         saturnSyncFormat: SaturnSyncFormat = SaturnSyncFormat.MEDNAFEN,
+        segaCdSyncFormat: SegaCdSyncFormat = SegaCdSyncFormat.GENESIS_PLUS_GX,
         beetleSaturnPerCoreFolder: Boolean = true,
         cdGamesPerContentFolder: Boolean = false
     ): List<EmulatorBase> {
@@ -123,6 +125,7 @@ object EmulatorRegistry {
                 romScanDir = romScanDir,
                 romDirOverrides = romDirOverrides,
                 saturnSyncFormat = saturnSyncFormat,
+            segaCdSyncFormat = segaCdSyncFormat,
                 beetleSaturnPerCoreFolder = beetleSaturnPerCoreFolder,
                 cdGamesPerContentFolder = cdGamesPerContentFolder,
                 saveDirOverride = ovr(RetroArchEmulator.EMULATOR_KEY)
@@ -179,6 +182,7 @@ object EmulatorRegistry {
         romDirOverrides: Map<String, String> = emptyMap(),
         saveDirOverrides: Map<String, String> = emptyMap(),
         saturnSyncFormat: SaturnSyncFormat = SaturnSyncFormat.MEDNAFEN,
+        segaCdSyncFormat: SegaCdSyncFormat = SegaCdSyncFormat.GENESIS_PLUS_GX,
         beetleSaturnPerCoreFolder: Boolean = true,
         cdGamesPerContentFolder: Boolean = false
     ): List<SaveEntry> {
@@ -188,6 +192,7 @@ object EmulatorRegistry {
             romDirOverrides = romDirOverrides,
             saveDirOverrides = saveDirOverrides,
             saturnSyncFormat = saturnSyncFormat,
+            segaCdSyncFormat = segaCdSyncFormat,
             beetleSaturnPerCoreFolder = beetleSaturnPerCoreFolder,
             cdGamesPerContentFolder = cdGamesPerContentFolder
         ).flatMap { emulator ->
@@ -214,6 +219,7 @@ object EmulatorRegistry {
         romDirOverrides: Map<String, String> = emptyMap(),
         saveDirOverrides: Map<String, String> = emptyMap(),
         saturnSyncFormat: SaturnSyncFormat = SaturnSyncFormat.MEDNAFEN,
+        segaCdSyncFormat: SegaCdSyncFormat = SegaCdSyncFormat.GENESIS_PLUS_GX,
         beetleSaturnPerCoreFolder: Boolean = true,
         cdGamesPerContentFolder: Boolean = false
     ): Map<String, SaveEntry> {
@@ -224,6 +230,7 @@ object EmulatorRegistry {
             romDirOverrides = romDirOverrides,
             saveDirOverrides = saveDirOverrides,
             saturnSyncFormat = saturnSyncFormat,
+            segaCdSyncFormat = segaCdSyncFormat,
             beetleSaturnPerCoreFolder = beetleSaturnPerCoreFolder,
             cdGamesPerContentFolder = cdGamesPerContentFolder
         ).forEach { emulator ->

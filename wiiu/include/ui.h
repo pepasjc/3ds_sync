@@ -39,6 +39,10 @@ void ui_flush(void);          /* render the buffer to both screens */
 void ui_text(int row, int col, int color, const char *fmt, ...);
 void ui_text_hl(int row, bool selected, int color, const char *fmt, ...);
 
+/* Draw a progress bar as the background of ``row`` this frame (the row's
+ * text renders on top of it).  Cleared by ui_clear(); total == 0 hides it. */
+void ui_progress(int row, uint64_t done, uint64_t total);
+
 void ui_status(const char *fmt, ...);
 void ui_error(const char *fmt, ...);
 const char *ui_status_text(void);

@@ -63,6 +63,7 @@ layout stay individual entries.  When the name embeds a Wii U title id —
 """
 
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -503,6 +504,32 @@ class RomCatalog:
     def __init__(self):
         self._entries: dict[str, RomEntry] = {}
         self._by_system: dict[str, list[RomEntry]] = {}
+        # Fingerprints are memoised against this; every mutation bumps it.
+        self._generation = 0
+        self._fingerprints: tuple[int, dict[str, dict]] | None = None
+
+    def fingerprints(self) -> dict[str, dict]:
+        """``{system: {"fingerprint": hex, "count": n}}`` for the catalogue.
+
+        What a client caches the catalogue against. A fingerprint covers the
+        fields a client displays and installs from, so a renamed or resized
+        file changes it while a rescan that found nothing new does not. Per
+        system, so a client refetches only the systems that changed - one
+        new SNES ROM does not cost a 20,000-row download.
+        """
+        if self._fingerprints and self._fingerprints[0] == self._generation:
+            return self._fingerprints[1]
+        result: dict[str, dict] = {}
+        for system, entries in self._by_system.items():
+            digest = hashlib.sha1()
+            for entry in sorted(entries, key=lambda e: e.rom_id):
+                digest.update(("%s%s%d%s%s" % (
+                    entry.rom_id, entry.title_id, entry.size, entry.name,
+                    entry.filename)).encode("utf-8", "replace"))
+            result[system] = {"fingerprint": digest.hexdigest(),
+                              "count": len(entries)}
+        self._fingerprints = (self._generation, result)
+        return result
 
     @property
     def entries(self) -> dict[str, RomEntry]:
@@ -528,9 +555,11 @@ class RomCatalog:
             return False
         self._entries[entry.rom_id] = entry
         self._by_system.setdefault(entry.system, []).append(entry)
+        self._generation += 1
         return True
 
     def _rebuild_index(self) -> None:
+        self._generation += 1
         self._by_system.clear()
         for entry in self._entries.values():
             self._by_system.setdefault(entry.system, []).append(entry)

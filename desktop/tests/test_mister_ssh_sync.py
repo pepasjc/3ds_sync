@@ -286,6 +286,13 @@ def test_blank_ps1_cards_stay_visible_but_cannot_upload(monkeypatch):
     monkeypatch.setattr(se, "_mister_ssh_from_profile", lambda p: FakeSSH())
     monkeypatch.setattr(se, "_get_cached_hash_for_key", lambda *a: None)
     monkeypatch.setattr(se, "_set_cached_hash_for_key", lambda *a: None)
+    # Blank PS1 cards now consult the ROM catalog, so stub it out: this test is
+    # about what happens when nothing else identifies the card, and it must not
+    # depend on whatever server the developer has configured.
+    import rom_installer
+
+    monkeypatch.setattr(rom_installer, "fetch_rom_catalog", lambda system: [])
+    se.clear_mister_catalog_cache()
 
     saves = se._scan_mister_ssh(_ssh_profile(), {})
     # Both cards are listed — hiding a real file on the device would look

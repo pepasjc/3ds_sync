@@ -53,6 +53,13 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _MULTI_UNDERSCORE_RE = re.compile(r"_+")
 
 
+#: Memo for the slug rules. Pure function, so caching is safe, and building a
+#: title matcher calls it once per catalogue name - thousands of times on a
+#: real library, where the regex chain dominates.
+_SLUG_MEMO: dict = {}
+_SLUG_MEMO_LIMIT = 50000
+
+
 def normalize_rom_name(filename: str) -> str:
     """Strip extension and revision/disc tags; append region to the slug.
 
@@ -69,6 +76,10 @@ def normalize_rom_name(filename: str) -> str:
     ``"Legend of Zelda, The - Minish Cap (USA).gba"`` → ``"legend_of_zelda_the_minish_cap_usa"``
     ``"Homebrew Game.sfc"``                           → ``"homebrew_game"``
     """
+    cached = _SLUG_MEMO.get(filename)
+    if cached is not None:
+        return cached
+
     name = _strip_extension(filename)
 
     # Extract region before stripping all parenthetical tags.
@@ -90,7 +101,11 @@ def normalize_rom_name(filename: str) -> str:
     if region_parts:
         name = f"{name}_{region_parts}"
 
-    return name or "unknown"
+    result = name or "unknown"
+    if len(_SLUG_MEMO) >= _SLUG_MEMO_LIMIT:
+        _SLUG_MEMO.clear()
+    _SLUG_MEMO[filename] = result
+    return result
 
 
 def make_title_id(system: str, rom_filename: str) -> str:

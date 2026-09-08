@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import com.savesync.android.sync.SaturnSyncFormat
+import com.savesync.android.sync.SegaCdSyncFormat
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
@@ -49,6 +50,13 @@ data class Settings(
      */
     val saveDirOverrides: Map<String, String> = emptyMap(),
     val saturnSyncFormat: SaturnSyncFormat = SaturnSyncFormat.MEDNAFEN,
+    /**
+     * Which RetroArch Sega CD core's backup-RAM file to sync: Genesis Plus GX
+     * writes ``<rom>.brm``, PicoDrive writes ``<rom>.srm``.  Both hold the same
+     * raw BRAM image, so this only selects the filename we track and download
+     * to.
+     */
+    val segaCdSyncFormat: SegaCdSyncFormat = SegaCdSyncFormat.GENESIS_PLUS_GX,
     /**
      * Mirrors RetroArch's "Sort Saves into Folders by Core Name" toggle for the
      * Beetle Saturn (Mednafen) core specifically. When true (default), new
@@ -91,6 +99,7 @@ class SettingsStore(private val context: Context) {
         val ROM_DIR_OVERRIDES = stringPreferencesKey("rom_dir_overrides")
         val SAVE_DIR_OVERRIDES = stringPreferencesKey("save_dir_overrides")
         val SATURN_SYNC_FORMAT = stringPreferencesKey("saturn_sync_format")
+        val SEGA_CD_SYNC_FORMAT = stringPreferencesKey("sega_cd_sync_format")
         val BEETLE_SATURN_PER_CORE_FOLDER = booleanPreferencesKey("beetle_saturn_per_core_folder")
         val CD_GAMES_PER_CONTENT_FOLDER = booleanPreferencesKey("cd_games_per_content_folder")
         /** Tracks whether we've already attempted to restore from external backup */
@@ -142,6 +151,7 @@ class SettingsStore(private val context: Context) {
             romDirOverrides = parseOverrides(prefs[Keys.ROM_DIR_OVERRIDES] ?: ""),
             saveDirOverrides = effectiveSaveDirOverrides,
             saturnSyncFormat = SaturnSyncFormat.fromWireValue(prefs[Keys.SATURN_SYNC_FORMAT]),
+            segaCdSyncFormat = SegaCdSyncFormat.fromWireValue(prefs[Keys.SEGA_CD_SYNC_FORMAT]),
             beetleSaturnPerCoreFolder = prefs[Keys.BEETLE_SATURN_PER_CORE_FOLDER] ?: true,
             cdGamesPerContentFolder = prefs[Keys.CD_GAMES_PER_CONTENT_FOLDER] ?: false
         )
@@ -177,6 +187,7 @@ class SettingsStore(private val context: Context) {
                 p[Keys.SAVE_DIR_OVERRIDES] = encodeOverrides(backup.saveDirOverrides)
             }
             p[Keys.SATURN_SYNC_FORMAT] = backup.saturnSyncFormat.wireValue
+            p[Keys.SEGA_CD_SYNC_FORMAT] = backup.segaCdSyncFormat.wireValue
             p[Keys.BEETLE_SATURN_PER_CORE_FOLDER] = backup.beetleSaturnPerCoreFolder
             p[Keys.CD_GAMES_PER_CONTENT_FOLDER] = backup.cdGamesPerContentFolder
         }
@@ -191,6 +202,7 @@ class SettingsStore(private val context: Context) {
         dolphinMemCardDir: String? = null,
         emudeckDir: String? = null,
         saturnSyncFormat: SaturnSyncFormat? = null,
+        segaCdSyncFormat: SegaCdSyncFormat? = null,
         beetleSaturnPerCoreFolder: Boolean? = null,
         cdGamesPerContentFolder: Boolean? = null
     ) {
@@ -203,6 +215,7 @@ class SettingsStore(private val context: Context) {
             dolphinMemCardDir?.let { prefs[Keys.DOLPHIN_MEM_CARD_DIR] = it }
             emudeckDir?.let { prefs[Keys.EMUDECK_DIR] = it }
             saturnSyncFormat?.let { prefs[Keys.SATURN_SYNC_FORMAT] = it.wireValue }
+            segaCdSyncFormat?.let { prefs[Keys.SEGA_CD_SYNC_FORMAT] = it.wireValue }
             beetleSaturnPerCoreFolder?.let { prefs[Keys.BEETLE_SATURN_PER_CORE_FOLDER] = it }
             cdGamesPerContentFolder?.let { prefs[Keys.CD_GAMES_PER_CONTENT_FOLDER] = it }
         }
@@ -315,6 +328,7 @@ class SettingsStore(private val context: Context) {
                 put("rom_dir_overrides", JSONObject(current.romDirOverrides as Map<*, *>))
                 put("save_dir_overrides", JSONObject(current.saveDirOverrides as Map<*, *>))
                 put("saturn_sync_format", current.saturnSyncFormat.wireValue)
+                put("sega_cd_sync_format", current.segaCdSyncFormat.wireValue)
                 put("beetle_saturn_per_core_folder", current.beetleSaturnPerCoreFolder)
                 put("cd_games_per_content_folder", current.cdGamesPerContentFolder)
             }
@@ -352,6 +366,9 @@ class SettingsStore(private val context: Context) {
                 saveDirOverrides = parseOverrides(json.optString("save_dir_overrides", "")),
                 saturnSyncFormat = SaturnSyncFormat.fromWireValue(
                     json.optString("saturn_sync_format", SaturnSyncFormat.MEDNAFEN.wireValue)
+                ),
+                segaCdSyncFormat = SegaCdSyncFormat.fromWireValue(
+                    json.optString("sega_cd_sync_format", SegaCdSyncFormat.GENESIS_PLUS_GX.wireValue)
                 ),
                 beetleSaturnPerCoreFolder = json.optBoolean("beetle_saturn_per_core_folder", true),
                 cdGamesPerContentFolder = json.optBoolean("cd_games_per_content_folder", false)

@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,18 +37,77 @@ void http_set_wait_cb(HttpWaitFn cb) { g_wait_cb = cb; }
 
 static void sleep_ms(unsigned ms) { OSSleepTicks(OSMillisecondsToTicks(ms)); }
 
-/* Timed receive.  nsysnet has no SO_RCVTIMEO, so each read is a per-call
- * non-blocking recv (MSG_DONTWAIT); a stalled peer returns EAGAIN and we pump
- * the wait callback instead of hanging the (single-threaded) UI.
+static uint64_t now_us(void) { return (uint64_t)OSTicksToMicroseconds(OSGetSystemTime()); }
+
+/* Where a transfer's wall-clock actually goes.  Kept because guessing at this
+ * cost a wrong fix once already: a slow download can be the socket, the SD
+ * write, or the per-chunk UI work, and only measurement separates them. */
+static HttpPerf g_perf;
+
+void http_perf_reset(void) { memset(&g_perf, 0, sizeof(g_perf)); }
+void http_perf_get(HttpPerf *out) { if (out) *out = g_perf; }
+
+/* How long a single select() wait blocks before we surface to the UI pump.
+ * Only spent when the socket is genuinely idle — data arriving wakes the
+ * select immediately, so this is a responsiveness knob, not a throughput one. */
+#define RECV_POLL_SLICE_MS 20u
+
+/* The transfer a worker thread is currently running, for http_abort_active().
+ * Only one streamed transfer runs at a time (the download worker). */
+static volatile int g_active_fd = -1;
+
+void http_abort_active(void) {
+    int fd = g_active_fd;
+    /* shutdown, not close: the worker still owns the fd, this only forces
+     * its blocked recv to return.  Racing a concurrent close is avoided
+     * because the worker clears g_active_fd first. */
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+}
+
+/* Timed receive.
+ *
+ * blocking mode (worker thread): a plain blocking recv(), the same hot path
+ * curl uses in NUSspli — no select(), no extra IPC round-trips into nsysnet.
+ * Timeouts and user cancel are enforced from outside via http_abort_active()
+ * (the main thread watches progress and shuts the socket down), so a stuck
+ * server can't wedge the worker.
+ *
+ * non-blocking mode (main-thread calls): the socket stays non-blocking
+ * (nsysnet has no SO_RCVTIMEO) and we wait on select() — that keeps the
+ * single-threaded UI pumpable while still returning the instant bytes land.
+ * It used to sleep a flat 5 ms per empty read instead of waiting on the fd;
+ * on a LAN that dominated everything and pinned throughput near 750 KB/s.
+ *
  * Returns >0 bytes, 0 = closed, -1 = error/timeout, -2 = user cancel. */
-static int recv_timed(int fd, void *buf, int len, uint32_t max_wait_ms) {
+static int recv_timed(int fd, void *buf, int len, uint32_t max_wait_ms,
+                      int blocking) {
+    if (blocking) {
+        for (;;) {
+            int n = (int)recv(fd, buf, (size_t)len, 0);
+            if (n >= 0) return n;
+            if (errno != EINTR) return -1;
+        }
+    }
+
     uint32_t waited_ms = 0, next_cb = 500;
     for (;;) {
         int n = (int)recv(fd, buf, (size_t)len, MSG_DONTWAIT);
         if (n >= 0) return n;
         if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) return -1;
-        sleep_ms(5);
-        waited_ms += 5;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = (long)RECV_POLL_SLICE_MS * 1000;
+
+        int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel > 0) continue;                       /* data ready — read it */
+        if (sel < 0 && errno != EINTR) return -1;
+
+        /* Timed out with nothing to read: only now has real time passed. */
+        waited_ms += RECV_POLL_SLICE_MS;
         if (waited_ms >= next_cb) {
             next_cb += 500;
             if (g_wait_cb && g_wait_cb(waited_ms)) return -2;
@@ -156,11 +216,57 @@ static int connect_to(const char *host, int port) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
 
-        /* Bigger receive window — single-stream LAN throughput is window-bound. */
-        int rcvbuf = 128 * 1024;
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        /*
+         * Wii U TCP tuning.  These MUST be set before connect(): window
+         * scaling is negotiated in the SYN, so enabling it afterwards has no
+         * effect on the connection.
+         *
+         * Nintendo's stack ships with window scaling OFF, which caps the
+         * advertised receive window at 65535 bytes however large SO_RCVBUF
+         * is.  A window-bound stream runs at window/RTT and is completely
+         * insensitive to how fast the application reads — which is why a
+         * download sat at ~750 KB/s on a LAN that measures 13.8 MB/s, and why
+         * changing the receive loop's polling made no difference at all.
+         *
+         * SO_WINSCALE first, then SO_RCVBUF: the buffer size is what the
+         * scaled window is derived from.
+         */
+        int on = 1;
+        setsockopt(fd, SOL_SOCKET, SO_WINSCALE, &on, sizeof(on));
+        setsockopt(fd, SOL_SOCKET, SO_TCPSACK, &on, sizeof(on));
+        /* Slow start costs a visible ramp on every one of a WUP set's 25-47
+         * separate connections; on a LAN there is no congestion to discover. */
+        setsockopt(fd, SOL_SOCKET, SO_NOSLOWSTART, &on, sizeof(on));
 
-        if (connect_timed(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        /* An oversized SO_RCVBUF request can be rejected outright, leaving
+         * the tiny default in place — so fall down a cascade and keep the
+         * largest size the stack actually accepts.  (NUSspli ships 128 KB;
+         * anything at or above that is comfortably past the LAN
+         * bandwidth-delay product once window scaling is on.) */
+        static const int rcvbuf_sizes[] = { 1024 * 1024, 512 * 1024,
+                                            256 * 1024, 128 * 1024 };
+        for (size_t i = 0; i < sizeof(rcvbuf_sizes) / sizeof(rcvbuf_sizes[0]); i++) {
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                           &rcvbuf_sizes[i], sizeof(int)) == 0)
+                break;
+        }
+
+        int sndbuf = 128 * 1024;   /* uploads: same reasoning, NUSspli's size */
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+        /* Read back what the stack actually accepted — the perf line reports
+         * it, so a rejected option shows up as a number instead of a theory. */
+        int applied = 0;
+        socklen_t applied_len = sizeof(applied);
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &applied, &applied_len) == 0)
+            g_perf.rcvbuf = applied;
+
+        if (connect_timed(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            /* Our request headers are small; Nagle would hold them waiting
+             * for more data that never comes. */
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+            break;
+        }
         close(fd);
         fd = -1;
     }
@@ -258,12 +364,12 @@ static int build_request(char *out, size_t out_size,
 }
 
 static int read_headers(int fd, char *buf, size_t buf_size, size_t *total_out,
-                        uint32_t header_wait_ms) {
+                        uint32_t header_wait_ms, int blocking) {
     size_t total = 0;
     if (total_out) *total_out = 0;
     while (total + 1 < buf_size) {
         int n = recv_timed(fd, buf + total, (int)(buf_size - 1 - total),
-                           header_wait_ms);
+                           header_wait_ms, blocking);
         if (n == -2) return -2;   /* user cancel */
         if (n <= 0) return -1;
         total += (size_t)n;
@@ -336,7 +442,8 @@ int http_get_buf(const HttpRequest *req,
 
     char rbuf[RECV_BUF_SIZE];
     size_t total_read = 0;
-    int  hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read, header_wait(req));
+    int  hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read,
+                             header_wait(req), 0);
     if (hlen < 0) { close(fd); return -5; }
 
     int status = parse_status(rbuf);
@@ -356,7 +463,8 @@ int http_get_buf(const HttpRequest *req,
         written = take;
     }
     while (written < cap) {
-        int n = recv_timed(fd, out + written, (int)(cap - written), HTTP_BODY_WAIT_MS);
+        int n = recv_timed(fd, out + written, (int)(cap - written),
+                           HTTP_BODY_WAIT_MS, 0);
         if (n <= 0) break;
         written += (uint32_t)n;
     }
@@ -382,45 +490,63 @@ int http_get_stream_cb(const HttpRequest *req,
     if (info_out) { info_out->status = 0; info_out->content_length = 0; }
     if (!writer) return -1;
 
+    int blocking = req->io_blocking;
+
     int fd = open_request(req, 0);
     if (fd < 0) return fd;
+    if (blocking) g_active_fd = fd;
 
     char rbuf[RECV_BUF_SIZE];
     size_t total_read = 0;
-    int  hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read, header_wait(req));
-    if (hlen == -2) { close(fd); return 1; }   /* user cancel = paused */
-    if (hlen < 0) { close(fd); return -5; }
+    int  hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read,
+                             header_wait(req), blocking);
+    if (hlen == -2) { g_active_fd = -1; close(fd); return 1; }   /* user cancel = paused */
+    if (hlen < 0) { g_active_fd = -1; close(fd); return -5; }
 
     int status = parse_status(rbuf);
     uint64_t content_length = parse_content_length(rbuf, (size_t)hlen);
     if (info_out) { info_out->status = status; info_out->content_length = content_length; }
 
-    if (status < 200 || status >= 300) { close(fd); return -6; }
-
-    if (begin && begin(content_length, user) != 0) { close(fd); return -9; }
-
+    int rc = 0;
     uint64_t total_done   = 0;
     size_t   in_rbuf_body = (total_read > (size_t)hlen) ? total_read - (size_t)hlen : 0;
+
+    if (status < 200 || status >= 300) { rc = -6; goto out; }
+    if (begin && begin(content_length, user) != 0) { rc = -9; goto out; }
+
     if (in_rbuf_body > 0) {
         if (writer(user, (const uint8_t *)(rbuf + hlen), in_rbuf_body) != 0) {
-            close(fd); return -7;
+            rc = -7; goto out;
         }
         total_done += in_rbuf_body;
     }
 
     static char chunk[65536];
     while (1) {
-        int n = recv_timed(fd, chunk, sizeof(chunk), HTTP_BODY_WAIT_MS);
-        if (n == -2) { close(fd); return 1; }   /* user cancel = paused */
+        uint64_t t0 = now_us();
+        int n = recv_timed(fd, chunk, sizeof(chunk), HTTP_BODY_WAIT_MS, blocking);
+        uint64_t t1 = now_us();
+        g_perf.recv_us += t1 - t0;
+        g_perf.recv_calls++;
+
+        if (n == -2) { rc = 1; goto out; }   /* user cancel = paused */
         if (n == 0) break;
-        if (n < 0)  { close(fd); return -8; }
-        if (writer(user, (const uint8_t *)chunk, (size_t)n) != 0) { close(fd); return -7; }
+        if (n < 0)  { rc = -8; goto out; }
+        g_perf.recv_bytes += (uint64_t)n;
+
+        if (writer(user, (const uint8_t *)chunk, (size_t)n) != 0) { rc = -7; goto out; }
+        g_perf.write_us += now_us() - t1;
+
         total_done += (uint64_t)n;
-        if (progress && progress(total_done, content_length) != 0) { close(fd); return 1; }
+        uint64_t t2 = now_us();
+        if (progress && progress(total_done, content_length) != 0) { rc = 1; goto out; }
+        g_perf.progress_us += now_us() - t2;
     }
 
+out:
+    g_active_fd = -1;
     close(fd);
-    return 0;
+    return rc;
 }
 
 int http_get_stream(const HttpRequest *req,
@@ -475,7 +601,8 @@ int http_post_chunked(const HttpRequest *req,
 
     char rbuf[RECV_BUF_SIZE];
     size_t total_read = 0;
-    int hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read, header_wait(req));
+    int hlen = read_headers(fd, rbuf, sizeof(rbuf), &total_read,
+                            header_wait(req), 0);
     if (hlen < 0) { close(fd); return -5; }
 
     int status = parse_status(rbuf);

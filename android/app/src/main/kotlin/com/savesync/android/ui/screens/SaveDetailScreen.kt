@@ -635,7 +635,7 @@ private val knownSystems = listOf(
     "GBA", "SNES", "NES", "GB", "GBC", "N64",
     "PS1", "PS2", "PSP", "SAT", "DC",
     "MD", "SEGACD", "GC", "WII",
-    "PCE", "NGP", "WSWAN", "WSWANC", "ARCADE", "NEOCD",
+    "PCE", "PCECD", "NGP", "WSWAN", "WSWANC", "ARCADE", "NEOCD",
     "NDS", "A2600", "LYNX", "MAME"
 )
 

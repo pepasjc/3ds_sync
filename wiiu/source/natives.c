@@ -125,12 +125,21 @@ int natives_init(SyncState *state) {
 
     /* Optional: only present when a USB drive is attached, so a failure here
      * is normal and must not be surfaced as an error. */
-    state->usb_mounted = mount_verified(USB_NAME, NULL, "/vol/" USB_NAME,
-                                        USB_NAME ":/usr", NULL, 0);
+    natives_mount_usb_wfs(state);
 
     natives_mount_usb_fat(state);
 
     return 0;
+}
+
+/* (Re)attach the console's WFS USB (storage_usb01) so save reads can reach it.
+ * Not required for MCP installs — those go through IOSU — but the install
+ * view re-probes here so the UI label is accurate.  Idempotent. */
+bool natives_mount_usb_wfs(SyncState *state) {
+    if (!state || !state->mocha_ok) return false;
+    state->usb_mounted = mount_verified(USB_NAME, NULL, "/vol/" USB_NAME,
+                                        USB_NAME ":/usr", NULL, 0);
+    return state->usb_mounted;
 }
 
 bool natives_mount_usb_fat(SyncState *state) {
@@ -275,13 +284,34 @@ bool wiiusaves_root_for(const char *title_id, char *out, size_t out_size) {
     if (!title_id || strlen(title_id) != 16) return false;
     if (strncasecmp(title_id, "00050000", 8) != 0) return false;
 
-    /* Prefer whichever root actually holds this title (USB-installed games
-     * keep their saves on the USB drive); fall back to MLC so a restore of a
-     * server-only title still has somewhere to go. */
+    /* Prefer whichever root actually holds this title's save (USB-installed
+     * games keep their saves on the USB drive). */
     for (int i = 0; WIIU_SAVE_ROOTS[i]; i++) {
         snprintf(out, out_size, "%s/%.8s/user", WIIU_SAVE_ROOTS[i], title_id + 8);
         if (dir_exists(out)) return true;
     }
+
+    /* No save exists yet (fresh restore after a drive swap, or the game has
+     * never been launched).  The save MUST land on the same device the title
+     * is installed on or the game will never see it — so probe where the
+     * content lives and mirror that.  MLC only as the final fallback. */
+    static const struct { const char *title_root; const char *save_root; } DEVS[] = {
+        { USB_NAME ":/usr/title/00050000", WIIU_USB_SAVES },
+        { MLC_NAME ":/usr/title/00050000", WIIU_SAVES_DIR },
+        { USB_NAME ":/usr/title/0005000E", WIIU_USB_SAVES },  /* disc game: only
+                                                                 the update is
+                                                                 installed */
+        { MLC_NAME ":/usr/title/0005000E", WIIU_SAVES_DIR },
+    };
+    for (size_t i = 0; i < sizeof(DEVS) / sizeof(DEVS[0]); i++) {
+        char probe[SAVE_DIR_LEN];
+        snprintf(probe, sizeof(probe), "%s/%.8s", DEVS[i].title_root, title_id + 8);
+        if (dir_exists(probe)) {
+            snprintf(out, out_size, "%s/%.8s/user", DEVS[i].save_root, title_id + 8);
+            return true;
+        }
+    }
+
     snprintf(out, out_size, WIIU_SAVES_DIR "/%.8s/user", title_id + 8);
     return true;
 }

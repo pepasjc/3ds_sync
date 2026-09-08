@@ -34,6 +34,11 @@ void natives_shutdown(SyncState *state);
  * user plugs a drive in.  Fills state->usb_fat_ready / usb_fat_error. */
 bool natives_mount_usb_fat(SyncState *state);
 
+/* (Re)attach the console's WFS USB (storage_usb01) for save reads; sets
+ * state->usb_mounted.  Idempotent — the install view calls it to refresh the
+ * flag before showing the USB target label. */
+bool natives_mount_usb_wfs(SyncState *state);
+
 /* ---- vWii ---- */
 
 void vwiisaves_scan(const SyncState *state, SaveTitleList *out);

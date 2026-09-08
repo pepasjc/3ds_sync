@@ -424,6 +424,33 @@ class TestRomCatalog:
         assert "SNES" in body["systems"]
         assert body["stats"]["GBA"] == 1
 
+    def test_fingerprints_change_only_with_the_catalogue(self, rom_client,
+                                                         auth_headers):
+        from app.services import rom_scanner
+
+        resp = rom_client.get("/api/v1/roms/fingerprints", headers=auth_headers)
+        assert resp.status_code == 200
+        systems = resp.json()["systems"]
+        assert systems["GBA"]["count"] == 1
+        assert len(systems["GBA"]["fingerprint"]) == 40
+        before = dict(systems)
+
+        # Stable across requests, and memoised (same object back).
+        catalog = rom_scanner.get()
+        assert catalog.fingerprints() is catalog.fingerprints()
+        again = rom_client.get("/api/v1/roms/fingerprints",
+                               headers=auth_headers).json()["systems"]
+        assert again == before
+
+        # Removing a row moves that system's fingerprint and no other.
+        gba = catalog.list_by_system("GBA")[0]
+        catalog._entries.pop(gba.rom_id)
+        catalog._rebuild_index()
+        after = rom_client.get("/api/v1/roms/fingerprints",
+                               headers=auth_headers).json()["systems"]
+        assert "GBA" not in after
+        assert after["SNES"] == before["SNES"]
+
     def test_no_rom_dir(self, client, auth_headers):
         resp = client.get("/api/v1/roms", headers=auth_headers)
         assert resp.status_code == 200

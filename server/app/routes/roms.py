@@ -609,6 +609,22 @@ async def list_systems():
     return {"systems": catalog.systems(), "stats": catalog.stats()}
 
 
+@router.get("/roms/fingerprints")
+async def list_fingerprints():
+    """Per-system catalogue fingerprints, for clients that cache the list.
+
+    A client keeps the catalogue on disk with each system's fingerprint and,
+    on the next start, asks only for the systems whose fingerprint moved. The
+    whole response is a few hundred bytes against a multi-megabyte catalogue,
+    which is what makes opening the client instant on a device that would
+    otherwise re-download 20,000 rows every time.
+    """
+    catalog = rom_scanner.get()
+    if not catalog:
+        return {"systems": {}}
+    return {"systems": catalog.fingerprints()}
+
+
 @router.get("/roms/share-link")
 async def create_share_link(
     path: str = Query(..., description="Path to share, e.g. /api/v1/roms/SLUS00922"),

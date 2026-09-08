@@ -1,10 +1,19 @@
 /*
- * ui.c — OSScreen text console, mirrored on TV + GamePad.
+ * ui.c — OSScreen UI, mirrored on TV + GamePad, styled after NUSspli's look
+ * (dark background, colored header/footer bars, selection highlight bar,
+ * in-row progress bar) without taking NUSspli's SDL2 dependency.
  *
- * OSScreen only draws white text, so the colour indices from ui.h are
- * rendered as one-character gutter marks in column 0 (and the selection is a
- * '>' caret) rather than real colours.  Everything else matches the GameCube
- * client's ui.h contract so the view bodies port unchanged.
+ * OSScreen's font is fixed white, but OSScreenPutFontEx only writes the
+ * glyph's foreground pixels, so filled rectangles drawn first show through as
+ * row backgrounds.  Rectangles are drawn with OSScreenPutPixelEx, which
+ * handles double-buffer parity and clipping itself.
+ *
+ * Geometry facts (per decaf-emu's coreinit OSScreen implementation,
+ * https://github.com/decaf-emu/decaf-emu — Cemu's version has different,
+ * wrong numbers): OSScreenPutFontEx draws at a fixed pixel origin of
+ * (50, 32) with a 12x24 px character cell (12x19 glyph); the TV buffer is
+ * 1280x720, the DRC 854x480.  Every rectangle below is derived from those
+ * constants so bars line up with the text on both screens.
  *
  * Framebuffers live in MEM1, which ProcUI reclaims whenever the app drops to
  * the background (HOME menu).  ui_acquire_foreground / ui_release_foreground
@@ -25,20 +34,50 @@
 #include <coreinit/screen.h>
 #include <proc_ui/procui.h>
 
-/* The GamePad is the smaller of the two screens (854x480 vs 1280x720); size
- * the shared grid so the mirrored output fits there too. */
+/* Text grid: 1 gutter cell (color chip) + UI_COLS text cells, UI_ROWS rows.
+ * 50 + (1 + 64) * 12 = 830 px wide, 32 + 18 * 24 = 464 px tall — inside the
+ * DRC's 854x480.  The origin and cell size are OSScreenPutFontEx facts, not
+ * choices. */
 #define UI_ROWS 18
 #define UI_COLS 64
+#define GRID_CELLS_W (1 + UI_COLS)
+#define CELL_W   12
+#define CELL_H   24
+#define ORIGIN_X 50
+#define ORIGIN_Y 32
 
 #define HEADER_ROWS 2   /* title bar + status line */
 #define FOOTER_ROWS 2   /* hint line + status line */
 
 #define FRM_HEAP_TAG 0x33445353   /* "3DSS" */
 
+/* Palette (0xRRGGBBAA, the format OSScreenPutPixelEx/ClearBufferEx take). */
+#define COL_BG        0x0B1220FF   /* near-black navy                */
+#define COL_BAR       0x14365CFF   /* header / footer bar            */
+#define COL_HILITE    0x2E6FB8FF   /* selected row                   */
+#define COL_ERRBG     0x6E1B1BFF   /* status row background on error */
+#define COL_PROG_BG   0x1D3048FF   /* progress trough                */
+#define COL_PROG_FG   0x27AE60FF   /* progress fill                  */
+
+static const uint32_t CHIP_COLORS[] = {
+    [UI_WHITE]  = 0,            /* no chip */
+    [UI_GREEN]  = 0x2ECC71FF,
+    [UI_RED]    = 0xE74C3CFF,
+    [UI_YELLOW] = 0xF1C40FFF,
+    [UI_CYAN]   = 0x1ABC9CFF,
+    [UI_BLUE]   = 0x3498DBFF,
+    [UI_GREY]   = 0x66788AFF,
+};
+
 static char    g_grid[UI_ROWS][UI_COLS + 1];
-static char    g_mark[UI_ROWS];        /* gutter glyph per row */
+static uint8_t g_color[UI_ROWS];       /* chip colour index per row */
+static bool    g_sel[UI_ROWS];         /* selection highlight per row */
 static char    g_status[200];
 static bool    g_status_err = false;
+
+/* One optional in-row progress bar per frame (the active download). */
+static int      g_prog_row = -1;
+static uint32_t g_prog_permille = 0;
 
 static void    *g_buf_tv = NULL, *g_buf_drc = NULL;
 static uint32_t g_size_tv = 0, g_size_drc = 0;
@@ -57,20 +96,6 @@ int ui_list_top(void) { return HEADER_ROWS; }
 int ui_list_visible(void) {
     int v = UI_ROWS - HEADER_ROWS - FOOTER_ROWS;
     return v < 1 ? 1 : v;
-}
-
-/* One-character gutter mark standing in for colour. */
-static char color_mark(int color) {
-    switch (color) {
-        case UI_GREEN:  return '+';
-        case UI_RED:    return '!';
-        case UI_YELLOW: return '*';
-        case UI_CYAN:   return ':';
-        case UI_BLUE:   return '#';
-        case UI_GREY:   return '.';
-        case UI_WHITE:
-        default:        return ' ';
-    }
 }
 
 /* ---- ProcUI foreground handling ---- */
@@ -105,8 +130,8 @@ uint32_t ui_acquire_foreground(void *ctx) {
      * the previous owner left behind.  Clear and flip twice so neither the
      * visible nor the work buffer can show garbage before the first repaint. */
     for (int i = 0; i < 2; i++) {
-        OSScreenClearBufferEx(SCREEN_TV,  0x00000000);
-        OSScreenClearBufferEx(SCREEN_DRC, 0x00000000);
+        OSScreenClearBufferEx(SCREEN_TV,  COL_BG);
+        OSScreenClearBufferEx(SCREEN_DRC, COL_BG);
         DCFlushRange(g_buf_tv,  g_size_tv);
         DCFlushRange(g_buf_drc, g_size_drc);
         OSScreenFlipBuffersEx(SCREEN_TV);
@@ -132,7 +157,8 @@ uint32_t ui_release_foreground(void *ctx) {
 
 void ui_init(void) {
     memset(g_grid, 0, sizeof(g_grid));
-    memset(g_mark, ' ', sizeof(g_mark));
+    memset(g_color, UI_WHITE, sizeof(g_color));
+    memset(g_sel, 0, sizeof(g_sel));
 
     ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, ui_acquire_foreground, NULL, 100);
     ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, ui_release_foreground, NULL, 100);
@@ -140,7 +166,7 @@ void ui_init(void) {
      * and the exiting transition does not necessarily fire RELEASE first. */
     ProcUIRegisterCallback(PROCUI_CALLBACK_EXIT, ui_release_foreground, NULL, 100);
 
-    /* WHBProcInit leaves us already in the foreground and does not replay the
+    /* ProcUIInit leaves us already in the foreground and does not replay the
      * ACQUIRE callback for that initial state — do it by hand. */
     ui_acquire_foreground(NULL);
     ui_clear();
@@ -156,23 +182,76 @@ void ui_clear(void) {
     for (int r = 0; r < UI_ROWS; r++) {
         memset(g_grid[r], ' ', UI_COLS);
         g_grid[r][UI_COLS] = '\0';
-        g_mark[r] = ' ';
+        g_color[r] = UI_WHITE;
+        g_sel[r]   = false;
     }
+    g_prog_row = -1;
+}
+
+void ui_progress(int row, uint64_t done, uint64_t total) {
+    if (row < 0 || row >= UI_ROWS || total == 0) { g_prog_row = -1; return; }
+    if (done > total) done = total;
+    g_prog_row      = row;
+    g_prog_permille = (uint32_t)(done * 1000 / total);
+}
+
+static void fill_rect(OSScreenID screen, int x, int y, int w, int h, uint32_t col) {
+    for (int yy = y; yy < y + h; yy++)
+        for (int xx = x; xx < x + w; xx++)
+            OSScreenPutPixelEx(screen, (uint32_t)xx, (uint32_t)yy, col);
 }
 
 static void draw_screen(OSScreenID screen) {
-    OSScreenClearBufferEx(screen, 0x00000000);
-    char line[UI_COLS + 4];
+    /* The text origin and cell size are fixed properties of the OSScreen
+     * font renderer — identical on both screens, so the same rectangles
+     * line up with the same text everywhere. */
+    int scr_w  = screen == SCREEN_TV ? 1280 : 854;
+    int grid_w = GRID_CELLS_W * CELL_W;
+
+    OSScreenClearBufferEx(screen, COL_BG);
+
+    /* Header and footer bars run the full screen width. */
+    fill_rect(screen, 0, ORIGIN_Y, scr_w, HEADER_ROWS * CELL_H, COL_BAR);
+    fill_rect(screen, 0, ORIGIN_Y + (UI_ROWS - FOOTER_ROWS) * CELL_H,
+              scr_w, FOOTER_ROWS * CELL_H, COL_BAR);
+    if (g_status[0] && g_status_err)
+        fill_rect(screen, 0, ORIGIN_Y + (UI_ROWS - 1) * CELL_H,
+                  scr_w, CELL_H, COL_ERRBG);
+
+    /* Selection highlight bars first, then the progress bar (so an active
+     * row that is also selected still shows its bar), then colour chips. */
     for (int r = 0; r < UI_ROWS; r++) {
-        /* Trim trailing blanks so OSScreen does less work per row. */
+        if (g_sel[r])
+            fill_rect(screen, ORIGIN_X, ORIGIN_Y + r * CELL_H, grid_w, CELL_H,
+                      COL_HILITE);
+    }
+
+    if (g_prog_row >= 0) {
+        int py = ORIGIN_Y + g_prog_row * CELL_H;
+        fill_rect(screen, ORIGIN_X, py, grid_w, CELL_H, COL_PROG_BG);
+        fill_rect(screen, ORIGIN_X, py,
+                  (int)((uint64_t)grid_w * g_prog_permille / 1000), CELL_H,
+                  COL_PROG_FG);
+    }
+
+    for (int r = 0; r < UI_ROWS; r++) {
+        int py = ORIGIN_Y + r * CELL_H;
+        uint32_t chip = CHIP_COLORS[g_color[r]];
+        if (chip && !(g_status_err && r == UI_ROWS - 1))
+            fill_rect(screen, ORIGIN_X + 2, py + 7, CELL_W - 4, CELL_H - 14,
+                      chip);
+    }
+
+    /* Text on top — the font only writes foreground pixels.  Column 1: the
+     * gutter cell holds the chip. */
+    char line[UI_COLS + 1];
+    for (int r = 0; r < UI_ROWS; r++) {
         int len = UI_COLS;
         while (len > 0 && g_grid[r][len - 1] == ' ') len--;
-        if (len == 0 && g_mark[r] == ' ') continue;
-        line[0] = g_mark[r];
-        line[1] = ' ';
-        memcpy(line + 2, g_grid[r], (size_t)len);
-        line[2 + len] = '\0';
-        OSScreenPutFontEx(screen, 0, (uint32_t)r, line);
+        if (len == 0) continue;
+        memcpy(line, g_grid[r], (size_t)len);
+        line[len] = '\0';
+        OSScreenPutFontEx(screen, 1, (uint32_t)r, line);
     }
 }
 
@@ -198,6 +277,14 @@ static void put_at(int row, int col, const char *src) {
     }
 }
 
+static void set_row_color(int row, int color) {
+    if (row < 0 || row >= UI_ROWS) return;
+    if (color < 0 || color >= (int)(sizeof(CHIP_COLORS) / sizeof(CHIP_COLORS[0])))
+        color = UI_WHITE;
+    if (g_color[row] == UI_WHITE)
+        g_color[row] = (uint8_t)color;
+}
+
 void ui_text(int row, int col, int color, const char *fmt, ...) {
     char line[256];
     va_list ap;
@@ -206,8 +293,7 @@ void ui_text(int row, int col, int color, const char *fmt, ...) {
     va_end(ap);
 
     put_at(row, col, line);
-    if (row >= 0 && row < UI_ROWS && g_mark[row] == ' ')
-        g_mark[row] = color_mark(color);
+    set_row_color(row, color);
 }
 
 void ui_text_hl(int row, bool selected, int color, const char *fmt, ...) {
@@ -218,8 +304,9 @@ void ui_text_hl(int row, bool selected, int color, const char *fmt, ...) {
     va_end(ap);
 
     put_at(row, 0, line);
-    if (row >= 0 && row < UI_ROWS)
-        g_mark[row] = selected ? '>' : color_mark(color);
+    set_row_color(row, color);
+    if (row >= 0 && row < UI_ROWS && selected)
+        g_sel[row] = true;
 }
 
 void ui_status(const char *fmt, ...) {
@@ -257,33 +344,32 @@ const char *ui_view_name(AppView view) {
 
 void ui_draw_header(const SyncState *state, AppView view) {
     char bar[UI_COLS + 1];
-    char right[16];
-    snprintf(right, sizeof(right), "%d/%d", (int)view + 1, (int)APP_VIEW_COUNT);
+    char right[24];
+    snprintf(right, sizeof(right), "%d/%d  v" APP_VERSION,
+             (int)view + 1, (int)APP_VIEW_COUNT);
 
     memset(bar, ' ', UI_COLS);
     bar[UI_COLS] = '\0';
     const char *title = ui_view_name(view);
     int tl = (int)strlen(title);
-    if (tl > UI_COLS - 6) tl = UI_COLS - 6;
-    memcpy(bar, title, (size_t)tl);
+    if (tl > UI_COLS - (int)strlen(right) - 2)
+        tl = UI_COLS - (int)strlen(right) - 2;
+    if (tl > 0) memcpy(bar, title, (size_t)tl);
     int rl = (int)strlen(right);
     memcpy(bar + UI_COLS - rl, right, (size_t)rl);
     put_at(0, 0, bar);
-    g_mark[0] = '#';
 
     const char *net = state->net_ready ? state->ip : "no-net";
     ui_text(1, 0, state->net_ready ? UI_GREEN : UI_RED, "net:%s", net);
-    ui_text(1, 24, state->sd_ready ? UI_GREEN : UI_RED,
+    ui_text(1, 22, state->sd_ready ? UI_WHITE : UI_RED,
             "sd:%s", state->sd_ready ? "ok" : "none");
-    ui_text(1, 34, state->mocha_ok ? UI_GREEN : UI_YELLOW,
-            "mocha:%s", state->mocha_ok ? "ok" : "off");
-    ui_text(1, 50, UI_CYAN, "v%s", APP_VERSION);
+    ui_text(1, 32, UI_WHITE, "mocha:%s", state->mocha_ok ? "ok" : "off");
 }
 
 void ui_draw_footer(const char *hint) {
     int hint_row   = UI_ROWS - 2;
     int status_row = UI_ROWS - 1;
-    if (hint && hint[0]) ui_text(hint_row, 0, UI_GREY, "%s", hint);
+    if (hint && hint[0]) ui_text(hint_row, 0, UI_WHITE, "%s", hint);
     if (g_status[0])
         ui_text(status_row, 0, g_status_err ? UI_RED : UI_GREEN, "%s", g_status);
 }

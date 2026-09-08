@@ -42,7 +42,17 @@ typedef struct {
      * something short so an unreachable server fails fast instead of
      * looking like a hang. */
     uint32_t       header_timeout_ms;
+    /* Worker-thread mode: use plain blocking recv() in the hot loop (fastest
+     * path, no per-refill select round-trip into nsysnet).  The caller MUST
+     * enforce timeouts/cancel from another thread via http_abort_active() —
+     * with this set the timeouts above are not applied. */
+    int            io_blocking;
 } HttpRequest;
+
+/* Force the worker's in-flight streamed transfer (io_blocking) to fail by
+ * shutting its socket down.  Safe to call from another thread; no-op when
+ * nothing is active. */
+void http_abort_active(void);
 
 /* Header wait for a plain API call (status, catalog, titles, sync, saves). */
 #define HTTP_API_TIMEOUT_MS 15000u
@@ -82,5 +92,26 @@ int  http_post_chunked(const HttpRequest *req,
                        HttpProducerFn producer,
                        void *user,
                        uint8_t *resp, uint32_t resp_size);
+
+/* ---- transfer profiling ----
+ *
+ * Splits a download's wall-clock into its three candidates so a slow transfer
+ * can be attributed instead of guessed at:
+ *   recv_us      waiting on / reading from the socket
+ *   write_us     handing bytes to the writer (SD or USB)
+ *   progress_us  the per-chunk UI callback
+ * Overhead is two OSGetSystemTime reads per 64 KB chunk, so it stays on in
+ * normal builds. */
+typedef struct {
+    uint64_t recv_us;
+    uint64_t write_us;
+    uint64_t progress_us;
+    uint64_t recv_bytes;
+    uint32_t recv_calls;
+    int      rcvbuf;      /* SO_RCVBUF the stack actually accepted */
+} HttpPerf;
+
+void http_perf_reset(void);
+void http_perf_get(HttpPerf *out);
 
 #endif /* WIIUSYNC_HTTP_H */

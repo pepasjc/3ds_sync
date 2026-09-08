@@ -11,6 +11,7 @@
 #include "natives.h"
 #include "state.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <whb/log.h>
 
 static char g_msg[256] = "";
 
@@ -152,14 +155,24 @@ int sync_one_download(const SyncState *state, SaveTitleList *list,
     int code = network_download_save_to_file(state, tid, bundle_path, &bundle_size);
     if (code < 200 || code >= 300 || bundle_size == 0) {
         remove(bundle_path);
-        set_msg("Download %s failed: HTTP %d", tid, code);
+        set_msg("Download %s failed: HTTP %d (%s)", tid, code,
+                network_last_error());
+        WHBLogPrintf("sync: download %s -> HTTP %d size=%llu (%s)", tid, code,
+                     (unsigned long long)bundle_size, network_last_error());
         return -1;
     }
 
+    WHBLogPrintf("sync: applying %s (%llu bytes) -> %s", tid,
+                 (unsigned long long)bundle_size, dest_root);
+    errno = 0;
     int rc = bundle_apply_file_to_disk(bundle_path, dest_root);
+    int apply_errno = errno;
     remove(bundle_path);
     if (rc != 0) {
-        set_msg("Apply %s failed (save left as-is, backup in 3dssync/backup)", tid);
+        set_msg("Apply %s to %s failed (errno %d) - save left as-is",
+                tid, dest_root, apply_errno);
+        WHBLogPrintf("sync: apply %s -> rc=%d errno=%d dest=%s",
+                     tid, rc, apply_errno, dest_root);
         return -1;
     }
     state_clear_cached_save_hash(state, tid);

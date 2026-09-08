@@ -979,3 +979,68 @@ def test_opl_strips_disc_tag_and_illegal_chars_in_name(tmp_path):
 
     # Disc tag dropped, ':' stripped (illegal on FAT32), serial prefix kept.
     assert plan.target_path == tmp_path / "DVD" / "SCES_000.01.Cool Game [Hack].iso"
+
+
+def test_archive_install_stages_in_tmp_not_on_target(tmp_path, monkeypatch):
+    """The zip is downloaded and unzipped off the target device.
+
+    Only the extracted files ever touch the target folder — no ``.zip.part``,
+    and the staging dir is gone afterwards.
+    """
+    import rom_installer
+
+    target = tmp_path / "card" / "Example Game"
+    plan = rom_installer.InstallPlan(
+        rom_id="SLUS00001",
+        display_name="Example Game",
+        system="PS1",
+        source_filename="Example Game.chd",
+        target_path=target,
+        extract_format="cue",
+        extract_archive=True,
+        target_is_directory=True,
+    )
+
+    staged: list[Path] = []
+
+    def fake_download(_plan, tmp_path_, progress_callback=None):
+        staged.append(tmp_path_)
+        # Nothing may be written to the target while downloading/extracting.
+        assert not target.exists()
+        with zipfile.ZipFile(tmp_path_, "w") as zf:
+            zf.writestr("Example Game.cue", b"cue")
+            zf.writestr("sub/Example Game.bin", b"bin-data")
+        if progress_callback:
+            progress_callback(8, 8)
+
+    monkeypatch.setattr(rom_installer, "_download_rom", fake_download)
+
+    written = rom_installer.install_rom(plan)
+
+    assert sorted(p.relative_to(target).as_posix() for p in written) == [
+        "Example Game.cue",
+        "sub/Example Game.bin",
+    ]
+    assert (target / "sub" / "Example Game.bin").read_bytes() == b"bin-data"
+    assert sorted(p.name for p in target.rglob("*")) == [
+        "Example Game.bin",
+        "Example Game.cue",
+        "sub",
+    ]
+    # Staging happened outside the target tree and was cleaned up.
+    assert staged and tmp_path not in staged[0].parents
+    assert not staged[0].parent.exists()
+
+
+def test_install_tmp_dir_config_override(tmp_path, monkeypatch):
+    import rom_installer
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(
+        rom_installer, "load_config", lambda: {"install_tmp_dir": str(scratch)}
+    )
+    assert rom_installer._install_tmp_dir() == scratch
+    assert scratch.is_dir()
+
+    monkeypatch.setattr(rom_installer, "load_config", lambda: {})
+    assert rom_installer._install_tmp_dir() is None

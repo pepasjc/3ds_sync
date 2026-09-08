@@ -5,7 +5,10 @@ from pathlib import Path
 
 from app.services.rom_id import (
     SYSTEM_CODES,
+    canonical_dc_serial,
+    make_dc_title_id,
     normalize_rom_name,
+    parse_dc_title_id,
     parse_title_id as _parse_emulator_id,
 )
 
@@ -22,6 +25,9 @@ _psp_names: dict[str, str] = {}  # keyed by full product code e.g. "ULUS10272"
 _psx_names: dict[str, str] = {}  # keyed by full product code e.g. "SCUS94163"
 _ps2_names: dict[str, str] = {}  # keyed by full product code e.g. "SCUS97203"
 _sat_names: dict[str, str] = {}  # keyed by Saturn serial e.g. "T-12705H"
+# Keyed by canonical Dreamcast serial e.g. "T1249M", "51000" — see
+# shared.rom_id.dreamcast for why Sega's "MK" prefix is dropped.
+_dc_names: dict[str, str] = {}
 _vita_names: dict[str, str] = {}  # keyed by full product code e.g. "PCSE00082"
 _wii_names: dict[
     str, str
@@ -43,6 +49,7 @@ _psp_priority: dict[str, tuple[int, int]] = {}
 _psx_priority: dict[str, tuple[int, int]] = {}
 _ps2_priority: dict[str, tuple[int, int]] = {}
 _sat_priority: dict[str, tuple[int, int]] = {}
+_dc_priority: dict[str, tuple[int, int]] = {}
 _vita_priority: dict[str, tuple[int, int]] = {}
 _3ds_priority: dict[str, tuple[int, int]] = {}
 _3ds_title_priority: dict[str, tuple[int, int]] = {}
@@ -61,6 +68,8 @@ _psx_serials_by_slug: dict[str, list[str]] = {}
 _sat_by_slug: dict[str, str] = {}
 _sat_serials_by_slug: dict[str, list[str]] = {}
 _sat_safe_to_serial: dict[str, str] = {}
+_dc_by_slug: dict[str, str] = {}
+_dc_serials_by_slug: dict[str, list[str]] = {}
 
 # PSN PSone Classic code → original retail disc serial
 # e.g. "NPUJ00662" (Parasite Eve Japan PSN) → "SLPM86034" (Parasite Eve Japan retail)
@@ -403,6 +412,8 @@ def load_database(db_path: Path | None = None) -> int:
         _psx_serials_by_slug, \
         _sat_by_slug, \
         _sat_serials_by_slug, \
+        _dc_by_slug, \
+        _dc_serials_by_slug, \
         _wii_names
 
     if db_path is None:
@@ -534,6 +545,10 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
         target = _sat_names
         priority = _sat_priority
         mode = "keep_serial"
+    elif "dreamcast" in fname:
+        target = _dc_names
+        priority = _dc_priority
+        mode = "dc_serial"  # canonical form folds Sega's "MK-51000" and "51000"
     elif "nintendo 3ds" in fname:
         target = _3ds_names
         priority = _3ds_priority
@@ -638,6 +653,8 @@ def load_libretro_dat_to_dicts(dat_path: Path, psn: bool = False) -> int:
             if len(parts) >= 3 and len(parts[2]) == 4 and parts[2].isalnum():
                 return parts[2]
             return None
+        if mode == "dc_serial":
+            return canonical_dc_serial(serial) or None
         if mode == "wii_code":
             # RVL-SP3E-USA or RVL-SP3E-USA-B0 → SP3E (segment index 1, 4 chars)
             parts = serial.upper().split("-")
@@ -879,6 +896,10 @@ def lookup_names_typed(product_codes: list[str]) -> dict[str, tuple[str, str]]:
             if sat_serial and sat_serial in _sat_names:
                 result[code] = (_sat_names[sat_serial], "SAT")
                 continue
+        dc_serial = parse_dc_title_id(code_upper)
+        if dc_serial and dc_serial in _dc_names:
+            result[code] = (_dc_names[dc_serial], "DC")
+            continue
         if platform == "PSP":
             name = _psp_names.get(base)
             if name:
@@ -1072,6 +1093,68 @@ def build_saturn_slug_index() -> int:
     return len(_sat_by_slug)
 
 
+def build_dreamcast_slug_index() -> int:
+    """Name-slug → Dreamcast serial index, for naming a ROM we only know by file.
+
+    Mirrors :func:`build_saturn_slug_index`.  Several serials can share a slug
+    (regional releases of one game), so all are kept and
+    :func:`lookup_dc_serial` picks by the region tag in the filename.
+    """
+    global _dc_by_slug, _dc_serials_by_slug
+
+    slug_serials: dict[str, list[str]] = {}
+    for code, name in _dc_names.items():
+        slug = _psx_name_slug(name)
+        if not slug:
+            continue
+        slug_serials.setdefault(slug, []).append(code)
+
+    new_index: dict[str, str] = {}
+    for slug, codes in slug_serials.items():
+        sorted_codes = sorted(codes)
+        new_index[slug] = sorted_codes[0]
+        slug_serials[slug] = sorted_codes
+
+    _dc_by_slug.clear()
+    _dc_by_slug.update(new_index)
+    _dc_serials_by_slug.clear()
+    _dc_serials_by_slug.update(slug_serials)
+    return len(_dc_by_slug)
+
+
+def _dc_serial_region_rank(code: str, region_hint: str | None) -> tuple[int, str]:
+    """Sort key for choosing between a game's regional serials.
+
+    Dreamcast product codes carry their region: Sega PAL discs end in ``-50``
+    (canonicalised to a trailing ``50``), third-party Japanese codes end in
+    ``M``/``J`` and US ones in ``N``.  With no hint, prefer USA, then Europe,
+    then Japan — the same order the rest of the DAT handling uses.
+    """
+    if region_hint == "USA" and code.endswith("N"):
+        return (0, code)
+    if region_hint == "EUROPE" and code.endswith("50"):
+        return (0, code)
+    if region_hint == "JAPAN" and code.endswith(("M", "J")):
+        return (0, code)
+    if code.endswith("50"):
+        return (2, code)
+    if code.endswith(("M", "J")):
+        return (3, code)
+    return (1, code)
+
+
+def lookup_dc_serial(name: str) -> str | None:
+    """Canonical Dreamcast serial for a ROM name, or ``None``."""
+    slug = _psx_name_slug(name)
+    if not slug:
+        return None
+    candidates = _dc_serials_by_slug.get(slug)
+    if not candidates:
+        return _dc_by_slug.get(slug)
+    region_hint = _psx_region_hint(name)
+    return min(candidates, key=lambda code: _dc_serial_region_rank(code, region_hint))
+
+
 def lookup_psx_serial(name: str) -> str | None:
     """Return the PS1 product code for a game name or ROM filename, or None.
 
@@ -1148,6 +1231,9 @@ def lookup_disc_serial(system: str, name: str) -> str | None:
     if sys_upper == "SAT":
         serial = lookup_saturn_serial(name)
         return make_saturn_title_id(serial) if serial else None
+    if sys_upper == "DC":
+        serial = lookup_dc_serial(name)
+        return make_dc_title_id(serial) if serial else None
     return None
 
 

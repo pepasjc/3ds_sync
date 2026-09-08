@@ -539,3 +539,29 @@ uv run pytest tests/ -v
 uv run pytest tests/test_bundle.py -v
 uv run pytest tests/test_api.py::TestUploadEndpoint::test_upload_success -v
 ```
+
+## Auditing the save store
+
+`tools/audit_saves.py` is a read-only check of the saves directory against
+`metadata.db`. It never writes, moves or deletes anything.
+
+```bash
+cd server
+uv run python tools/audit_saves.py                 # uses SYNC_SAVE_DIR
+uv run python tools/audit_saves.py --json audit.json
+uv run python tools/audit_saves.py --check hash,orphan
+```
+
+Run it **through the server's virtualenv**. The server hashes and sizes a save
+three different ways depending on the title - the generic rule, the PS1
+PSP-visible subset, and the PS3 filtered set - and the script borrows those
+implementations rather than reimplementing them. Without them it skips the
+hash, size and count checks and says so, instead of reporting healthy saves as
+corrupt.
+
+It reports: rows with no files on disk, save directories the database does not
+know about, empty saves, size/count/hash disagreements, unrecognised
+identifiers, one game stored under two identifiers (a serial beside a name
+slug), serial-keyed systems filed under a slug, leftover `.part` files, and
+malformed or excessive history snapshots. Exit status is non-zero when any
+error-level finding is present.

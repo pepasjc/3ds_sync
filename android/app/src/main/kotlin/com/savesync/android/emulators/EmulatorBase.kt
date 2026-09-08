@@ -202,6 +202,29 @@ abstract class EmulatorBase {
     }
 
     /**
+     * Looks up the Dreamcast disc serial for [romName] in the bundled Redump libretro DAT and
+     * returns a canonical `"DC_<serial>"` title ID (e.g. `"DC_T1249M"`), or null when the DAT
+     * has no entry.
+     *
+     * Dreamcast is a serial-keyed system: MemCard PRO DC and openMenu's Serial VMU file every
+     * save under the disc's serial, so an emulator save only shares a server slot with a card
+     * save when both sides produce the same id.  Used as the fallback after
+     * [readDreamcastProductCode] returns null — most notably for CHDs, which are compressed.
+     */
+    protected fun lookupDreamcastSerial(romName: String): String? =
+        DreamcastSerial.titleId(DreamcastSerialDatabase.lookupSerial(romName))
+
+    /**
+     * Reads the Dreamcast product number out of a disc image's IP.BIN header and returns a
+     * canonical `"DC_<serial>"` title ID, or null when the image can't be identified
+     * (compressed CHD, unreadable file, not a Dreamcast disc).
+     *
+     * See [DreamcastDisc] for the layouts handled.
+     */
+    protected fun readDreamcastProductCode(romFile: File): String? =
+        DreamcastSerial.titleId(DreamcastDisc.readProductCode(romFile))
+
+    /**
      * Reads the PS1 disc serial from an ISO/BIN/CUE disc image by parsing the ISO 9660
      * Primary Volume Descriptor and locating SYSTEM.CNF on the disc.
      *

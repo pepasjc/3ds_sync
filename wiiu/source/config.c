@@ -57,7 +57,7 @@ static void config_apply_defaults(SyncState *state) {
     strncpy(state->install_target, "usb", sizeof(state->install_target) - 1);
     state->sync_vwii = true;
     state->sync_wiiu = true;
-    strncpy(state->exit_mode, "full", sizeof(state->exit_mode) - 1);
+    strncpy(state->exit_mode, "auto", sizeof(state->exit_mode) - 1);
 }
 
 static bool parse_bool_value(const char *value, bool *out) {
@@ -158,7 +158,8 @@ static void format_config_text(const SyncState *state, char *out, size_t out_siz
              "install_target=%s\n"
              "sync_vwii=%s\n"
              "sync_wiiu=%s\n"
-             "# exit_mode: full | minimal | relaunch | none\n"
+             "# exit_mode: auto | menu | relaunch | none  (auto = let the\n"
+             "# host loader restore the menu; legacy full/minimal = auto)\n"
              "exit_mode=%s\n"
              "%s%s%s",
              state->server_url, state->api_key,
@@ -168,7 +169,7 @@ static void format_config_text(const SyncState *state, char *out, size_t out_siz
              state->install_target[0] ? state->install_target : "usb",
              state->sync_vwii ? "true" : "false",
              state->sync_wiiu ? "true" : "false",
-             state->exit_mode[0] ? state->exit_mode : "full",
+             state->exit_mode[0] ? state->exit_mode : "auto",
              state->console_id[0] ? "console_id=" : "",
              state->console_id[0] ? state->console_id : "",
              state->console_id[0] ? "\n" : "");

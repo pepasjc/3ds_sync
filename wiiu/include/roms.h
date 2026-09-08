@@ -88,8 +88,15 @@ const char *roms_install_dir(char *out, size_t out_size); /* "<root>/install" */
 void roms_ensure_target_dirs(void);
 void roms_mkdir_p(const char *path);
 
-/* Per-title WUP staging folder: <install>/<sanitised name>. */
-void roms_wup_game_dir(const char *name, char *out, size_t out_size);
+/* Per-title WUP staging folder: <install>/<TITLE_ID>.
+ * Named after the id (not the game name) to match NUSspli / WUP Installer —
+ * MCP would not install our game-name folders, whose paths carried spaces and
+ * parentheses, while byte-identical id-named sets installed fine. */
+void roms_wup_game_dir(const char *title_id, const char *name,
+                       char *out, size_t out_size);
+
+/* True for a bare 16-hex Wii U title id ("0005000010110100"). */
+bool roms_is_wiiu_title_id(const char *s);
 
 /* True when ``dir`` holds a title.tmd — i.e. a complete WUP set ready for
  * MCP.  A folder mid-download does not have one yet. */
@@ -121,6 +128,10 @@ typedef struct {
     char     filename[200];
     char     path[SAVE_DIR_LEN];
     char     system[8];
+    /* Wii U only: the staged title id, kept separately so the display name
+     * can be replaced with the catalog's without losing the identifier the
+     * install path and ordering depend on. */
+    char     title_id[24];
     uint64_t size;
 } LocalRom;
 

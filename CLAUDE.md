@@ -22,7 +22,7 @@ self-hosted local server. One Python FastAPI server plus these clients:
 | `android/` | Kotlin, Compose, Room, Retrofit | `gamesync.apk` |
 | `desktop/` | Python, PyQt6 | — |
 | `steamdeck/` | Python, PyQt6 + pygame | — |
-| `mister/` | Bash | `sync_saves.sh` |
+| `mister/` | Python 3.9 (stdlib only), framebuffer UI | `gamesync.pyz` |
 
 Shared Python logic lives in `shared/` and is imported by server, desktop and
 Steam Deck alike. `tools/` holds scrapers and one-off utilities.
@@ -121,7 +121,7 @@ in metadata is informational and does not affect the storage path.
 |---|---|---|
 | `title_id` | 3DS, Wii U | `0004000000055D00` (16-char uppercase hex) |
 | `prefix_hex_serial` | NDS | `00048000` + hex of 4-byte gamecode |
-| `serial` | PS1/PS2/PSP/Vita/Saturn/GC | `SLUS01279`, `SAT_T-4507G` |
+| `serial` | PS1/PS2/PSP/Vita/Saturn/DC/GC | `SLUS01279`, `SAT_T-4507G`, `DC_T1249M` |
 | `slug` | SNES, GBA, NES, … | `GBA_legend_of_zelda_minish_cap_usa` |
 
 Slug rules live in `shared/rom_id/normalizer.py`. Server and clients must agree
@@ -284,6 +284,71 @@ a devoptab path, and its structs must be heap-allocated at 0x40 alignment.
 Per-game `secure_file_id` keys come from `ps3/data/games.conf` (Apollo Save Tool
 format, redistributed in the PKG).
 
+**Dreamcast** — keyed by the disc **serial** (the IP.BIN product number), not
+by a name slug: `SYNC_ID_RULES["DC"]` is `{"strategy": "serial", "prefix":
+"DC_"}`, so a save is `DC_T1249M`. That is what every Dreamcast save device
+already files by, so a card save and a Flycast save share one slot and a
+mis-named ROM can't split a game in two. `shared/rom_id/dreamcast.py` holds the
+canonical form: punctuation stripped, and Sega's `MK` publisher prefix dropped
+because the disc says `MK-51000` where the Redump DAT says `51000` — both must
+fold onto `DC_51000`. The region suffix is *kept* (`MK-51064-50` -> `DC_5106450`
+is the PAL disc, `DC_51064` the NTSC one). Writing back to a device reverses it:
+`dc_device_folder_ids()` offers `MK51000` before `51000`, since IP.BIN is what
+the card names its folder after. Server-side, `game_names.lookup_dc_serial()`
+resolves a ROM name through `Sega - Dreamcast.dat`, and slug-form uploads from
+older clients are upgraded at the API boundary by `canonicalize_slug_title_id`;
+`server/migrate_dc_serial_ids.py` re-keys saves already stored under a slug.
+
+Every client resolves the serial the same way, mirroring the Saturn plumbing:
+`shared/rom_id/dreamcast.py` reads IP.BIN out of the disc (GDI/CDI/ISO/BIN —
+never a CHD, which is compressed) and falls back to a DAT name lookup, exposed
+as `resolve_dreamcast_title_id()`. Desktop and the Steam Deck scanner call it
+directly (`desktop/dreamcast_ipbin.py` is only a shim over it); Android has a
+Kotlin port in `emulators/DreamcastSerialDatabase.kt` (`DreamcastDisc`,
+`DreamcastSerial`, `DreamcastSerialDatabase`) with the DAT bundled as an asset.
+The canonical-serial rule is duplicated in Kotlin — change one and change the
+other, or the same game lands in two slots; `DreamcastSerialTest` and
+`shared/tests/test_dreamcast.py` assert the same cases on both sides.
+
+Three Dreamcast-only desktop device types build on that. `GDEMU` and `openMenu` install ROMs into numbered
+folders at the SD card root (`01` = menu disc, games start at `02`, each folder
+gets a `name.txt`); GDEMU cannot read CHD, so a catalog CHD is always fetched as
+a converted GDI set. The menu's game list (`LIST.INI` for GDMENU,
+`OPENMENU.INI` for openMenu) lives **inside the folder-01 menu image** — openMenu
+opens it off its own disc and never reads the card, so a newly installed game is
+bootable but invisible until that file changes. Each install regenerates the
+list (`desktop/gdemu_menu.py`), reading each folder's IP.BIN header
+(`desktop/dreamcast_ipbin.py`) for name/disc/VGA/region/version/date/product and
+reusing the previous list for folders whose `name.txt` is unchanged, then writes
+it twice: staged at the card root, and patched into the menu image by
+`desktop/openmenu_image.py`. That patch is in-place ISO9660 surgery — the menu's
+data tracks are 2048-byte-sector `.iso` (no EDC/ECC), the list gets a whole
+sector to itself, so only the file's bytes and the both-endian size fields of
+its directory records change. A GD-ROM image carries **two** filesystems (low
+density, and high density whose directory can point at content in a later
+track), so there are normally two copies to keep in step; both are checked for
+room before anything is written, and every touched region is backed up under
+`desktop/.menu_image_backups/`. Installs also mirror GD MENU Card Manager's
+folder layout: `disc.gdi` + `trackNN.*` (never quoted/spaced names) plus the
+`name.txt`/`serial.txt`/`disc.txt`/`region.txt`/`version.txt`/`date.txt`/
+`vga.txt`/`type.txt`/`folder.txt` caches. "Repair Installed Files" in the ROM
+Installer tab applies all of this to games already on a card, and also
+renumbers the game folders so `02`, `03`, … run alphabetically — folder number
+*is* menu order, since the list is emitted in folder order. The renumber is
+two-phase (movers park under `.gs_sort_<n>` first, because a rename needs a
+free name) and recovers strays left by an interrupted run; folder `01` never
+moves. GDEMU stores no saves. `openMenu` syncs its Serial VMU
+backups from a *second* card (the serial SD adapter) at
+`OPENMENU/SAVES/<GameID>/SLOT1.VMU`; `MemCard Pro DC` syncs
+`Dreamcast/<GameID>/<GameID>-1.vmu`. Slot/channel 1 only, 128 KB raw VMU images
+uploaded through `/raw`. `desktop/dreamcast.py` turns a card folder name into
+`DC_<serial>` and, for an emulator profile that only knows a filename, maps the
+name to its serial through the DAT (falling back to a name slug for a disc the
+DAT has never seen). A card scan only ever walks a real `Dreamcast/` or
+`OPENMENU/SAVES/` folder — never a bare drive root, since a reader's drive
+letter can point anywhere. `MemoryCard1` (the shared card) and `openmenu` (the
+menu's own VMU) are skipped.
+
 **Android / Steam Deck** — emulator save locations live in per-emulator scanners
 (`android/.../emulators/impl/`, `steamdeck/scanner/`), kept deliberately parallel
 so a fix in one ports to the other.
@@ -327,7 +392,7 @@ Code written by reading someone else's implementation still needs credit even
 though nothing was copied verbatim. Add a file header comment (`Based on analysis
 of …`, `Protocol ported from …`) **and** a bullet under **Format documentation
 and reverse-engineering references** in `README.md`. Existing examples:
-`ps3/source/pfd.c`, `gc/source/saves.c`, `desktop/saroo_format.py`.
+`ps3/source/pfd.c`, `gc/source/saves.c`, `shared/saturn_format.py`.
 
 ### Adding data files
 

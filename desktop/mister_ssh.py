@@ -1,9 +1,11 @@
 """MiSTer FPGA SSH/SFTP sync helper.
 
 Uses paramiko to connect to a MiSTer over SSH and sync saves with the
-3dssync server.  The state file stored on the MiSTer
-(/media/fat/3dssync_state.json) is compatible with the standalone
-mister/sync_saves.sh script so both tools can be used interchangeably.
+GameSync server.  The state file lives in the MiSTer script convention
+directory (``/media/fat/Scripts/.config/gamesync/state.json``) and is shared
+with the on-device client and the standalone ``mister/sync_saves.sh``, so all
+three can be used interchangeably.  The pre-0.5.4 path is still read when the
+current one is absent, so an existing install keeps its sync state.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ try:
 except ImportError:
     PARAMIKO_AVAILABLE = False
 
+from shared import mister as _shared_mister  # noqa: E402
+from shared.mister_scan import system_for_save  # noqa: E402
 from systems import (  # noqa: E402 (after conditional import above)
     MISTER_FOLDER_TO_SYSTEM,
     MISTER_SYSTEM_TO_FOLDER,
@@ -32,10 +36,59 @@ from systems import (  # noqa: E402 (after conditional import above)
 # ---------------------------------------------------------------------------
 
 MISTER_SAVES_DIR = "/media/fat/saves"
-MISTER_STATE_FILE = "/media/fat/3dssync_state.json"
+
+# Device paths live in shared/mister.py because the on-device client and the
+# legacy shell script write the same state file.
+MISTER_CONFIG_DIR = _shared_mister.MISTER_CONFIG_DIR
+MISTER_STATE_FILE = _shared_mister.MISTER_STATE_FILE
+LEGACY_MISTER_STATE_FILE = _shared_mister.LEGACY_MISTER_STATE_FILE
 
 FOLDER_TO_SYSTEM = MISTER_FOLDER_TO_SYSTEM
 SYSTEM_TO_FOLDER = MISTER_SYSTEM_TO_FOLDER
+
+
+class _SftpProvider:
+    """The shared file-provider interface over an open SFTP channel.
+
+    Lets ``shared/mister_scan.py`` rules run against a remote MiSTer exactly as
+    they run against a local one on the device.
+    """
+
+    def __init__(self, sftp):
+        self._sftp = sftp
+        self._listdir_cache: dict[str, list[str]] = {}
+        self._isdir_cache: dict[str, bool] = {}
+
+    def listdir(self, path: str) -> list[str]:
+        if path not in self._listdir_cache:
+            try:
+                self._listdir_cache[path] = self._sftp.listdir(path)
+            except Exception:
+                self._listdir_cache[path] = []
+        return list(self._listdir_cache[path])
+
+    def is_dir(self, path: str) -> bool:
+        if path not in self._isdir_cache:
+            try:
+                import stat as _stat
+
+                self._isdir_cache[path] = _stat.S_ISDIR(
+                    self._sftp.stat(path).st_mode
+                )
+            except Exception:
+                self._isdir_cache[path] = False
+        return self._isdir_cache[path]
+
+    def stat(self, path: str):
+        try:
+            info = self._sftp.stat(path)
+            return int(info.st_size or 0), float(info.st_mtime or 0)
+        except Exception:
+            return 0, 0.0
+
+    def read(self, path: str) -> bytes:
+        with self._sftp.open(path, "rb") as handle:
+            return handle.read()
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +212,11 @@ class MiSTerSSH:
     # Save discovery
     # ------------------------------------------------------------------
 
+    def provider(self) -> "_SftpProvider":
+        """A shared-rules file provider backed by this SFTP connection."""
+        assert self._sftp is not None, "Not connected"
+        return _SftpProvider(self._sftp)
+
     def scan_saves(
         self, progress_cb: Optional[Callable[[str], None]] = None
     ) -> list[MiSTerSave]:
@@ -188,14 +246,20 @@ class MiSTerSSH:
                 if Path(fname).suffix.lower() not in SAVE_EXTENSIONS:
                     continue
                 remote_path = f"{system_path}/{fname}"
+                # A folder can serve two systems - the TurboGrafx-16 core keeps
+                # HuCard and CD saves together in saves/TGFX16 - so the
+                # installed game decides which this is.
+                resolved = system_for_save(
+                    self.provider(), folder, system, Path(fname).stem
+                )
                 try:
-                    title_id = make_title_id(system, fname)
+                    title_id = make_title_id(resolved, fname)
                 except Exception:
                     continue
 
                 saves.append(
                     MiSTerSave(
-                        system=system,
+                        system=resolved,
                         folder=folder,
                         filename=fname,
                         remote_path=remote_path,
@@ -294,18 +358,25 @@ class MiSTerSSH:
     # ------------------------------------------------------------------
 
     def load_state(self) -> dict[str, str]:
-        """Load sync state from MiSTer. Returns {} if missing or corrupt."""
+        """Load sync state from MiSTer. Returns {} if missing or corrupt.
+
+        Falls back to the pre-0.5.4 path so an existing install does not lose
+        its last-synced hashes and see every save as a conflict.
+        """
         assert self._sftp is not None
-        try:
-            with self._sftp.open(MISTER_STATE_FILE, "r") as fh:
-                return json.loads(fh.read())
-        except Exception:
-            return {}
+        for path in (MISTER_STATE_FILE, LEGACY_MISTER_STATE_FILE):
+            try:
+                with self._sftp.open(path, "r") as fh:
+                    return json.loads(fh.read())
+            except Exception:
+                continue
+        return {}
 
     def save_state(self, state: dict[str, str]) -> None:
-        """Persist sync state to MiSTer."""
+        """Persist sync state to MiSTer, in the script-convention directory."""
         assert self._sftp is not None
         data = json.dumps(state, indent=2)
+        self.makedirs(MISTER_CONFIG_DIR)
         with self._sftp.open(MISTER_STATE_FILE, "w") as fh:
             fh.write(data)
 

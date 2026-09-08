@@ -35,6 +35,8 @@ from systems import (
     SYSTEM_CODES,
     SYSTEM_DEFAULT_SAVE_EXT,
 )
+from shared import mister as _shared_mister_mod
+from shared import mister_saves as _mister_saves
 from shared.rom_id import make_title_id, normalize_rom_name
 from shared.sync_id import canonicalize_code_form_title_id
 
@@ -358,7 +360,7 @@ def _saturn_format_for_path(path: Path | None) -> str:
     # to 64 KB (0xFF padding at even offsets) — the same layout Yabause uses —
     # and always names it ``.sav``.
     if is_ssh_save_path(path):
-        return "yabause"
+        return _shared_mister_mod.MISTER_SATURN_FORMAT
     if _is_shared_saturn_backup(path) or path.suffix.lower() == ".bin":
         return "yabasanshiro"
     if path.suffix.lower() == ".srm":
@@ -2295,13 +2297,43 @@ def scan_profile(
     elif device_type == "MemCard Pro":
         # MemCard Pro is a card-manager profile, not a ROM folder. The selected
         # system determines which card layout to scan inside the chosen root.
-        if system_override in {"PS1", "PS2", "GC", "DC"}:
+        if system_override == "DC":
+            results = _scan_memcard_pro_dc(
+                folder,
+                progress_callback=progress_callback,
+                profile_scope=profile_scope,
+            )
+        elif system_override in {"PS1", "PS2", "GC"}:
             results = _scan_memcard_pro(
                 folder,
                 system_override,
                 progress_callback=progress_callback,
                 profile_scope=profile_scope,
             )
+
+    elif device_type == "MemCard Pro DC":
+        # Dreamcast card manager: <root>/Dreamcast/<GAMEID>/<GAMEID>-1.vmu
+        results = _scan_memcard_pro_dc(
+            folder,
+            progress_callback=progress_callback,
+            profile_scope=profile_scope,
+        )
+
+    elif device_type == "openMenu":
+        # openMenu's Serial VMU feature backs each game's VMU up to a serial SD
+        # adapter — a different card from the GDEMU one holding the games, so
+        # the save folder is scanned, falling back to the game folder.
+        results = _scan_openmenu_vmu(
+            save_folder if (save_folder and save_folder.exists()) else folder,
+            progress_callback=progress_callback,
+            profile_scope=profile_scope,
+        )
+
+    elif device_type == "GDEMU":
+        # GDEMU stores no saves of its own — the VMU does.  This profile exists
+        # to install games onto the card; pair it with an openMenu or MemCard
+        # PRO DC profile to sync the saves.
+        results = []
 
     elif device_type == "MEGA EverDrive":
         # MEGA EverDrive Pro: gamedata/<Game Name>/bram.srm layout.
@@ -2333,6 +2365,18 @@ def scan_profile(
                 rom_folder,
                 mednafen_folder,
                 progress_callback=progress_callback,
+                profile_scope=profile_scope,
+            )
+
+    elif device_type == "Super SD System 3":
+        # Super SD System 3: fixed card layout — HuCard/, Cd/<Game>/ and bup/
+        # all hang off the SD card root, so only `path` is configurable.
+        if rom_folder and rom_folder.exists():
+            results = _scan_supersd3(
+                rom_folder,
+                systems_config,
+                progress_callback=progress_callback,
+                enable_auto_normalize=enable_auto_normalize,
                 profile_scope=profile_scope,
             )
 
@@ -3157,6 +3201,207 @@ def _scan_mega_everdrive(
     return _dedup_saves(results)
 
 
+# ---------------------------------------------------------------------------
+# Super SD System 3 (TerraOnion PC Engine / TurboGrafx ODE)
+#
+# Card layout::
+#
+#     <root>/HuCard/<Game (Region)>.pce      cartridge dumps (flat)
+#     <root>/Cd/<Game>/<Image>.cue + .bin    one folder per CD game
+#     <root>/bup/<Image stem>.bup            per-game 2 KB backup RAM
+#     <root>/bup/backram.bup                 the console's shared BRAM
+#
+# A save is named after the *ROM file* it belongs to, not the folder: the CD
+# game in ``Cd/SR/Super_Raiden_(NTSC-J)_[HCD2023].cue`` saves to
+# ``bup/Super_Raiden_(NTSC-J)_[HCD2023].bup``.  The payload is a raw 2048-byte
+# PC Engine BRAM image (``HUBM`` magic) — byte-identical to what Mednafen,
+# Beetle PCE and the MiSTer TurboGrafx16 core write, so it syncs as-is.
+# ---------------------------------------------------------------------------
+
+SUPERSD3_HUCARD_DIR = "HuCard"
+SUPERSD3_CD_DIR = "Cd"
+SUPERSD3_SAVE_DIR = "bup"
+SUPERSD3_SAVE_EXT = ".bup"
+# The shared system BRAM, not a per-game save — never synced to a title slot.
+SUPERSD3_SHARED_BRAM_STEM = "backram"
+SUPERSD3_HUCARD_EXTENSIONS = frozenset({".pce", ".tg16", ".pc2"})
+SUPERSD3_SUPERGRAFX_EXTENSIONS = frozenset({".sgx"})
+# Which file in a Cd/<Game>/ folder names the save.  The cue sheet wins: a
+# multi-track rip has one cue but a dozen "(Track NN).bin" files.
+SUPERSD3_DISC_PRIORITY = (".cue", ".ccd", ".chd", ".iso", ".img", ".mdf", ".bin")
+
+
+def _child_dir(root: Path, name: str) -> Path:
+    """``root/name``, matched case-insensitively against existing children.
+
+    The card is FAT32 (case-insensitive), but a Linux desktop mounting it is
+    not, so ``bup`` must still find a folder written as ``BUP``.
+    """
+    direct = root / name
+    if direct.is_dir():
+        return direct
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir() and entry.name.lower() == name.lower():
+                return Path(entry.path)
+    except OSError:
+        pass
+    return direct
+
+
+def _supersd3_disc_image(game_dir: Path) -> Optional[Path]:
+    """The disc file whose stem names this CD game's ``.bup`` save."""
+    try:
+        files = sorted(f for f in game_dir.iterdir() if f.is_file())
+    except OSError:
+        return None
+    for ext in SUPERSD3_DISC_PRIORITY:
+        for f in files:
+            if f.suffix.lower() == ext:
+                return f
+    return None
+
+
+def _scan_supersd3(
+    root: Path,
+    systems_config: Optional[dict[str, dict]] = None,
+    progress_callback=None,
+    enable_auto_normalize: bool = True,
+    profile_scope: str = "",
+) -> list[SaveFile]:
+    """Scan a Super SD System 3 SD card root for HuCard / CD games and saves."""
+    save_dir = _child_dir(root, SUPERSD3_SAVE_DIR)
+    hucard_dir = _child_dir(root, SUPERSD3_HUCARD_DIR)
+    cd_dir = _child_dir(root, SUPERSD3_CD_DIR)
+
+    # bup/ index: save stem (lowercased) -> path.  ".bup.bak" backups written by
+    # the ODE end in ".bak" and are skipped by the suffix test.
+    save_index: dict[str, Path] = {}
+    for f in _safe_walk(save_dir, recursive=False):
+        try:
+            if not f.is_file():
+                continue
+        except OSError:
+            continue
+        if f.suffix.lower() != SUPERSD3_SAVE_EXT:
+            continue
+        if f.stem.lower() == SUPERSD3_SHARED_BRAM_STEM:
+            continue
+        save_index.setdefault(f.stem.lower(), f)
+
+    enabled = set(systems_config or {})
+    results: list[SaveFile] = []
+    matched: set[Path] = set()
+
+    def _add(system: str, rom_path: Path, stem: str) -> None:
+        if enabled and system not in enabled:
+            return
+        save_path = save_index.get(stem.lower())
+        if save_path is None:
+            save_path = save_dir / (stem + SUPERSD3_SAVE_EXT)
+            file_hash, mtime, save_exists = "", 0.0, False
+        else:
+            matched.add(save_path)
+            try:
+                file_hash = _hash_file(save_path)
+                mtime = save_path.stat().st_mtime
+                save_exists = True
+            except OSError:
+                file_hash, mtime, save_exists = "", 0.0, False
+        # The ROM path drives canonical-name resolution; the save path is what
+        # actually gets uploaded/downloaded.
+        sf = _build_save_file(
+            system=system,
+            game_name=stem,
+            source_name=rom_path.name,
+            path=rom_path,
+            file_hash=file_hash,
+            mtime=mtime,
+            save_exists=save_exists,
+            enable_auto_normalize=enable_auto_normalize,
+            profile_scope=profile_scope,
+        )
+        sf.path = save_path
+        sf.hash = file_hash
+        sf.mtime = mtime
+        sf.save_exists = save_exists
+        results.append(sf)
+
+    # ── HuCard/ — flat cartridge dumps ────────────────────────────────────
+    if hucard_dir.is_dir():
+        rom_files = [f for f in _safe_walk(hucard_dir, recursive=True)]
+        total = len(rom_files)
+        for idx, rom_file in enumerate(rom_files, start=1):
+            try:
+                if not rom_file.is_file():
+                    continue
+            except OSError:
+                continue
+            if rom_file.name.startswith("."):
+                continue
+            ext = rom_file.suffix.lower()
+            if ext in SUPERSD3_SUPERGRAFX_EXTENSIONS:
+                _add("PCSG", rom_file, rom_file.stem)
+            elif ext in SUPERSD3_HUCARD_EXTENSIONS:
+                _add("PCE", rom_file, rom_file.stem)
+            if idx == 1 or idx % 25 == 0 or idx == total:
+                _emit_progress(
+                    progress_callback,
+                    f"Scanning HuCard ROMs… {idx}/{total}",
+                    idx,
+                    total,
+                )
+
+    # ── Cd/<Game>/ — one folder per disc ──────────────────────────────────
+    if cd_dir.is_dir():
+        try:
+            game_dirs = sorted(d for d in cd_dir.iterdir() if d.is_dir())
+        except OSError:
+            game_dirs = []
+        total = len(game_dirs)
+        for idx, game_dir in enumerate(game_dirs, start=1):
+            image = _supersd3_disc_image(game_dir)
+            if image is not None:
+                _add("PCECD", image, image.stem)
+            if idx == 1 or idx % 25 == 0 or idx == total:
+                _emit_progress(
+                    progress_callback,
+                    f"Scanning PC Engine CD folders… {idx}/{total}",
+                    idx,
+                    total,
+                )
+
+    # Saves whose game is no longer on the card still sync, so removing a ROM
+    # never strands its BRAM.  There is no ROM to tell HuCard from CD apart, so
+    # they are reported as PCECD — CD games are what actually write BRAM.
+    for save_path in save_index.values():
+        if save_path in matched:
+            continue
+        if enabled and "PCECD" not in enabled:
+            continue
+        try:
+            file_hash = _hash_file(save_path)
+            mtime = save_path.stat().st_mtime
+        except OSError:
+            continue
+        results.append(
+            _build_save_file(
+                system="PCECD",
+                game_name=save_path.stem,
+                source_name=save_path.name,
+                path=save_path,
+                file_hash=file_hash,
+                mtime=mtime,
+                save_exists=True,
+                enable_auto_normalize=enable_auto_normalize,
+                match_name=save_path.stem,
+                profile_scope=profile_scope,
+            )
+        )
+
+    return _dedup_saves(results)
+
+
 def _scan_saroo(
     saroo_root: Path,
     mednafen_save_folder: Optional[Path],
@@ -3503,130 +3748,22 @@ def _scan_cd_game_folders(
 # letter (A/E/I) + product code.  The product code is this project's PS1 sync
 # key (see CLAUDE.md — PS1 saves are keyed by the in-card code, not the disc
 # serial in the filename).
-_PS1_INCARD_SERIAL_RE = re.compile(r"^B[A-Z]([A-Z]{4})[-_]?(\d{5})")
+_PS1_INCARD_SERIAL_RE = _mister_saves._PS1_INCARD_SERIAL_RE
 
 # A MiSTer PSX card written while booting a real CD is named after the disc
-# serial (``SLPM-86219.sav``) rather than the game folder.  Accept the usual
-# written forms: ``SLPM-86219``, ``SLPM_86219``, ``SLPM86219``, ``SLUS_012.34``.
-_PS1_FILENAME_SERIAL_RE = re.compile(
-    r"^([A-Z]{4})[-_ ]?(\d{3})[-_. ]?(\d{2})$", re.IGNORECASE
-)
+# serial (``SLPM-86219.sav``) rather than the game folder.
+_PS1_FILENAME_SERIAL_RE = _mister_saves._PS1_FILENAME_SERIAL_RE
 
 # Cache marker for "formatted PS1 card with no save blocks at all".
 _PS1_EMPTY_CARD_MARKER = "EMPTY"
 
-
-def _ps1_serial_from_filename(stem: str) -> str | None:
-    """Compact disc serial from a serial-named save file stem, else None.
-
-    Only recognised PlayStation disc prefixes match, so ordinary game names
-    can never be mistaken for a serial.
-    """
-    match = _PS1_FILENAME_SERIAL_RE.match(str(stem or "").strip())
-    if not match:
-        return None
-    prefix = match.group(1).upper()
-    if prefix not in _PSX_RETAIL_PREFIXES:
-        return None
-    return f"{prefix}{match.group(2)}{match.group(3)}"
-
-
-def _ps1_card_serial(card: bytes) -> str | None:
-    """Compact product code (``SLUS01324``) from a raw 128KB PS1 memory card.
-
-    Directory frames 1–15 live in block 0 (128 bytes each); an in-use
-    first-link frame (state ``0x51``) carries the in-card filename at +0x0A.
-    Returns None for empty/unformatted cards.
-    """
-    if len(card) < 2048 or card[:2] != b"MC":
-        return None
-    for frame in range(1, 16):
-        off = frame * 128
-        if card[off] != 0x51:
-            continue
-        raw_name = card[off + 0x0A : off + 0x0A + 20].split(b"\x00")[0]
-        match = _PS1_INCARD_SERIAL_RE.match(raw_name.decode("ascii", errors="ignore"))
-        if match:
-            return f"{match.group(1)}{match.group(2)}"
-    return None
-
-
-# A Sega CD backup RAM ends with a 0x40-byte format footer; save directory
-# entries are 0x20 bytes each and grow backwards from it, an unused slot
-# being all zero.  Same layout for the internal 8 KB BRAM and for RAM carts.
-_SEGACD_FOOTER_SIZE = 0x40
-_SEGACD_DIR_ENTRY_SIZE = 0x20
-_SEGACD_FOOTER_MAGIC = b"SEGA_CD_ROM"
-
-
-def _segacd_bram_is_empty(data: bytes) -> bool:
-    """True for a formatted Sega CD backup RAM holding no save files.
-
-    The MegaCD core writes the format footer the first time a game
-    initialises the BRAM, so a freshly created ``.sav`` is 99% zeros with a
-    valid footer and an empty directory.
-    """
-    if len(data) < _SEGACD_FOOTER_SIZE + _SEGACD_DIR_ENTRY_SIZE:
-        return False
-    if _SEGACD_FOOTER_MAGIC not in data[-_SEGACD_FOOTER_SIZE:]:
-        return False
-    first_entry = data[
-        -_SEGACD_FOOTER_SIZE - _SEGACD_DIR_ENTRY_SIZE : -_SEGACD_FOOTER_SIZE
-    ]
-    return not any(first_entry)
-
-
-# ── Mega Drive SRAM: MiSTer vs emulator layout ──────────────────────────────
-#
-# Mega Drive cartridge SRAM sits on the odd byte of the 68000's 16-bit bus, so
-# the two worlds store it differently:
-#
-#   emulators (and this server)  <sram byte> at every ODD offset, filler at even
-#   MiSTer MegaDrive core        the sram bytes packed, padded with 0xFF to 64 KB
-#
-# The core's transfer loop is a fixed 128 sectors (``&sd_lba[6:0]``), which is
-# why its file is always 65536 bytes regardless of the game's real SRAM size.
-# Handing it a 16 KB emulator save leaves the game with no data.
-_MISTER_MD_SAVE_SIZE = 65536
-_MD_MIN_SRAM = 0x1000  # 4 KB — smallest size seen in the wild
-
-
-def _md_expanded_to_packed(data: bytes) -> bytes:
-    """Emulator/server layout -> the packed SRAM bytes the core stores."""
-    return bytes(data[1::2])
-
-
-def _md_packed_to_expanded(packed: bytes, filler: int = 0x00) -> bytes:
-    """Packed SRAM bytes -> emulator/server layout (byte at each odd offset)."""
-    out = bytearray(len(packed) * 2)
-    for idx, value in enumerate(packed):
-        out[idx * 2] = filler
-        out[idx * 2 + 1] = value
-    return bytes(out)
-
-
-def _md_to_mister(data: bytes) -> bytes:
-    """Server payload -> a 64 KB image the MegaDrive core will load."""
-    if len(data) == _MISTER_MD_SAVE_SIZE:
-        return data  # already core-shaped
-    packed = _md_expanded_to_packed(data)
-    if len(packed) >= _MISTER_MD_SAVE_SIZE:
-        return packed[:_MISTER_MD_SAVE_SIZE]
-    return packed + b"\xff" * (_MISTER_MD_SAVE_SIZE - len(packed))
-
-
-def _md_sram_size(packed: bytes) -> int:
-    """Guess a game's SRAM size from the used portion of a core image.
-
-    The core pads to 64 KB with 0xFF, so the tail says nothing; round the
-    used length up to the next power of two, which is how cartridges are
-    actually sized.
-    """
-    used = len(packed.rstrip(b"\xff"))
-    size = _MD_MIN_SRAM
-    while size < used and size < _MISTER_MD_SAVE_SIZE:
-        size *= 2
-    return size
+# The MiSTer save format and identity rules live in shared/mister_saves.py so
+# the on-device MiSTer client runs the same code instead of re-deriving it.
+_ps1_serial_from_filename = _mister_saves.ps1_serial_from_filename
+_ps1_card_serial = _mister_saves.ps1_card_serial
+_segacd_bram_is_empty = _mister_saves.is_segacd_bram_blank
+_md_to_mister = _mister_saves.md_to_mister
+_MISTER_MD_SAVE_SIZE = _mister_saves.MISTER_MD_SAVE_SIZE
 
 
 def _server_save_size(
@@ -3648,35 +3785,18 @@ def _server_save_size(
     return 0
 
 
-def _md_from_mister(data: bytes, target_size: int = 0) -> bytes:
-    """64 KB core image -> the expanded layout every other client reads.
-
-    ``target_size`` (the size already on the server) wins when known, so a
-    save keeps the exact shape its counterpart clients expect.
-    """
-    if len(data) != _MISTER_MD_SAVE_SIZE:
-        return data  # not a core image — pass through untouched
-    sram = (target_size // 2) if target_size else _md_sram_size(data)
-    sram = max(sram, _MD_MIN_SRAM)
-    return _md_packed_to_expanded(data[:sram])
-
-
-def _ps1_card_is_empty(card: bytes) -> bool:
-    """True for a formatted PS1 card that holds no save blocks at all.
-
-    The MiSTer PSX core creates one of these the first time a game runs, so
-    they are common and carry nothing worth syncing.
-    """
-    if len(card) < 2048 or card[:2] != b"MC":
-        return False
-    return all(card[frame * 128] != 0x51 for frame in range(1, 16))
+_md_from_mister = _mister_saves.md_from_mister
+_ps1_card_is_empty = _mister_saves.is_ps1_card_blank
+_md_packed_to_expanded = _mister_saves._md_packed_to_expanded
+_md_expanded_to_packed = _mister_saves._md_expanded_to_packed
+_md_sram_size = _mister_saves._md_sram_size
 
 
 _mister_catalog_cache: dict[str, dict[str, str]] = {}
 
 
-def _mister_catalog_index(system: str) -> dict[str, str]:
-    """``{normalized rom name: server title_id}`` for one system.
+def _mister_catalog_index(system: str):
+    """A name → server ``title_id`` matcher for one system.
 
     MiSTer names a save after the game file/folder, which for a translation
     patch bears no resemblance to the server's canonical title (``Castlevania
@@ -3684,40 +3804,45 @@ def _mister_catalog_index(system: str) -> dict[str, str]:
     already carries the disc serial for both, so it is the bridge between the
     on-device name and the server's key.  Cached per process; call
     ``clear_scan_cache()`` to refresh.
+
+    Matching is region-aware rather than an exact slug comparison, because the
+    two sides routinely spell the same game differently — ``Final Fantasy IX
+    (USA)`` on the device against ``Final Fantasy IX (USA, Canada) (Disc 1)``
+    on the server.  See ``shared/title_match.py`` for the rules.
     """
+    from shared.title_match import TitleMatcher
+
     system = (system or "").upper()
     cached = _mister_catalog_cache.get(system)
     if cached is not None:
         return cached
 
-    index: dict[str, str] = {}
+    matcher = TitleMatcher()
     try:
         from rom_installer import fetch_rom_catalog
 
         for rom in fetch_rom_catalog(system):
-            title_id = str(rom.get("title_id") or "").strip()
-            filename = str(rom.get("filename") or "")
-            if not title_id or not filename:
-                continue
-            slug = normalize_rom_name(posixpath.splitext(filename)[0])
-            if slug and slug != "unknown":
-                index.setdefault(slug, title_id)
-            name_slug = normalize_rom_name(str(rom.get("name") or ""))
-            if name_slug and name_slug != "unknown":
-                index.setdefault(name_slug, title_id)
+            matcher.add(rom.get("title_id"), rom.get("filename"),
+                        rom.get("name"))
     except Exception as exc:  # offline / server down — fall back to slug ids
         _debug_scan(f"MiSTer: {system} catalog lookup unavailable: {exc}")
 
-    _mister_catalog_cache[system] = index
-    return index
+    _mister_catalog_cache[system] = matcher
+    return matcher
 
 
 def _mister_catalog_title_id(system: str, save_stem: str) -> str | None:
-    """Server title_id for a MiSTer save named after its game, else None."""
-    slug = normalize_rom_name(str(save_stem or ""))
-    if not slug or slug == "unknown":
+    """Server title_id for a MiSTer save named after its game, else None.
+
+    Only serial-keyed systems (PS1, Saturn, …) may be resolved this way. For a
+    slug-keyed system the name *is* the identity, so matching it loosely would
+    file two different games under one save slot.
+    """
+    from shared.sync_id import uses_serial_identity
+
+    if not uses_serial_identity(system):
         return None
-    return _mister_catalog_index(system).get(slug)
+    return _mister_catalog_index(system).lookup(str(save_stem or ""))
 
 
 def _scan_mister_ssh(
@@ -3759,27 +3884,26 @@ def _scan_mister_ssh(
             save_hash = _get_cached_hash_for_key(cache_key, sv.size, sv.mtime)
             stem = posixpath.splitext(sv.filename)[0]
             serial: str | None = None
+            serials: tuple[str, ...] = ()
             filename_serial: str | None = None
             empty_card = False
-            if sv.system == "SAT":
-                # Saturn backup RAM carries no disc id, so the game name is
-                # the only handle we have — resolve it through the catalog.
-                catalog_id = _mister_catalog_title_id("SAT", stem)
-                if catalog_id:
-                    title_id = catalog_id
             if sv.system == "PS1":
                 filename_serial = _ps1_serial_from_filename(stem)
                 # Cached markers: "-" = has data but no in-card serial,
-                # "" would be falsy so blank cards use "EMPTY".
+                # "" would be falsy so blank cards use "EMPTY". Otherwise
+                # every product code on the card, comma-joined, first save
+                # first - a shared card holds several, and which one keys the
+                # save depends on the file name (see resolve_title_id).
                 cached_serial = _get_cached_hash_for_key(
-                    f"{cache_key}|ps1serial", sv.size, sv.mtime
+                    f"{cache_key}|ps1serials", sv.size, sv.mtime
                 )
                 empty_card = cached_serial == _PS1_EMPTY_CARD_MARKER
-                serial = (
-                    None
+                serials = (
+                    ()
                     if cached_serial in (None, "-", _PS1_EMPTY_CARD_MARKER)
-                    else cached_serial
+                    else tuple(cached_serial.split(","))
                 )
+                serial = serials[0] if serials else None
                 need_read = not save_hash or cached_serial is None
             elif sv.system in ("SAT", "SEGACD") or (
                 sv.system == "MD" and sv.size == _MISTER_MD_SAVE_SIZE
@@ -3799,65 +3923,30 @@ def _scan_mister_ssh(
                     total,
                 )
                 try:
-                    if sv.system == "PS1":
-                        # One read serves both the hash and the in-card serial.
+                    if _mister_saves.needs_payload_read(sv.system, sv.size):
+                        # One read serves the hash, the in-card serial and the
+                        # blank check.  Which bytes get hashed is per-system and
+                        # lives in shared/mister_saves.py, so the on-device
+                        # client computes byte-identical hashes.
                         data = ssh.read_file(sv.remote_path)
-                        save_hash = hashlib.sha256(data).hexdigest()
-                        serial = _ps1_card_serial(data)
-                        empty_card = serial is None and _ps1_card_is_empty(data)
+                        identity = _mister_saves.resolve_save_identity(
+                            sv.system, data
+                        )
+                        save_hash = hashlib.sha256(
+                            identity.hash_payload
+                        ).hexdigest()
+                        serial = identity.serial
+                        serials = identity.serials
+                        empty_card = identity.is_blank
+                        marker_key = (
+                            "ps1serials" if sv.system == "PS1" else "blank"
+                        )
                         _set_cached_hash_for_key(
-                            f"{cache_key}|ps1serial",
+                            f"{cache_key}|{marker_key}",
                             sv.size,
                             sv.mtime,
-                            serial
+                            ",".join(serials)
                             or (_PS1_EMPTY_CARD_MARKER if empty_card else "-"),
-                        )
-                    elif sv.system == "SAT":
-                        # Hash the canonical 32 KB internal BRAM, not the
-                        # 64 KB byte-expanded file, so the hash lines up with
-                        # what the server (and every other Saturn client) has.
-                        from saroo_format import (
-                            list_saturn_archive_names,
-                            normalize_saturn_save,
-                        )
-
-                        data = ssh.read_file(sv.remote_path)
-                        save_hash = hashlib.sha256(
-                            normalize_saturn_save(data)
-                        ).hexdigest()
-                        empty_card = not list_saturn_archive_names(data)
-                        _set_cached_hash_for_key(
-                            f"{cache_key}|blank",
-                            sv.size,
-                            sv.mtime,
-                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
-                        )
-                    elif sv.system == "MD" and sv.size == _MISTER_MD_SAVE_SIZE:
-                        # Hash the expanded layout the server keeps, or a
-                        # core-written save never matches its own upload.
-                        data = ssh.read_file(sv.remote_path)
-                        save_hash = hashlib.sha256(
-                            _md_from_mister(data)
-                        ).hexdigest()
-                        empty_card = not data.rstrip(b"\xff")
-                        _set_cached_hash_for_key(
-                            f"{cache_key}|blank",
-                            sv.size,
-                            sv.mtime,
-                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
-                        )
-                    elif sv.system == "SEGACD":
-                        # Raw 8 KB internal BRAM — the same bytes Genesis Plus
-                        # GX keeps in a .brm, so it needs no conversion; only
-                        # the "formatted but no saves in it" case matters.
-                        data = ssh.read_file(sv.remote_path)
-                        save_hash = hashlib.sha256(data).hexdigest()
-                        empty_card = _segacd_bram_is_empty(data)
-                        _set_cached_hash_for_key(
-                            f"{cache_key}|blank",
-                            sv.size,
-                            sv.mtime,
-                            _PS1_EMPTY_CARD_MARKER if empty_card else "-",
                         )
                     else:
                         save_hash = ssh.hash_file(sv.remote_path)
@@ -3867,11 +3956,19 @@ def _scan_mister_ssh(
                     _set_cached_hash_for_key(
                         cache_key, sv.size, sv.mtime, save_hash
                     )
-            # The in-card code wins when the card holds a save (variant discs
-            # boot one serial but write another — see the PS1 identity rule);
-            # a disc-serial filename identifies an as-yet-unwritten CD card.
-            if serial or filename_serial:
-                title_id = serial or filename_serial
+            # One shared rule decides the key, so the desktop and the
+            # on-device client always agree: in-card code, then a disc-serial
+            # filename, then a catalogue hit on the game name (serial-keyed
+            # systems only), then the slug.
+            title_id = _mister_saves.resolve_title_id(
+                sv.system,
+                stem,
+                _mister_saves.SaveIdentity(b"", serial=serial,
+                                           is_blank=empty_card,
+                                           serials=serials),
+                title_id,
+                catalog_lookup=_mister_catalog_title_id,
+            )
             # A formatted-but-blank card (PS1 memory card, Saturn or Sega CD
             # backup RAM with no entries) means "here but hasn't saved yet":
             # keep the row visible so a server save can be downloaded into it,
@@ -3984,10 +4081,13 @@ def build_mister_ssh_save_path(
     ``SLPM-86219`` form, which is what the core uses when booting a real CD.
     """
     from mister_ssh import MISTER_SAVES_DIR
-    from systems import mister_system_folder_candidates
+    from systems import mister_system_save_folder_candidates
 
     system = (system or "").upper()
-    candidates = mister_system_folder_candidates(system)
+    # Save folders are not always named after the games folder: the
+    # TurboGrafx-16 core writes CD saves into saves/TGFX16 even though its CD
+    # games live in games/TGFX16-CD.
+    candidates = mister_system_save_folder_candidates(system)
     if not candidates:
         return None
     folder = candidates[0]
@@ -4207,27 +4307,7 @@ _MCD_SLOT_RE = re.compile(r"_\d+$")
 
 # PS1 retail disc product code prefixes (physical/PSN discs, not PSP games).
 # Used to classify PSone Classics inside PSP/PPSSPP SAVEDATA correctly as "PSX".
-_PSX_RETAIL_PREFIXES: frozenset[str] = frozenset(
-    {
-        # North America
-        "SLUS",
-        "SCUS",
-        "PAPX",
-        # Europe
-        "SLES",
-        "SCES",
-        "SCED",
-        # Japan
-        "SLPS",
-        "SLPM",
-        "SCPS",
-        "SCPM",
-        # Other
-        "SLAJ",
-        "SLEJ",
-        "SCAJ",
-    }
-)
+_PSX_RETAIL_PREFIXES: frozenset[str] = _mister_saves.PSX_RETAIL_PREFIXES
 
 _PS1_SERIAL_RE = re.compile(r"^([A-Z]{4})(\d{5,})$")
 
@@ -4781,8 +4861,20 @@ def _resolve_canonical_sync_name(
 def _make_sync_title_id(
     system: str, source_name: str, canonical_name: str | None = None
 ) -> str:
-    """Build the server title ID, preferring a canonical No-Intro name when found."""
-    return _make_title_id_with_region(system, canonical_name or source_name)
+    """Build the server title ID, preferring a canonical No-Intro name when found.
+
+    Dreamcast is keyed by disc serial rather than by name slug (the card devices
+    file saves that way), so its ids go through the DAT; a disc the DAT doesn't
+    know still falls back to the name slug.
+    """
+    name = canonical_name or source_name
+    if (system or "").upper() == "DC":
+        from dreamcast import title_id_for_name
+
+        title_id = title_id_for_name(name)
+        if title_id:
+            return title_id
+    return _make_title_id_with_region(system, name)
 
 
 def _scan_emudeck(
@@ -5474,6 +5566,245 @@ def _scan_memcard_pro(
 # ---------------------------------------------------------------------------
 # Server comparison
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Dreamcast virtual VMUs — MemCard PRO DC and openMenu Serial VMU
+#
+# Both devices store one 128 KB VMU image per game, in a folder named after the
+# disc's Game ID (the IP.BIN "Product number" with dashes and spaces stripped):
+#
+#   MemCard PRO DC   <root>/Dreamcast/MK5106450/MK5106450-1.vmu
+#   openMenu         <serial SD>/OPENMENU/SAVES/MK5106450/SLOT1.VMU
+#                                                         TITLE.TXT
+#
+# Only slot / channel 1 syncs, matching the PS1/PS2/GC MemCard Pro profiles.
+# The payload is a bare VMU image — the same bytes Flycast writes — so it
+# uploads through /raw and interchanges with an emulator profile as long as the
+# title id agrees, which is what ``dreamcast.resolve_save_identity`` arranges.
+#
+# Layout references: https://www.8bitmods.wiki/importing-saves and
+# https://github.com/DerekPascarella/openMenu-Virtual-Folder-Bundle
+# ---------------------------------------------------------------------------
+
+MEMCARD_PRO_DC_DIR = "Dreamcast"
+OPENMENU_SAVES_DIRS = ("OPENMENU", "SAVES")
+
+
+def _child_dir_ci(root: Path, *names: str) -> Optional[Path]:
+    """Walk ``root`` down ``names``, matching each component case-insensitively."""
+    current = root
+    for name in names:
+        found = _child_dir(current, name)
+        if not found.is_dir():
+            return None
+        current = found
+    return current
+
+
+def _vmu_slot_file(folder: Path, preferred_stems: tuple[str, ...]) -> Optional[Path]:
+    """Slot-1 ``.vmu`` inside a per-game folder.
+
+    ``preferred_stems`` are tried in order (case-insensitively).  A folder that
+    holds only higher slots is skipped rather than syncing an arbitrary one —
+    slot 1 is the slot every device fills first.
+    """
+    try:
+        vmus = [
+            f
+            for f in sorted(folder.iterdir())
+            if f.is_file() and f.suffix.lower() == ".vmu"
+        ]
+    except OSError:
+        return None
+    for stem in preferred_stems:
+        for vmu in vmus:
+            if vmu.stem.lower() == stem.lower():
+                return vmu
+    return None
+
+
+def _scan_memcard_pro_dc(
+    root: Path,
+    progress_callback=None,
+    profile_scope: str = "",
+) -> list[SaveFile]:
+    """Scan a MemCard PRO DC microSD for per-game virtual VMUs.
+
+    ``root`` may be the card root (which holds ``Dreamcast/``) or the
+    ``Dreamcast`` folder itself.
+    """
+    from dreamcast import is_game_folder, normalize_game_id, resolve_save_identity
+
+    # Require the Dreamcast folder (or a root that already is it).  Falling back
+    # to the whole root would walk every directory on whatever volume the
+    # profile's drive letter currently points at — card readers reassign those
+    # on every reconnect.
+    base = _child_dir_ci(root, MEMCARD_PRO_DC_DIR)
+    if base is None:
+        base = root if root.name.lower() == MEMCARD_PRO_DC_DIR.lower() else None
+    if base is None or not base.is_dir():
+        return []
+
+    results: list[SaveFile] = []
+    game_dirs = [d for d in sorted(base.iterdir()) if d.is_dir()]
+    total = len(game_dirs)
+    for idx, game_dir in enumerate(game_dirs, start=1):
+        # A real card also holds MemoryCard1 (the shared card for discs with no
+        # GameID) and openmenu (the menu's own VMU) — neither is a game.
+        if not is_game_folder(game_dir.name):
+            continue
+        game_id = normalize_game_id(game_dir.name)
+        slot1 = _vmu_slot_file(game_dir, (f"{game_dir.name}-1", f"{game_id}-1"))
+        if slot1 is None:
+            continue
+        title_id, game_name = resolve_save_identity(game_id)
+        if not title_id:
+            continue
+        results.append(
+            SaveFile(
+                title_id=title_id,
+                path=slot1,
+                hash=_hash_memcard_file_cached(slot1, "DC", title_id),
+                mtime=slot1.stat().st_mtime,
+                system="DC",
+                game_name=game_name,
+                profile_scope=profile_scope,
+            )
+        )
+        if idx == 1 or idx % 25 == 0 or idx == total:
+            _emit_progress(
+                progress_callback,
+                f"Scanning MemCard PRO DC folders. {idx}/{total}",
+                idx,
+                total,
+            )
+    return results
+
+
+def _scan_openmenu_vmu(
+    root: Path,
+    progress_callback=None,
+    profile_scope: str = "",
+) -> list[SaveFile]:
+    """Scan an openMenu Serial VMU SD card for per-game virtual VMUs.
+
+    ``root`` may be the serial SD root (holding ``OPENMENU/SAVES/``), the
+    ``OPENMENU`` folder, or the ``SAVES`` folder itself.
+    """
+    from dreamcast import is_game_folder, normalize_game_id, resolve_save_identity
+
+    # As for the card above: only scan a folder that really is the Serial VMU
+    # store, never a bare drive root.
+    base = _child_dir_ci(root, *OPENMENU_SAVES_DIRS) or _child_dir_ci(
+        root, OPENMENU_SAVES_DIRS[1]
+    )
+    if base is None and root.name.lower() in {d.lower() for d in OPENMENU_SAVES_DIRS}:
+        base = root
+    if base is None or not base.is_dir():
+        return []
+
+    results: list[SaveFile] = []
+    game_dirs = [d for d in sorted(base.iterdir()) if d.is_dir()]
+    total = len(game_dirs)
+    for idx, game_dir in enumerate(game_dirs, start=1):
+        if not is_game_folder(game_dir.name):
+            continue
+        game_id = normalize_game_id(game_dir.name)
+        slot1 = _vmu_slot_file(game_dir, ("SLOT1", f"{game_dir.name}-1"))
+        if slot1 is None:
+            continue
+        title_id, game_name = resolve_save_identity(
+            game_id, _openmenu_title_label(game_dir)
+        )
+        if not title_id:
+            continue
+        results.append(
+            SaveFile(
+                title_id=title_id,
+                path=slot1,
+                hash=_hash_memcard_file_cached(slot1, "DC", title_id),
+                mtime=slot1.stat().st_mtime,
+                system="DC",
+                game_name=game_name,
+                profile_scope=profile_scope,
+            )
+        )
+        if idx == 1 or idx % 25 == 0 or idx == total:
+            _emit_progress(
+                progress_callback,
+                f"Scanning openMenu Serial VMU folders. {idx}/{total}",
+                idx,
+                total,
+            )
+    return results
+
+
+def _openmenu_title_label(game_dir: Path) -> str:
+    """openMenu's own display name for a game folder (``TITLE.TXT``)."""
+    for entry in (game_dir / "TITLE.TXT", game_dir / "title.txt"):
+        if entry.is_file():
+            try:
+                return entry.read_text(encoding="utf-8", errors="ignore").strip()
+            except OSError:
+                return ""
+    return ""
+
+
+def build_dreamcast_vmu_path(profile: dict, title_id: str) -> Optional[Path]:
+    """Local destination for a server-only Dreamcast save, or ``None``.
+
+    Needs a Game ID: these folders are named after the disc, not the game, so a
+    title the Dreamcast DAT can't resolve has nowhere to go and the caller falls
+    back to a manual download.  An existing folder for any of the title's Game
+    IDs wins over creating a new one, so a downloaded save lands in the folder
+    the console already writes to instead of beside it.
+    """
+    from dreamcast import game_ids_for_title_id
+
+    device_type = str(profile.get("device_type", "")).strip()
+    game_ids = game_ids_for_title_id(title_id)
+    if not game_ids:
+        return None
+
+    if device_type == "openMenu":
+        root_str = profile.get("save_folder") or profile.get("path", "")
+        if not root_str:
+            return None
+        root = Path(root_str)
+        base = (
+            _child_dir_ci(root, *OPENMENU_SAVES_DIRS)
+            or _child_dir_ci(root, OPENMENU_SAVES_DIRS[1])
+            or root.joinpath(*OPENMENU_SAVES_DIRS)
+        )
+        for game_id in game_ids:
+            existing = _child_dir(base, game_id)
+            if existing.is_dir():
+                return existing / "SLOT1.VMU"
+        return base / game_ids[0] / "SLOT1.VMU"
+
+    root_str = profile.get("path") or profile.get("save_folder", "")
+    if not root_str:
+        return None
+    root = Path(root_str)
+    base = _child_dir_ci(root, MEMCARD_PRO_DC_DIR) or root / MEMCARD_PRO_DC_DIR
+    for game_id in game_ids:
+        existing = _child_dir(base, game_id)
+        if existing.is_dir():
+            return existing / f"{existing.name}-1.vmu"
+    return base / game_ids[0] / f"{game_ids[0]}-1.vmu"
+
+
+def finalize_openmenu_download(path: Path, game_name: str) -> None:
+    """Write openMenu's ``TITLE.TXT`` next to a freshly downloaded Serial VMU."""
+    label = str(game_name or "").strip()
+    if not label:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / "TITLE.TXT").write_text(label + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def compare_with_server(

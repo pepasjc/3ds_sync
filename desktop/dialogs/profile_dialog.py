@@ -40,12 +40,18 @@ SINGLE_SYSTEM_DEVICES = {
     "SAROO",
     "MemCard Pro",
     "MemCard Pro FTP",
+    "MemCard Pro DC",
     "PSIO",
     "CD Folder",
     "OPL",
+    "GDEMU",
+    "openMenu",
 }
 MEMCARD_PRO_SYSTEMS = ["PS1", "PS2", "GC", "DC"]
 MEMCARD_PRO_FTP_SYSTEMS = ["PS1", "PS2", "GC"]
+# Dreamcast-only profiles: the two ODE menus (GDEMU / openMenu) and the
+# Dreamcast card manager.  All three are keyed by the disc's Game ID.
+DREAMCAST_DEVICES = {"GDEMU", "openMenu", "MemCard Pro DC"}
 
 # MiSTer ROM install destination.  "local" is the classic mounted-card mode
 # (Game Folder path on this PC); "sd"/"usb" install over the network via the
@@ -127,6 +133,9 @@ DEVICE_SYSTEMS: dict[str, list[str]] = {
         "SAT",
     ],
     "EmuDeck": list(SYSTEM_CHOICES),
+    # Super SD System 3 (TerraOnion PC Engine ODE): HuCard/ holds cartridge
+    # dumps, Cd/<Game>/ holds CUE/BIN discs, bup/ holds every save.
+    "Super SD System 3": ["PCECD", "PCE", "PCSG"],
 }
 
 # Default save extension per multi-system device type
@@ -136,6 +145,7 @@ DEVICE_DEFAULT_EXT: dict[str, str] = {
     "Analogue Pocket": ".sav",
     "Pocket (openFPGA)": ".sav",
     "EmuDeck": ".srm",
+    "Super SD System 3": ".bup",
 }
 
 SAVE_EXT_OPTIONS = SAVE_EXT_CHOICES   # UI save-extension dropdown list
@@ -641,7 +651,11 @@ class ProfileDialog(QDialog):
         is_psio = device_type == "PSIO"
         is_saroo = device_type == "SAROO"
         is_opl = device_type == "OPL"
+        is_supersd3 = device_type == "Super SD System 3"
         is_mister = device_type == "MiSTer"
+        is_gdemu = device_type == "GDEMU"
+        is_openmenu = device_type == "openMenu"
+        is_memcard_dc = device_type == "MemCard Pro DC"
         self._mister_target_label.setVisible(is_mister)
         self.mister_target_combo.setVisible(is_mister)
         for widget in (
@@ -683,11 +697,20 @@ class ProfileDialog(QDialog):
             folder_label = "Remote Root:"
         elif is_memcard:
             folder_label = "Root Folder:"
-        elif is_psio:
+        elif is_psio or is_supersd3:
             folder_label = "SD Card Root:"
         elif is_opl:
             folder_label = "USB Root:"
+        elif is_gdemu or is_openmenu:
+            folder_label = "GDEMU SD Root:"
+        elif is_memcard_dc:
+            folder_label = "Root Folder:"
         self._game_folder_label.setText(folder_label)
+        self.multi_save_folder_edit.setPlaceholderText(
+            "Leave empty — saves always live in <root>/bup"
+            if is_supersd3
+            else "Leave empty — saves co-located with game folder"
+        )
         self._single_save_row_label.setVisible(not is_memcard_ftp)
         self._single_save_row_widget.setVisible(not is_memcard_ftp)
         if is_memcard_ftp:
@@ -713,12 +736,39 @@ class ProfileDialog(QDialog):
             self.single_save_folder_edit.setPlaceholderText(
                 "Mednafen save folder (optional — for emulator sync)"
             )
+        elif is_supersd3:
+            self.game_folder_edit.setPlaceholderText(
+                "Super SD System 3 SD card root (contains HuCard/, Cd/, bup/)…"
+            )
         elif is_opl:
             self.game_folder_edit.setPlaceholderText(
                 "OPL USB root (DVD/, CD/ and POPS/ created here)…"
             )
             self.single_save_folder_edit.setPlaceholderText(
                 "Leave empty — OPL VMCs managed separately"
+            )
+        elif is_gdemu:
+            self.game_folder_edit.setPlaceholderText(
+                "GDEMU SD card root (01/ holds the menu, games go in 02/, 03/, …)"
+            )
+            self.single_save_folder_edit.setPlaceholderText(
+                "Leave empty — GDEMU stores no saves; sync them with an "
+                "openMenu or MemCard PRO DC profile"
+            )
+        elif is_openmenu:
+            self.game_folder_edit.setPlaceholderText(
+                "GDEMU SD card root (01/ holds the openMenu disc)…"
+            )
+            self.single_save_folder_edit.setPlaceholderText(
+                "Serial SD adapter root (holds OPENMENU/SAVES/) — required to "
+                "sync Serial VMUs"
+            )
+        elif is_memcard_dc:
+            self.game_folder_edit.setPlaceholderText(
+                "MemCard PRO DC microSD root (holds Dreamcast/)…"
+            )
+            self.single_save_folder_edit.setPlaceholderText(
+                "Leave empty — not used for MemCard PRO DC"
             )
         else:
             self.game_folder_edit.setPlaceholderText("Root game / ROM folder...")
@@ -747,6 +797,16 @@ class ProfileDialog(QDialog):
         # SAROO is always SAT; lock system and hide save-ext picker
         if is_saroo and not self._loading:
             self._apply_single_system_defaults("SAT")
+
+        # GDEMU / openMenu / MemCard PRO DC are Dreamcast-only.  Auto resolves
+        # to GDI for the ODEs (GDEMU cannot read CHD).
+        if device_type in DREAMCAST_DEVICES and not self._loading:
+            self._apply_single_system_defaults("DC")
+            idx = self.rom_format_combo.findText(
+                ROM_FORMAT_LABELS.get("auto", "Auto")
+            )
+            if idx >= 0:
+                self.rom_format_combo.setCurrentIndex(idx)
 
         self._on_mister_target_changed()
 
@@ -778,6 +838,8 @@ class ProfileDialog(QDialog):
             choices = ["PS1"]
         elif device_type == "OPL":
             choices = ["PS2", "PS1"]
+        elif device_type in DREAMCAST_DEVICES:
+            choices = ["DC"]
         else:
             choices = SYSTEM_CHOICES
         self.system_combo.blockSignals(True)
@@ -798,7 +860,8 @@ class ProfileDialog(QDialog):
             "PS1": ".mcd",
             "PS2": ".mc2",
             "GC": ".raw",
-            "DC": ".bin",
+            # MemCard PRO DC and openMenu both store bare 128 KB VMU images.
+            "DC": ".vmu",
             "SAT": ".bkr",
         }.get(system)
         if default_ext:
@@ -1150,11 +1213,12 @@ class ProfileDialog(QDialog):
             if device_type == "MiSTer" and self.ssh_host_edit.text().strip():
                 self.accept()
                 return
-            message = (
-                "Root folder path is required."
-                if device_type == "MemCard Pro"
-                else "Game folder path is required."
-            )
+            if device_type in {"MemCard Pro", "MemCard Pro DC"}:
+                message = "Root folder path is required."
+            elif device_type in {"GDEMU", "openMenu"}:
+                message = "GDEMU SD card root is required."
+            else:
+                message = "Game folder path is required."
             QMessageBox.warning(self, "Validation", message)
             return
         self.accept()

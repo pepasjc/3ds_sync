@@ -1098,6 +1098,7 @@ class SyncTab(QWidget):
                     "MemCard Pro",
                     "MemCard Pro FTP",
                 }
+                is_openmenu = profile.get("device_type") == "openMenu"
                 save_exists = getattr(st.save, "save_exists", True)
                 if (
                     st.status in ("local_newer", "not_on_server")
@@ -1175,6 +1176,10 @@ class SyncTab(QWidget):
                             "PS2",
                         }:
                             self._finalize_memcard_pro_download(
+                                dest_path, st.save.game_name
+                            )
+                        if is_openmenu:
+                            self._finalize_openmenu_download(
                                 dest_path, st.save.game_name
                             )
                         self._update_row_status(idx, "up_to_date", new_path=dest_path)
@@ -1330,6 +1335,13 @@ class SyncTab(QWidget):
         from sync_engine import finalize_memcard_pro_download
 
         finalize_memcard_pro_download(path, game_name)
+
+    def _finalize_openmenu_download(self, path, game_name: str):
+        """Label a downloaded Serial VMU so openMenu shows the game's name."""
+        from sync_engine import finalize_openmenu_download
+
+        if isinstance(path, Path):
+            finalize_openmenu_download(path, game_name)
 
     def _finalize_saroo_download(
         self, title_id: str, bkr_path: Path, profile: dict
@@ -1526,6 +1538,19 @@ class SyncTab(QWidget):
 
         if device_type == "MemCard Pro FTP":
             return build_memcard_pro_ftp_path(profile, st.save.title_id, system)
+
+        if device_type in ("MemCard Pro DC", "openMenu") or (
+            device_type == "MemCard Pro" and system == "DC"
+        ):
+            # Both layouts name the game folder after the disc's Game ID, so a
+            # title the Dreamcast DAT can't resolve returns None and the user
+            # downloads it by hand.
+            from sync_engine import build_dreamcast_vmu_path
+
+            return build_dreamcast_vmu_path(profile, st.save.title_id)
+
+        if device_type == "GDEMU":
+            return None  # ROM-install profile — no save storage on the card
 
         if device_type == "SAROO":
             # For server-only downloads, prefer the mednafen save folder so the

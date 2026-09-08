@@ -491,6 +491,7 @@ SAVE_EXTENSIONS: frozenset[str] = frozenset(
         ".fs",     # Freeze state (some emulators)
         ".rtc",    # Real-time clock data
         ".raw",    # Raw save (some emulators)
+        ".bup",    # PC Engine backup RAM (Super SD System 3)
     }
 )
 
@@ -507,6 +508,8 @@ SAVE_EXT_CHOICES: list[str] = [
     ".mc2",    # PS2
     ".ps2",    # PS2 alternate
     ".dsv",    # NDS DeSmuME
+    ".bup",    # PC Engine BRAM (Super SD System 3)
+    ".vmu",    # Dreamcast VMU image (MemCard PRO DC, openMenu Serial VMU)
     ".frz",
     ".fs",
     ".raw",
@@ -830,6 +833,12 @@ SYNC_ID_RULES: dict[str, dict[str, str]] = {
     "VITA": {"strategy": "serial"},
     # Sega Saturn — "T-NNNNNG" product codes match Saroo and emulators
     "SAT":  {"strategy": "serial"},
+    # Sega Dreamcast — the IP.BIN product number ("T-1249M", "MK-51000").  It is
+    # what MemCard PRO DC and openMenu's Serial VMU name their per-game folders
+    # after, so keying by it puts a card save and an emulator save in one slot.
+    # Prefixed like Saturn's because a bare code such as "51000" says nothing
+    # about which console it belongs to.
+    "DC":   {"strategy": "serial", "prefix": "DC_"},
     # Everything else: slug.  Listed explicitly so the rule set is a complete
     # declaration rather than relying on a default, and so a reader can
     # confirm "yes, SNES really does use slug".
@@ -846,7 +855,6 @@ SYNC_ID_RULES: dict[str, dict[str, str]] = {
     "CPS1":     {"strategy": "slug"},
     "CPS2":     {"strategy": "slug"},
     "CPS3":     {"strategy": "slug"},
-    "DC":       {"strategy": "slug"},
     "FBA":      {"strategy": "slug"},
     "FBNEO":    {"strategy": "slug"},
     "FDS":      {"strategy": "slug"},
