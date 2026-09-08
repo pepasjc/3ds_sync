@@ -527,8 +527,9 @@ class App:
             hints = [(primary, "Change"), (back, "Exit"), (tabs, "Tab")]
         else:
             hints = [(primary, "Sync / install"), (back, "Exit"),
-                     (sync, "Sync all"),
-                     (alt, "Rescan"), (systems, "System"), (tabs, "Tab")]
+                     (sync, "Delete save"),
+                     (alt, "Rescan / sync all"), (systems, "System"),
+                     (tabs, "Tab")]
 
         if metrics.compact:
             # 240p has room for about four hints; keep the ones that are not
@@ -684,6 +685,9 @@ class App:
                 self.do_run_queue()
             elif self.tab == 2:
                 self.do_delete_installed()
+            elif self.tab == 0:
+                # Same button deletes on Installed; keep the two tabs alike.
+                self.do_delete_save()
             else:
                 self.do_sync()
         elif action == gsinput.PRIMARY:
@@ -710,7 +714,16 @@ class App:
                 self.load_data()
                 self.draw_all()
             else:
-                self.do_rescan()
+                # Sync-all lost its own button to Delete, so it lives here
+                # beside Rescan - both start with the same scan anyway.
+                choice = self.choose("Saves", ["Rescan", "Sync all"],
+                                     title="Saves")
+                if choice == 0:
+                    self.do_rescan()
+                elif choice == 1:
+                    self.do_sync()
+                else:
+                    self.draw_all()
         elif action == gsinput.SETTINGS:
             self.set_tab(TABS.index("Settings") - self.tab)
         elif action in (gsinput.BACK, gsinput.QUIT):
@@ -1863,6 +1876,62 @@ class App:
                     dst.write(src.read())
             except OSError:
                 pass
+
+    def do_delete_save(self) -> None:
+        """X on Saves: remove the highlighted save file from this MiSTer.
+
+        The way out when leftover cards from earlier variants of a game
+        (``Snatcher (Japan).sav``, ``... [T-En v0.4].sav``) keep claiming
+        the server slot, so the copy for the variant actually installed
+        can never be downloaded. Nothing on the server is touched.
+        """
+        if self.tab != 0:
+            return
+        rows = self.rows()
+        if not rows or self.selected >= len(rows):
+            return
+        entry = rows[self.selected].ref
+        if entry is None or not entry.path or not os.path.exists(entry.path):
+            self.toast("Nothing on this MiSTer to delete for %s"
+                       % (entry.display if entry else "this row"))
+            time.sleep(1.5)
+            self.draw_all()
+            return
+
+        detail = [entry.path, "This cannot be undone."]
+        # Say plainly when the server does not hold what is about to go.
+        if entry.status in (gssync.UPLOAD, gssync.CONFLICT):
+            detail.insert(1, "This save has progress the server does not.")
+        elif entry.status == gssync.LOCAL:
+            detail.insert(1, "Not compared with the server yet.")
+        elif entry.status == gssync.SYNCED:
+            detail.insert(1, "The server holds an identical copy.")
+        elif entry.status == gssync.DOWNLOAD:
+            detail.insert(1, "The server holds a newer copy.")
+        if not self.confirm("Delete the save for %s?" % entry.display,
+                            detail, title="Delete save"):
+            self.draw_all()
+            return
+
+        try:
+            os.remove(entry.path)
+        except OSError as exc:
+            self.toast("Delete failed: %s" % exc, theme.DANGER)
+            time.sleep(2.5)
+            self.draw_all()
+            return
+        if entry in self.engine.entries:
+            self.engine.entries.remove(entry)
+        self.toast("Deleted %s" % os.path.basename(entry.path))
+        time.sleep(1.0)
+        # The slot may now be server-only, or belong to a sibling card:
+        # let the scan and the plan say so rather than guessing. Stay
+        # where the cursor was - the next leftover is usually right there.
+        keep = (self.selected, self.scroll)
+        self.do_rescan()
+        self.selected, self.scroll = keep
+        self._clamp_cursor()
+        self.draw_all()
 
     def do_sync_selected(self) -> None:
         """A: sync just the highlighted save."""
