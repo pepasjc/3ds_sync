@@ -14,6 +14,49 @@ import traceback
 LOG_PATH = "/media/fat/Scripts/.config/gamesync/gamesync.log"
 
 
+class QuietConsole:
+    """Keep the script VT from echoing while the framebuffer is ours.
+
+    MiSTer translates pad presses into keyboard events as well, and the
+    console we were started on (tty2) keeps echoing them - every D-pad
+    press lands as an escape sequence on a screen we have painted over.
+    They all show up the moment the framebuffer is handed back, as a wall
+    of ``^[[A^[[B`` above the prompt. So while the app runs the tty has
+    echo and line editing off, and on the way out whatever queued up is
+    flushed and the screen cleared, so the console comes back blank.
+    """
+
+    def __init__(self, fd=0):
+        self.fd = fd
+        self._saved = None
+
+    def __enter__(self):
+        try:
+            import termios
+
+            if not os.isatty(self.fd):
+                return self
+            self._saved = termios.tcgetattr(self.fd)
+            attrs = termios.tcgetattr(self.fd)
+            attrs[3] &= ~(termios.ECHO | termios.ICANON)
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        except Exception:
+            self._saved = None
+        return self
+
+    def __exit__(self, *_exc):
+        if self._saved is None:
+            return
+        try:
+            import termios
+
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+            termios.tcsetattr(self.fd, termios.TCSANOW, self._saved)
+            os.write(self.fd, b"\033[2J\033[H")
+        except Exception:
+            pass
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     os.environ.setdefault("TERM", "linux")
@@ -65,10 +108,12 @@ def main(argv=None):
             calibrate = True
 
     try:
-        app = App()
-        app.run(timeout=timeout, start_tab=start_tab,
-                show_conflict=show_conflict, calibrate=calibrate,
-                demo_confirm=demo_confirm, demo_choose=demo_choose)
+        with QuietConsole():
+            app = App()
+            app.run(timeout=timeout, start_tab=start_tab,
+                    show_conflict=show_conflict, calibrate=calibrate,
+                    demo_confirm=demo_confirm, demo_choose=demo_choose)
+            app.close()
     except Exception:
         report = traceback.format_exc()
         try:

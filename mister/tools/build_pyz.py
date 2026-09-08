@@ -50,7 +50,19 @@ LAUNCHER = """#!/usr/bin/env bash
 set -u
 export TERM="${TERM:-linux}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "${DIR}/.gamesync/gamesync.pyz" "$@"
+python3 "${DIR}/.gamesync/gamesync.pyz" "$@"
+status=$?
+
+# When a script ends, MiSTer leaves its console on screen until a key is
+# pressed. The app has already drawn its own goodbye, so on a clean exit
+# ask MiSTer to go straight back to the menu instead. A crash (non-zero)
+# keeps the console so the traceback can be read, and so do the text
+# subcommands. GAMESYNC_STAY=1 opts out for the SSH dev loop.
+case " $* " in *" --selftest "*) stay=1 ;; *) stay="${GAMESYNC_STAY:-0}" ;; esac
+if [ "$status" -eq 0 ] && [ "$stay" != 1 ] && [ -w /dev/MiSTer_cmd ]; then
+    echo "load_core /media/fat/menu.rbf" > /dev/MiSTer_cmd
+fi
+exit "$status"
 """
 
 MAIN = """import sys
