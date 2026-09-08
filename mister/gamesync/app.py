@@ -140,6 +140,8 @@ class App:
             self.tab = 0
             self.selected = 0
             self.scroll = 0
+            #: (selected, scroll) per tab, restored when you come back to it.
+            self.tab_positions: dict[int, tuple[int, int]] = {}
             self.system_filter = 0
             self.running = True
             #: Set by run(); any modal loop checks it so --timeout bounds them
@@ -221,7 +223,7 @@ class App:
 
         queued = [
             Row(item.system, item.name,
-                _progress_text(item), item.status)
+                _progress_text(item), item.status, ref=item)
             for item in self.queue.items
         ]
 
@@ -514,7 +516,11 @@ class App:
             hints = [(primary, "Move SD/USB"), (back, "Exit"), (sync, "Delete"),
                      (alt, "Refresh"), (systems, "System"), (tabs, "Tab")]
         elif self.tab == 3:
-            hints = [(primary, "Download"), (back, "Exit"),
+            rows = self.rows()
+            failed = (rows and self.selected < len(rows)
+                      and rows[self.selected].status == gsdownloads.FAILED)
+            hints = [(primary, "Retry" if failed else "Download"),
+                     (back, "Exit"),
                      (sync, "Download all"), (alt, "Clear done"),
                      (systems, "System"), (tabs, "Tab")]
         elif self.tab == 4:
@@ -608,16 +614,35 @@ class App:
         self.move(target - self.selected)
 
     def set_tab(self, delta: int) -> None:
+        # Each tab keeps its own cursor: glancing at Downloads and coming
+        # back should land on the game you were looking at, not row one.
+        self.tab_positions[self.tab] = (self.selected, self.scroll)
         self.tab = (self.tab + delta) % len(TABS)
-        self.selected = 0
-        self.scroll = 0
+        self.selected, self.scroll = self.tab_positions.get(self.tab, (0, 0))
         self._resync_system_filter()
         self._rows_key = None
+        self._clamp_cursor()
         self.draw_all()
         # The catalogue can be thousands of rows, so it is fetched the first
         # time it is actually looked at rather than on startup.
         if self.tab == 1 and not self.catalog and self.client is not None:
             self.load_catalog()
+
+    def _clamp_cursor(self) -> None:
+        """Keep a remembered cursor inside the rows the tab has now: the list
+        may have shrunk (a download cleared, a game deleted) since it was
+        last looked at."""
+        count = len(self.rows())
+        if count == 0:
+            self.selected = self.scroll = 0
+            return
+        self.selected = max(0, min(count - 1, self.selected))
+        visible = self.metrics.visible_rows
+        self.scroll = max(0, min(self.scroll, max(0, count - visible)))
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        elif self.selected >= self.scroll + visible:
+            self.scroll = self.selected - visible + 1
 
     def set_system(self, delta: int) -> None:
         systems = self.systems
@@ -667,7 +692,7 @@ class App:
             elif self.tab == 2:
                 self.do_move_installed()
             elif self.tab == 3:
-                self.do_run_queue()
+                self.do_download_action()
             elif self.tab == 4:
                 self.do_settings_action()
             else:
@@ -1130,6 +1155,22 @@ class App:
         # Only if it actually landed: a failed download leaves nothing to
         # write the save into.
         return self.game_installed(group)
+
+    def do_download_action(self) -> None:
+        """A on Downloads: retry the selected failure, else run the queue."""
+        rows = self.rows()
+        item = rows[self.selected].ref if rows and self.selected < len(rows) \
+            else None
+        if item is not None and item.status == gsdownloads.FAILED:
+            if not self.queue.retry(item):
+                self.toast("Still no MiSTer folder for %s" % item.system,
+                           theme.DANGER)
+                time.sleep(2.0)
+                self.draw_all()
+                return
+            self.load_data()
+            self.draw_all()
+        self.do_run_queue()
 
     def do_run_queue(self) -> None:
         """X on Catalog or Downloads: download everything queued."""

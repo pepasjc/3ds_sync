@@ -94,10 +94,16 @@ class DownloadQueue:
             self.items = []
             return
         items = []
+        dropped = 0
         for raw in data.get("downloads", []) if isinstance(data, dict) else []:
             try:
                 item = Download.from_dict(raw)
             except TypeError:
+                continue
+            # A finished download is history by the next run; the game is on
+            # the Installed tab now. Queued and failed ones are still work.
+            if item.status in (DONE, CANCELLED):
+                dropped += 1
                 continue
             # Anything caught mid-flight last run is resumable, not lost: the
             # .part file is still there and Range picks up where it stopped.
@@ -105,6 +111,8 @@ class DownloadQueue:
                 item.status = QUEUED
             items.append(item)
         self.items = items
+        if dropped:
+            self.save()
 
     def save(self):
         payload = {"downloads": [item.to_dict() for item in self.items]}
@@ -170,6 +178,31 @@ class DownloadQueue:
         if item in self.items:
             self.items.remove(item)
             self.save()
+
+    def retry(self, item):
+        """Put a failed download back in the queue. Returns True if it was.
+
+        Whatever ``.part`` the failed attempt left is kept: the next run
+        resumes from it with a Range request rather than starting over.
+        A download that failed before it had a destination (no core folder
+        for the system) is re-resolved, since that is what installing the
+        core - or switching ROM target - fixes.
+        """
+        if item.status != FAILED:
+            return False
+        if not item.target:
+            directory, target_name = install_target(
+                self.provider, item.system, item.filename, item.name,
+                self.rom_target)
+            if not directory:
+                return False
+            item.directory = directory
+            item.filename = target_name
+            item.target = posixpath.join(directory, target_name)
+        item.status = QUEUED
+        item.error = ""
+        self.save()
+        return True
 
     # --------------------------------------------------------------- transfer
 
