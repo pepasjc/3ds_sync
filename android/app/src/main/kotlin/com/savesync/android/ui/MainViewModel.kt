@@ -2626,6 +2626,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 // Refresh server meta after a sync
                 fetchServerMeta(entry.titleId, entry.systemName)
+                // A download materialises a server-only row into a local save;
+                // rescan so the list stops treating it as "nothing local" — the
+                // stale flag is what made a later smart sync overwrite newer play.
+                if (result.uploaded > 0 || result.downloaded > 0) scanSaves()
                 _saveDetailState.value = SaveDetailState.Success(msg.trim())
             } catch (e: Exception) {
                 _saveDetailState.value = SaveDetailState.Error(e.message ?: "Sync failed")

@@ -1818,8 +1818,18 @@ class App:
             danger = True
         else:
             question = "Download %s?" % entry.display
-            detail = ["Not on this MiSTer yet - nothing is overwritten."]
-            danger = False
+            # The row says nothing is here, but the file it would be written
+            # to may exist under another title id (a card the scan keyed by
+            # a different serial, or a save made since the last scan).
+            target = self.engine.download_target(entry)
+            if target and os.path.exists(target):
+                detail = ["A file already exists at the destination:",
+                          os.path.basename(target),
+                          "It will be overwritten."]
+                danger = True
+            else:
+                detail = ["Not on this MiSTer yet - nothing is overwritten."]
+                danger = False
         if entry.message:
             # Where the two copies disagree, when the engine compared them.
             detail.append(entry.message[0].upper() + entry.message[1:])

@@ -102,7 +102,11 @@ fun SaveDetailScreen(
     val saturnArchivePickerState by viewModel.saturnArchivePicker.collectAsState()
     val saturnArchiveSelectionVersion by viewModel.saturnArchiveSelectionVersion.collectAsState()
 
-    val entry = saves.find { it.titleId == titleId }
+    // The scanned list can lag behind disk (a download since the last scan, or
+    // the emulator writing the predicted card while we sat in the background).
+    // Re-check so a save that really exists gets a hash, an enabled upload, and
+    // a three-way sync instead of an unconditional download.
+    val entry = saves.find { it.titleId == titleId }?.reconcileWithDisk()
     val syncState = syncStateEntities.find { it.titleId == titleId }
 
     // Auto-fetch server metadata when screen opens

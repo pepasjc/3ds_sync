@@ -70,6 +70,31 @@ data class SaveEntry(
         }
     }
 
+    /**
+     * A server-only entry is a prediction: "if this save were downloaded, it
+     * would land at [saveFile] / [saveDir]".  Once that path really exists —
+     * after a download, or because the emulator wrote it while the scanned list
+     * was stale — the prediction is a real local save and must be treated as
+     * one.  Left as-is, [exists] and [computeHash] keep answering "nothing
+     * local", so the detail screen shows no hash, disables upload, and a smart
+     * sync downloads straight over newer play.
+     *
+     * Shared Saturn containers (YabaSanshiro `backup.bin`) hold many games and
+     * are deliberately kept server-only; SyncEngine handles them through the
+     * archive-selection path.  A predicted directory only counts once it holds
+     * at least one file, so an empty folder does not turn into an "empty save".
+     */
+    fun reconcileWithDisk(): SaveEntry {
+        if (!isServerOnly) return this
+        if (systemName == "SAT" && saveFile?.name.equals("backup.bin", ignoreCase = true)) return this
+        val onDisk = when {
+            saveDir != null -> saveDir.isDirectory && saveDir.walkTopDown().any { it.isFile }
+            saveFile != null -> saveFile.isFile
+            else -> false
+        }
+        return if (onDisk) copy(isServerOnly = false) else this
+    }
+
     fun exists(): Boolean {
         if (isServerOnly) return false
         return when {

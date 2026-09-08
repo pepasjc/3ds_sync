@@ -224,3 +224,25 @@ def test_sync_plan_asks_about_each_slot_once(tmp_path, monkeypatch):
 def test_disc_card_detection(stem, is_cd):
     from shared.mister_saves import ps1_serial_from_filename
     assert (ps1_serial_from_filename(stem) is not None) is is_cd
+
+
+def test_server_only_row_still_guards_the_card_at_its_destination(tmp_path, monkeypatch):
+    """A "server only" row carries no path, but the file a download would be
+    written to may already be a card the scan keyed under another serial.
+    The shared-card guard must run against that destination, not be skipped
+    because the row itself says nothing is here."""
+    engine = make_engine(tmp_path, monkeypatch, {ISO: ps1_card(SAVE_V1)})
+    existing = by_stem(engine, ISO)
+    # Server: a card for the same slot that lacks this game's save entirely.
+    engine.client.uploaded["SLUS01279"] = (ps1_card([("BASLUS-99999-OTHER", 0x33)]), "")
+    monkeypatch.setattr(gssync, "build_save_path",
+                        lambda *a, **k: existing.path)
+    engine._catalog_lookup = None
+    ghost = gssync.SaveEntry(
+        "SLUS01279", "PS1", ISO, "", 0, 0.0, "", gssync.SERVER_ONLY,
+        exists=False, is_blank=False)
+
+    with pytest.raises(RuntimeError, match="would delete yours"):
+        engine._download(ghost)
+    assert read(existing) == ps1_card(SAVE_V1)
+    assert engine.download_target(ghost) == existing.path

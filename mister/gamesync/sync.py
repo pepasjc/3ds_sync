@@ -707,6 +707,17 @@ class SyncEngine:
         self._remember(entry.title_id, entry.hash)
         return True
 
+    def download_target(self, entry):
+        """Where a download of ``entry`` would be written, or "" if nowhere.
+
+        A "server only" row has no path of its own; the predicted one may
+        already hold a file the scan filed under a different title id, so
+        callers must not assume it is free.
+        """
+        return entry.path or build_save_path(
+            self.provider, entry.system, entry.title_id, entry.name,
+            catalog_lookup=self._catalog_lookup) or ""
+
     def _download(self, entry, progress=None, allow_data_loss=False):
         if progress:
             progress("Downloading %s" % entry.display)
@@ -716,11 +727,18 @@ class SyncEngine:
             entry.message = "server has no save"
             return False
 
-        if entry.system == "PS1" and entry.path and not allow_data_loss:
+        # Resolve the destination before any safety check (see download_target).
+        target = self.download_target(entry)
+        if not target:
+            entry.message = "no place to write it - is the game installed?"
+            entry.status = ERROR
+            return False
+
+        if entry.system == "PS1" and not allow_data_loss:
             # A memory card is shared between games. Writing the server's copy
             # over it would delete every save the server does not have.
             try:
-                local = self.provider.read(entry.path)
+                local = self.provider.read(target)
             except OSError:
                 local = b""
             if local:
@@ -736,14 +754,6 @@ class SyncEngine:
                     # share the card. Recorded so it is visible afterwards.
                     entry.message = ("replaced the card; %d save(s) for other "
                                      "games were not on the server" % len(others))
-
-        target = entry.path or build_save_path(
-            self.provider, entry.system, entry.title_id, entry.name,
-            catalog_lookup=self._catalog_lookup)
-        if not target:
-            entry.message = "no place to write it - is the game installed?"
-            entry.status = ERROR
-            return False
 
         # Convert to whatever shape the core expects before writing.
         data = _to_device_format(entry.system, payload)

@@ -92,7 +92,10 @@ class SyncEngine(
     }
 
     suspend fun sync(saves: List<SaveEntry>): SyncResult {
-        val resolvedSaves = normalizeCanonicalSlugEntries(saves)
+        // The list may predate a download or an emulator session: a "server-only"
+        // row whose predicted file now exists is a local save with possibly newer
+        // play on it, and must go through the three-way check, not a blind download.
+        val resolvedSaves = normalizeCanonicalSlugEntries(saves.map { it.reconcileWithDisk() })
         val errors = mutableListOf<String>()
         var uploaded = 0
         var downloaded = 0
@@ -398,7 +401,10 @@ class SyncEngine(
      */
     private fun isTreeBundleEntry(entry: SaveEntry): Boolean = entry.isTreeSaveDir
 
-    suspend fun uploadSave(entry: SaveEntry): Boolean {
+    suspend fun uploadSave(rawEntry: SaveEntry): Boolean {
+        // A stale server-only flag would make readBytes()/computeHash() return
+        // nothing and upload an empty save.
+        val entry = rawEntry.reconcileWithDisk()
         if (isSharedYabaSanshiroContainer(entry)) {
             autoResolveSharedSaturnArchives(entry)
         }
@@ -799,7 +805,7 @@ class SyncEngine(
     }
 
     suspend fun recordSyncedState(entry: SaveEntry) {
-        updateSyncState(entry)
+        updateSyncState(entry.reconcileWithDisk())
     }
 
     suspend fun recordSyncedStateFromFile(entry: SaveEntry) {

@@ -1043,8 +1043,7 @@ class SyncTab(QWidget):
         # already part of the current selection.
         self.table.selectRow(row)
         st = self._statuses[status_idx]
-        save_exists = getattr(st.save, "save_exists", True)
-        has_local = st.save.path is not None and save_exists
+        has_local = self._has_local_file(st)
         has_server = bool(st.server_hash) or st.status == "server_only"
 
         menu = QMenu(self)
@@ -1072,6 +1071,42 @@ class SyncTab(QWidget):
     def _sync_selected(self):
         self._do_sync(self._selected_status_indices())
 
+    def _has_local_file(self, st) -> bool:
+        """Whether a local save exists *now* — the scan-time flag, or a file
+        that appeared at the expected path since (emulator wrote it)."""
+        if not st.save.path:
+            return False
+        if getattr(st.save, "save_exists", True):
+            return True
+        try:
+            return Path(st.save.path).is_file()
+        except OSError:
+            return False
+
+    def _local_changed_since_scan(self, st, path: Path | None = None) -> bool:
+        """True when the local file no longer matches what the scan recorded.
+
+        The table is a snapshot: a save the emulator created or rewrote since
+        the scan must not be overwritten on the strength of a stale status
+        (a "download" verdict reached when the file was older, or absent).
+        Compares mtime rather than hash because several systems store a
+        canonical hash that is not the raw file's.  FTP-backed paths never
+        exist locally, so they fall through unchanged.
+        """
+        path = path if path is not None else st.save.path
+        if not path:
+            return False
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return False
+            current = p.stat().st_mtime
+        except OSError:
+            return False
+        if not getattr(st.save, "save_exists", True):
+            return True  # scan saw nothing here; something is here now
+        return abs(current - (st.save.mtime or 0)) > 1.0
+
     def _do_sync(self, indices):
         from sync_engine import upload_save, download_save
 
@@ -1080,6 +1115,7 @@ class SyncTab(QWidget):
         errors = []
         synced = 0
         skipped = 0
+        stale = 0
 
         indices = list(indices)
         progress = QProgressDialog("Syncing saves...", "Cancel", 0, len(indices), self)
@@ -1115,6 +1151,9 @@ class SyncTab(QWidget):
                     self._update_row_status(idx, "up_to_date")
                     synced += 1
                 elif st.status == "server_newer" and st.save.path:
+                    if self._local_changed_since_scan(st):
+                        stale += 1
+                        continue
                     if is_saroo:
                         dest_path = self._resolve_download_path(st)
                         if dest_path is None:
@@ -1159,7 +1198,11 @@ class SyncTab(QWidget):
                     synced += 1
                 elif st.status == "server_only":
                     dest_path = self._resolve_download_path(st)
-                    if dest_path:
+                    if dest_path and self._local_changed_since_scan(st, dest_path):
+                        # Scan attributed nothing to this title, yet the
+                        # destination is occupied — never blind-write it.
+                        stale += 1
+                    elif dest_path:
                         self._download_to_paths(
                             st.save.title_id,
                             [dest_path],
@@ -1198,6 +1241,11 @@ class SyncTab(QWidget):
         msg = f"Synced {synced} saves."
         if skipped:
             msg += f"\n{skipped} item(s) skipped (conflicts / unresolvable server-only — use the action buttons)."
+        if stale:
+            msg += (
+                f"\n{stale} item(s) skipped: the local save changed since the last scan. "
+                f"Scan again before syncing them."
+            )
         if errors:
             msg += f"\n\nErrors:\n" + "\n".join(errors)
         QMessageBox.information(self, "Sync Complete", msg)
@@ -1215,6 +1263,14 @@ class SyncTab(QWidget):
         if new_path is not None:
             st.save.path = new_path
             st.save.save_exists = True
+        # Record what is on disk now, so the staleness check does not mistake
+        # our own write for an emulator session.
+        try:
+            if st.save.path and Path(st.save.path).is_file():
+                st.save.mtime = Path(st.save.path).stat().st_mtime
+                st.save.save_exists = True
+        except OSError:
+            pass
 
         # Find the table row whose UserRole matches status_idx
         target_row = None
@@ -1307,8 +1363,7 @@ class SyncTab(QWidget):
     def _force_upload(self, status_idx: int):
         """Upload the local save regardless of the current sync status."""
         st = self._statuses[status_idx]
-        save_exists = getattr(st.save, "save_exists", True)
-        if not st.save.path or not save_exists:
+        if not self._has_local_file(st):
             QMessageBox.warning(
                 self, "No Local File", "No local save exists for this row."
             )
@@ -1790,7 +1845,22 @@ class SyncTab(QWidget):
             # dest_path is already computed from the ROM scan (correct name + location)
             save_exists = getattr(st.save, "save_exists", True)
             dest_paths = [dest_path, *getattr(st.save, "alternate_paths", [])]
-            if st.status == "local_newer":
+            if self._local_changed_since_scan(st, dest_path):
+                # The status was decided against a file that has since been
+                # written (or did not exist). Say so instead of trusting it.
+                reply = QMessageBox.question(
+                    self,
+                    "Local Save Changed Since Scan",
+                    f"The local save for {st.save.game_name} was modified after the "
+                    f"last scan:\n{dest_path}\n\n"
+                    f"It may hold newer progress than the server. Overwrite it anyway?\n"
+                    f"(Scan again to compare the current file.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            elif st.status == "local_newer":
                 reply = QMessageBox.question(
                     self,
                     "Overwrite Newer Local Save",
