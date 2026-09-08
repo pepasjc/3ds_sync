@@ -41,6 +41,7 @@ __all__ = [
     "MiSTerSaveFile",
     "build_save_path",
     "find_installed_rom_stem",
+    "installed_game_save_paths",
     "save_folder_for_system",
     "scan_saves",
 ]
@@ -310,6 +311,33 @@ def build_save_path(
     if not stem:
         return ""
     return posixpath.join(saves_root, folder, stem + MISTER_SAVE_EXT)
+
+
+def installed_game_save_paths(
+    provider,
+    system: str,
+    stem: str,
+    saves_root: str = MISTER_SAVES_DIR,
+) -> List[str]:
+    """Save files a core has written for the installed game ``stem``.
+
+    The inverse of ``build_save_path``: a core names its save after the game
+    file's stem or the game folder, so the save for an installed game is
+    ``saves/<folder>/<stem>.sav`` in whichever save folder the system has
+    used over the years (``Genesis`` and ``MegaDrive`` may both exist).
+    Only files that exist are returned, so callers can offer to remove
+    them alongside the game - leaving them behind is how two variants of
+    one game end up fighting over a server slot after one is uninstalled.
+    """
+    if not stem:
+        return []
+    found = []
+    for folder in mister_system_save_folder_candidates(system):
+        directory = posixpath.join(saves_root, folder)
+        name = stem + MISTER_SAVE_EXT
+        if name in provider.listdir(directory):
+            found.append(posixpath.join(directory, name))
+    return found
 
 
 _UNSAFE = set('<>:"/\\|?*')

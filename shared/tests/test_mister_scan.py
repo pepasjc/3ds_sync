@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from shared.mister_scan import (  # noqa: E402
     build_save_path,
     find_installed_rom_stem,
+    installed_game_save_paths,
     save_folder_for_system,
     scan_saves,
 )
@@ -277,3 +278,28 @@ def test_two_different_games_are_never_deduplicated():
         "/media/fat/saves/SNES/B (USA).sav": b"b",
     })
     assert len(scan_saves(provider)) == 2
+
+
+def test_installed_game_save_paths_finds_the_core_named_card():
+    """Uninstalling a variant should be able to take its card along: the
+    core names the save after the game file stem or folder, in whichever
+    save folder the system has used (legacy names included)."""
+    provider = FakeProvider({
+        "/media/fat/saves": ["PSX", "Genesis", "MegaDrive"],
+        "/media/fat/saves/PSX": ["Snatcher (Japan) [T-En by pepa v0.5].sav",
+                                 "Snatcher (Japan).sav"],
+        "/media/fat/saves/Genesis": ["Sonic (USA).sav"],
+        "/media/fat/saves/MegaDrive": ["Sonic (USA).sav"],
+    })
+
+    assert installed_game_save_paths(
+        provider, "PS1", "Snatcher (Japan) [T-En by pepa v0.5]") == [
+        "/media/fat/saves/PSX/Snatcher (Japan) [T-En by pepa v0.5].sav"]
+    # The other variant's card is left alone.
+    assert installed_game_save_paths(provider, "PS1", "Snatcher (Japan)") == [
+        "/media/fat/saves/PSX/Snatcher (Japan).sav"]
+    assert installed_game_save_paths(provider, "PS1", "Not Installed") == []
+    # Both the modern and the legacy folder can hold one.
+    assert set(installed_game_save_paths(provider, "MD", "Sonic (USA)")) == {
+        "/media/fat/saves/Genesis/Sonic (USA).sav",
+        "/media/fat/saves/MegaDrive/Sonic (USA).sav"}

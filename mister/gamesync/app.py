@@ -36,6 +36,7 @@ from shared.mister import (  # noqa: E402
     MISTER_GAMES_ROOTS,
     MISTER_SYSTEM_FOLDER_CANDIDATES,
 )
+from shared.mister_scan import installed_game_save_paths  # noqa: E402
 from shared.systems import ROM_EXTENSIONS, SAVE_EXTENSIONS  # noqa: E402
 
 GAMES_ROOTS = [MISTER_GAMES_ROOTS["usb"], MISTER_GAMES_ROOTS["sd"]]
@@ -1693,10 +1694,28 @@ class App:
         detail = ["%s %s on %s" % (item.system, what, item.where),
                   item.path,
                   "This cannot be undone."]
-        if not self.confirm("Delete %s?" % item.name, detail,
-                            title="Delete game"):
-            self.draw_all()
-            return
+        # The core named its save after this game. Offer to take the save
+        # too: a leftover card for a variant you no longer keep is what makes
+        # the remaining copy fight it over one server slot.
+        saves = installed_game_save_paths(self.engine.provider, item.system,
+                                          item.name)
+        if saves:
+            detail.append("Save file: %s" % ", ".join(
+                os.path.basename(path) for path in saves))
+            choice = self.choose(
+                "Delete %s?" % item.name,
+                ["Delete game only", "Delete game and its save"],
+                detail, title="Delete game")
+            if choice is None:
+                self.draw_all()
+                return
+            delete_saves = choice == 1
+        else:
+            if not self.confirm("Delete %s?" % item.name, detail,
+                                title="Delete game"):
+                self.draw_all()
+                return
+            delete_saves = False
 
         self.toast("Deleting %s..." % item.name)
         try:
@@ -1704,11 +1723,15 @@ class App:
                 _remove_tree(item.path)
             else:
                 os.remove(item.path)
+            if delete_saves:
+                for path in saves:
+                    os.remove(path)
         except OSError as exc:
             self.toast("Delete failed: %s" % exc, theme.DANGER)
             time.sleep(2.5)
         else:
-            self.toast("Deleted %s" % item.name)
+            self.toast("Deleted %s%s" % (item.name,
+                                         " and its save" if delete_saves else ""))
             time.sleep(1.0)
         self.selected = max(0, self.selected - 1)
         self.load_data()
