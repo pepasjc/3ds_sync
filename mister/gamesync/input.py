@@ -236,8 +236,10 @@ REPEAT_INTERVAL = 0.10
 FAST_AFTER = 1.2
 FAST_INTERVAL = 0.05
 PAGE_INTERVAL = 0.10
-LETTER_AFTER = 1.5
-LETTER_INTERVAL = 0.25
+# Page for a good while before switching to initials, and step slowly once
+# there: at 4 letters a second the one you want is gone before you let go.
+LETTER_AFTER = 3.0
+LETTER_INTERVAL = 0.6
 
 #: Any identical action arriving inside this window is a mirrored duplicate.
 DEDUPE_WINDOW = 0.06

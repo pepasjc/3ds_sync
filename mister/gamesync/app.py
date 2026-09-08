@@ -677,7 +677,9 @@ class App:
                 self.load_data()
                 self.draw_all()
             elif self.tab == 1:
-                self.load_catalog()
+                # Y on the catalog means "I changed the library": rescan
+                # server-side and refetch everything, not just by fingerprint.
+                self.load_catalog(force=True)
             elif self.tab == 3:
                 self.queue.clear_finished()
                 self.load_data()
@@ -913,7 +915,7 @@ class App:
                       "disc_index", "disc_total", "primary_rom_id",
                       "title_id")
 
-    def load_catalog(self, quiet: bool = False) -> None:
+    def load_catalog(self, quiet: bool = False, force: bool = False) -> None:
         """The server's ROM list for the systems a MiSTer can run.
 
         Kept on disk between runs and refreshed by difference: the server
@@ -921,6 +923,11 @@ class App:
         fingerprint moved are fetched again. A server too old to publish
         fingerprints, or one that cannot be reached, falls back to a whole
         fetch or to the last copy respectively.
+
+        ``force`` is the explicit "the library changed" gesture: the server
+        is asked to rescan its ROM folder first (its catalogue lives in
+        memory and otherwise waits for the periodic scan), then the on-disk
+        copy is thrown away and every system fetched again.
         """
         if not self.require_client():
             return
@@ -928,6 +935,21 @@ class App:
             self.toast("Loading catalog...")
         runnable = sorted(MISTER_SYSTEM_FOLDER_CANDIDATES)
         cache = self.catalog_cache
+
+        if force:
+            self.toast("Asking the server to rescan its ROMs...")
+            try:
+                count = self.client.rescan_roms()
+            except Exception as exc:
+                self.toast("Server rescan failed: %s" % exc, theme.WARN)
+                time.sleep(1.5)
+            else:
+                if count is None:
+                    self.toast("Server did not allow a rescan - "
+                               "refetching the catalog anyway", theme.WARN)
+                    time.sleep(1.2)
+            cache.clear()
+            cache.save()
 
         def report(loaded, total, system=""):
             self.toast("Loading catalog... %s%d/%d"

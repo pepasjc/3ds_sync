@@ -19,6 +19,8 @@ import urllib.request
 DEFAULT_TIMEOUT = 20
 UPLOAD_TIMEOUT = 120
 DOWNLOAD_TIMEOUT = 120
+#: A rescan walks the whole ROM library on the server before answering.
+RESCAN_TIMEOUT = 300
 
 #: Systems whose saves are memory cards handled by the dedicated endpoints.
 CARD_SYSTEMS = {"PS1"}
@@ -168,6 +170,22 @@ class Client:
         titles = body.get("titles", []) if isinstance(body, dict) else body
         return {str(entry.get("title_id")): entry
                 for entry in titles or [] if entry.get("title_id")}
+
+    def rescan_roms(self):
+        """Ask the server to walk its ROM folder again.
+
+        The server's catalogue lives in memory and only moves on a scan, so
+        a file added to its disk is invisible until the periodic scan runs.
+        Returns the row count, or None when the server refused (a non-admin
+        user behind a proxy) - the caller carries on with what it has.
+        """
+        try:
+            body = self._get_json("/roms/scan", timeout=RESCAN_TIMEOUT)
+        except ApiError as exc:
+            if exc.status in (403, 404, 405):
+                return None
+            raise
+        return int(body.get("count") or 0) if isinstance(body, dict) else None
 
     def rom_fingerprints(self):
         """``{system: {"fingerprint", "count"}}``, or None on a server that
