@@ -291,10 +291,10 @@ def _eviocgabs(fd, axis):
 
 class Device:
     __slots__ = ("path", "name", "fd", "is_pad", "is_keyboard", "axes",
-                 "layout", "arcade")
+                 "layout", "arcade", "code_map")
 
     def __init__(self, path, name, fd, is_pad, is_keyboard, axes,
-                 layout=LAYOUT_GENERIC, arcade=False):
+                 layout=LAYOUT_GENERIC, arcade=False, code_map=None):
         self.path = path
         self.name = name
         self.fd = fd
@@ -304,6 +304,8 @@ class Device:
         self.layout = layout
         #: Uses the contiguous-range defaults (ARCADE_BUTTON_ACTIONS).
         self.arcade = arcade
+        #: Raw code -> real code, for a pad the kernel enumerated generically.
+        self.code_map = code_map
 
 
 def is_arcade_pad(keys: set, layout: str) -> bool:
@@ -317,6 +319,46 @@ def is_arcade_pad(keys: set, layout: str) -> bool:
     room, not a cabinet, and was getting the cabinet map.
     """
     return layout == LAYOUT_GENERIC and BTN_C in keys and BTN_Z in keys
+
+
+#: Sony pads that only ``hid-playstation`` knows how to name.
+DUALSENSE_PRODUCTS = {0x0ce6, 0x0df2}
+SONY_VENDOR = 0x054c
+
+#: What a DualSense's buttons come out as when the kernel has no
+#: ``hid-playstation`` (the September 2026 MiSTer image: 6.18 with only
+#: ``hid-sony``, which stops at the DualShock 4). ``hid-generic`` then hands
+#: the report's buttons out in order from BTN_SOUTH - Square first, because
+#: that is button 1 on the wire - so Cross landed on BTN_EAST and read as
+#: Back. Keyed by what arrives, valued by what the button really is.
+GENERIC_DUALSENSE_CODES = {
+    BTN_SOUTH: BTN_WEST,       # 1  Square
+    BTN_EAST: BTN_SOUTH,       # 2  Cross
+    BTN_C: BTN_EAST,           # 3  Circle
+    BTN_NORTH: BTN_NORTH,      # 4  Triangle
+    BTN_WEST: BTN_TL,          # 5  L1
+    BTN_Z: BTN_TR,             # 6  R1
+    BTN_TL: BTN_TL2,           # 7  L2
+    BTN_TR: BTN_TR2,           # 8  R2
+    BTN_TL2: BTN_SELECT,       # 9  Create
+    BTN_TR2: BTN_START,        # 10 Options
+    BTN_SELECT: BTN_THUMBL,    # 11 L3
+    BTN_START: BTN_THUMBR,     # 12 R3
+    BTN_MODE: BTN_MODE,        # 13 PS
+    BTN_THUMBL: None,          # 14 touchpad click
+}
+
+
+def generic_code_map(vendor: int, product: int, keys: set) -> dict | None:
+    """A code translation for a pad the kernel enumerated generically.
+
+    A DualSense bound to hid-generic is recognisable by its id plus BTN_C in
+    its key set - hid-playstation never reports BTN_C. With that driver
+    present the codes are already right and nothing is translated.
+    """
+    if vendor == SONY_VENDOR and product in DUALSENSE_PRODUCTS             and BTN_C in keys:
+        return GENERIC_DUALSENSE_CODES
+    return None
 
 
 class InputReader:
@@ -475,13 +517,14 @@ class InputReader:
                     except OSError:
                         pass
                 try:
-                    vendor, _product = _eviocgid(fd)
+                    vendor, product = _eviocgid(fd)
                 except OSError:
-                    vendor = 0
+                    vendor = product = 0
                 layout = detect_layout(name, vendor)
-                arcade = is_arcade_pad(keys, layout)
+                code_map = generic_code_map(vendor, product, keys)
+                arcade = code_map is None and is_arcade_pad(keys, layout)
             found[path] = Device(path, name, fd, is_pad, is_keyboard, axes,
-                                 layout, arcade)
+                                 layout, arcade, code_map)
 
         keep = self._select_sources(found)
 
@@ -598,6 +641,10 @@ class InputReader:
             return
         if device.is_pad:
             self._active_pad = device.path
+            if device.code_map is not None:
+                code = device.code_map.get(code, code)
+                if code is None:
+                    return
         if self._capture is not None and device.is_pad:
             self._capture.append(code)
             return

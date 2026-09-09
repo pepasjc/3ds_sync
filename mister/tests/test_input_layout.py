@@ -135,3 +135,51 @@ def test_keyboard_only_is_generic():
     assert reader.layout == LAYOUT_GENERIC
     assert reader.layout_description() == "no controller"
     assert reader.label(gsinput.PRIMARY) == "A"
+
+
+def test_dualsense_on_hid_generic_is_translated_to_real_buttons():
+    """Seen live after the September 2026 kernel update (6.18, no
+    hid-playstation): Cross asked to exit and Square did what Cross should.
+    hid-generic numbers the report's buttons from BTN_SOUTH in wire order,
+    which on a DualSense starts at Square."""
+    from gamesync.input import (
+        BTN_C, BTN_MODE, BTN_NORTH, BTN_THUMBL, BTN_TL, BTN_WEST, BTN_Z,
+        generic_code_map,
+    )
+
+    generic_keys = set(range(BTN_SOUTH, BTN_THUMBL + 1))
+    assert generic_code_map(0x054C, 0x0CE6, generic_keys) is not None
+    assert generic_code_map(0x054C, 0x0DF2, generic_keys) is not None   # Edge
+    # With hid-playstation present BTN_C is absent and nothing is translated.
+    assert generic_code_map(0x054C, 0x0CE6, generic_keys - {BTN_C, BTN_Z}) is None
+    assert generic_code_map(0x0079, 0x0011, generic_keys) is None
+
+    ds = pad("/dev/input/event4", "DualSense Wireless Controller",
+             LAYOUT_PLAYSTATION)
+    ds.code_map = generic_code_map(0x054C, 0x0CE6, generic_keys)
+    reader = make_reader(ds)
+
+    reader._on_key(ds, BTN_EAST, 1)        # wire button 2 = Cross
+    assert reader._pending[-1] == gsinput.PRIMARY
+    reader._on_key(ds, BTN_C, 1)           # wire button 3 = Circle
+    assert reader._pending[-1] == gsinput.BACK
+    reader._on_key(ds, BTN_SOUTH, 1)       # wire button 1 = Square
+    assert reader._pending[-1] == gsinput.SYNC
+    reader._on_key(ds, BTN_NORTH, 1)       # Triangle
+    assert reader._pending[-1] == gsinput.ALT
+    reader._on_key(ds, BTN_WEST, 1)        # wire button 5 = L1
+    assert reader._pending[-1] == gsinput.PREV_SYSTEM
+    reader._on_key(ds, BTN_TL, 1)          # wire button 7 = L2
+    assert reader._pending[-1] == gsinput.NEXT_TAB or \
+        reader._pending[-1] == gsinput.PREV_TAB
+    before = len(reader._pending)
+    reader._on_key(ds, BTN_THUMBL, 1)      # touchpad click: nothing
+    assert len(reader._pending) == before
+    assert reader.label(gsinput.PRIMARY) == "Cross"
+
+    # The remap wizard captures the translated code, so a saved binding
+    # keeps meaning the same physical button on either driver.
+    reader.capture_next()
+    reader._on_key(ds, BTN_EAST, 1)
+    assert reader.captured() == BTN_SOUTH
+    _ = BTN_MODE
