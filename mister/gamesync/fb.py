@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover
     # Linux-only. Guarded so the UI logic can be imported and unit-tested on a
     # development machine; nothing here works without a real MiSTer anyway.
     fcntl = None
+import errno
 import mmap
 import os
 import struct
@@ -54,6 +55,7 @@ class Framebuffer:
         self.path = path
         self._take_over_console = take_over_console
         self._fd = -1
+        self._mem_fd = -1
         self._tty_fd = -1
         self._map: mmap.mmap | None = None
         self._saved: bytes | None = None
@@ -90,6 +92,7 @@ class Framebuffer:
 
             fix = bytearray(80)
             fcntl.ioctl(self._fd, FBIOGET_FSCREENINFO, fix, True)
+            smem_start, smem_len = struct.unpack_from("II", fix, 16)
             stride = struct.unpack_from("I", fix, 44)[0]
 
             if bpp != 32:
@@ -104,9 +107,8 @@ class Framebuffer:
 
             # smem_len reads back as 0 on MiSTer, so the map is sized from the
             # stride and height rather than from what the driver claims.
-            self._map = mmap.mmap(self._fd, self.stride * self.phys_height,
-                                  mmap.MAP_SHARED,
-                                  mmap.PROT_READ | mmap.PROT_WRITE)
+            self._map = self._map_pixels(smem_start, smem_len,
+                                         self.stride * self.phys_height)
             self._saved = self._map[:]
             if self._take_over_console:
                 self._set_console_mode(KD_GRAPHICS)
@@ -114,6 +116,35 @@ class Framebuffer:
             self.close()
             raise
         return self
+
+    def _map_pixels(self, smem_start: int, smem_len: int, needed: int):
+        """Map the pixel memory, through the device or around it.
+
+        MiSTer's Linux image moved to a 6.x kernel (6.18 as of September
+        2026) whose fbdev core refuses ``mmap`` on a driver that does not
+        supply its own ``fb_mmap``. The out-of-tree ``MiSTer_fb`` driver
+        does not, so the map that had worked for years began failing with
+        ``ENODEV`` - and ``write()`` is gone the same way. The driver still
+        reports where the pixels are (``smem_start``, a reserved region
+        outside System RAM), so map that through ``/dev/mem`` instead; the
+        image ships without ``STRICT_DEVMEM`` and scripts run as root.
+        """
+        try:
+            return mmap.mmap(self._fd, needed, mmap.MAP_SHARED,
+                             mmap.PROT_READ | mmap.PROT_WRITE)
+        except OSError as exc:
+            if exc.errno != errno.ENODEV or not smem_start:
+                raise
+        length = max(needed, smem_len)
+        self._mem_fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+        try:
+            return mmap.mmap(self._mem_fd, length, mmap.MAP_SHARED,
+                             mmap.PROT_READ | mmap.PROT_WRITE,
+                             offset=smem_start)
+        except OSError as exc:
+            raise FramebufferError(
+                "framebuffer refuses mmap and /dev/mem at 0x%x failed: %s"
+                % (smem_start, exc))
 
     def close(self) -> None:
         if self._map is not None:
@@ -137,12 +168,14 @@ class Framebuffer:
             except Exception:
                 pass
             self._tty_fd = -1
-        if self._fd >= 0:
-            try:
-                os.close(self._fd)
-            except Exception:
-                pass
-            self._fd = -1
+        for attr in ("_fd", "_mem_fd"):
+            fd = getattr(self, attr)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                setattr(self, attr, -1)
 
     def __enter__(self) -> "Framebuffer":
         return self.open()
