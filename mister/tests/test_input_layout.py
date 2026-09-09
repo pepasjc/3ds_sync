@@ -183,3 +183,18 @@ def test_dualsense_on_hid_generic_is_translated_to_real_buttons():
     reader._on_key(ds, BTN_EAST, 1)
     assert reader.captured() == BTN_SOUTH
     _ = BTN_MODE
+
+
+def test_default_pad_prefers_a_recognised_console_layout():
+    """An always-plugged generic pad enumerated first was captioning the
+    footer A/B/C for a DualSense user until the first press."""
+    pce = pad("/dev/input/event1", "PCEngine PAD", LAYOUT_GENERIC)
+    ds = pad("/dev/input/event4", "DualSense Wireless Controller",
+             LAYOUT_PLAYSTATION)
+    reader = make_reader(pce, ds)
+
+    assert reader.active_pad() is ds
+    assert reader.label(gsinput.PRIMARY) == "Cross"
+    # A press on the generic pad still wins, as before.
+    reader._on_key(pce, BTN_SOUTH, 1)
+    assert reader.active_pad() is pce

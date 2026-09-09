@@ -445,6 +445,13 @@ class InputReader:
         for device in pads:
             if device.path == self._active_pad:
                 return device
+        # Nothing pressed yet: guess the pad in hand. A recognised console
+        # pad over a nameless one - an always-plugged PC Engine pad on
+        # event1 was captioning the footer A/B/C for a DualSense user until
+        # the first press.
+        for device in pads:
+            if device.layout != LAYOUT_GENERIC and not device.arcade:
+                return device
         return pads[0]
 
     @property
