@@ -510,6 +510,7 @@ class InputReader:
             axes = {}
             layout = LAYOUT_GENERIC
             arcade = False
+            code_map = None
             if is_pad:
                 for axis in (ABS_X, ABS_Y):
                     try:
